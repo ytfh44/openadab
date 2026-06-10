@@ -1,0 +1,25 @@
+name: explore
+description: Explore story state, wiki, and manuscript
+category: utility
+parameters:
+  - name: change
+    type: string
+    required: false
+    description: Change identifier to focus exploration
+  - name: artifact
+    type: string
+    required: false
+    default: status
+    description: Artifact to inspect
+  - name: chapter
+    type: string
+    required: false
+    description: Chapter identifier to explore
+steps:
+  - action: cli
+    command: openadab status --change {{change}} --json
+    capture: status_output
+  - action: read_optional
+    paths: "adab/wiki/index.md,adab/wiki/overview.md"
+  - action: read_optional
+    paths: "adab/manuscript/chapters/{{chapter}}.md"

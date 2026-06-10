@@ -1,0 +1,19 @@
+name: worldbuilding
+version: 1
+description: Placeholder schema for future worldbuilding workflow.
+context:
+  domain: ""
+artifacts:
+  - id: domain-outline
+    generates: domain-outline.md
+    requires: []
+    instruction: >
+      Placeholder: outline a worldbuilding domain (history, magic system, geography, etc.).
+    contextBudget: 2000
+
+  - id: domain-detail
+    generates: domain-detail.md
+    requires: [domain-outline]
+    instruction: >
+      Placeholder: expand the domain outline into detailed wiki-ready content.
+    contextBudget: 2000

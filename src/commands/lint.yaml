@@ -1,0 +1,11 @@
+name: lint
+description: Run semantic validation and report issues
+category: validation
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+steps:
+  - action: cli
+    command: openadab validate --change {{change}} --semantic

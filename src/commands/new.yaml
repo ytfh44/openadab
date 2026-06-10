@@ -1,0 +1,18 @@
+name: new
+description: Create a new chapter change
+category: workflow
+parameters:
+  - name: id
+    type: string
+    required: true
+    description: Unique change identifier (e.g., ch-012)
+  - name: schema
+    type: string
+    required: false
+    default: chapter-draft
+    description: Schema to use for the change
+steps:
+  - action: cli
+    command: openadab new chapter {{id}}
+  - action: read
+    paths: "adab/changes/{{id}}/.openadab.yaml"

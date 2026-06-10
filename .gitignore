@@ -1,0 +1,70 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Generated config files (compiled from vitest.config.ts)
+vitest.config.js
+vitest.config.js.map
+vitest.config.d.ts
+vitest.config.d.ts.map
+
+# TypeScript
+*.tsbuildinfo
+
+# Package manager (pnpm project — npm lock excluded)
+package-lock.json
+
+# Smoke test output
+adab/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE and Editors
+# VS Code
+.vscode/
+*.code-workspace
+*.code-profile
+
+# JetBrains IDEs (WebStorm, IntelliJ, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim
+*.swp
+*.swo
+*~
+*.swo
+.netrwhist
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ACE Editor
+.ace/
+
+# Cloud9
+.c9/
+
+# Temporary files
+*.tmp
+*.temp

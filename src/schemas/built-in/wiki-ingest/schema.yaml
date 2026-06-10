@@ -1,0 +1,38 @@
+name: wiki-ingest
+version: 1
+description: Lightweight workflow for ingesting raw sources into wiki updates.
+context:
+  source: "raw-source"
+artifacts:
+  - id: extract
+    generates: extract.md
+    requires: []
+    template: templates/extract.md
+    instruction: >
+      Read the raw source material and extract entities, facts, and events
+      relevant to the story world. Organize extracts by entity type
+      (character, location, faction, object, thread).
+    contextBudget: 6000
+    validation:
+      mechanical:
+        - frontmatterPresent
+      semantic:
+        - extracts organized by entity type
+        - source cited for each extract
+
+  - id: wiki-diff
+    generates: wiki-diff.md
+    requires: [extract]
+    template: templates/wiki-diff.md
+    instruction: >
+      Convert the extracted facts into structured wiki-diff operations.
+      Each operation must reference the original source. Do not apply the
+      diff directly; it will be applied via `wiki apply-diff`.
+    contextBudget: 4000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - operationsHaveSource
+      semantic:
+        - operations match extracts
+        - no duplicate operations

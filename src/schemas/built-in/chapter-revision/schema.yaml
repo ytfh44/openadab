@@ -1,0 +1,91 @@
+name: chapter-revision
+version: 1
+description: Revision workflow for an existing chapter.
+context:
+  chapter: "001"
+artifacts:
+  - id: revision-brief
+    generates: revision-brief.md
+    requires: []
+    template: templates/revision-brief.md
+    instruction: >
+      Summarize the revision goals for this chapter. Identify what needs to
+      change (pacing, character voice, plot holes, tone shifts) and why.
+    contextBudget: 2000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - wordCount > 50
+      semantic:
+        - revision goals stated
+        - references existing chapter
+
+  - id: revision-plan
+    generates: revision-plan.md
+    requires: [revision-brief]
+    template: templates/revision-plan.md
+    instruction: >
+      Create a detailed plan for the revision. Break changes down by scene or
+      section. Note which wiki pages may need updating as a result.
+    contextBudget: 3000
+    validation:
+      mechanical:
+        - frontmatterPresent
+      semantic:
+        - changes mapped to scenes
+        - wiki impact noted
+
+  - id: revision
+    generates: revision.md
+    requires: [revision-brief, revision-plan]
+    template: templates/revision.md
+    instruction: >
+      Execute the revision plan. Produce a new version of the chapter that
+      addresses all identified issues. Maintain consistency with the rest of
+      the manuscript.
+    contextBudget: 12000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - wordCount > 1000
+      semantic:
+        - all revision plan items addressed
+        - consistency with manuscript maintained
+
+  - id: continuity-report
+    generates: continuity-report.md
+    requires: [revision]
+    template: templates/continuity-report.md
+    instruction: >
+      Analyze the revised chapter for continuity implications. Record changes
+      to active threads, character knowledge, location state, and any new
+      contradictions.
+    contextBudget: 4000
+    validation:
+      mechanical:
+        - frontmatterPresent
+      semantic:
+        - active threads listed
+        - character knowledge changes documented
+        - location state changes documented
+
+  - id: wiki-diff
+    generates: wiki-diff.md
+    requires: [continuity-report]
+    template: templates/wiki-diff.md
+    instruction: >
+      Translate the continuity report into structured wiki-diff operations.
+      Each operation must cite the revised chapter as its source.
+    contextBudget: 4000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - operationsHaveSource
+      semantic:
+        - operations match continuity report
+        - no duplicate operations
+
+apply:
+  requires: [revision, wiki-diff]
+  target: manuscript/chapters/{{chapter}}.md
+  action: copy

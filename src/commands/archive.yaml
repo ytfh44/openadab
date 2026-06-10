@@ -1,0 +1,13 @@
+name: archive
+description: Sync and archive a completed change
+category: workflow
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+steps:
+  - action: cli
+    command: openadab sync --change {{change}}
+  - action: cli
+    command: openadab archive {{change}}

@@ -1,0 +1,55 @@
+{
+  "name": "openadab",
+  "version": "0.1.0",
+  "description": "Local-first, host-neutral fiction workflow engine CLI",
+  "type": "module",
+  "bin": {
+    "openadab": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "lint": "eslint src tests"
+  },
+  "keywords": [
+    "cli",
+    "fiction",
+    "workflow",
+    "llm",
+    "wiki"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "chokidar": "^4.0.3",
+    "commander": "^13.1.0",
+    "fast-glob": "^3.3.3",
+    "gray-matter": "^4.0.3",
+    "ora": "^8.2.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.5",
+    "yaml": "^2.7.0",
+    "zod": "^3.25.42"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/mdast": "^4.0.4",
+    "@types/node": "^22.15.25",
+    "@types/yaml": "^1.9.7",
+    "eslint": "^9.39.4",
+    "eslint-import-resolver-typescript": "^4.4.5",
+    "eslint-plugin-import": "^2.32.0",
+    "globals": "^17.6.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.60.1",
+    "vitest": "^3.2.3"
+  }
+}

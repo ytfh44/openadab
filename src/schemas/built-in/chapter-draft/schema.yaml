@@ -1,0 +1,115 @@
+name: chapter-draft
+version: 1
+description: Standard chapter draft workflow for OpenAdab.
+context:
+  chapter: "001"
+artifacts:
+  - id: brief
+    generates: brief.md
+    requires: []
+    template: templates/brief.md
+    instruction: >
+      Write a chapter brief that defines the narrative goal, POV character,
+      tone, and key beats for this chapter. Keep it concise (under 500 words)
+      and focused on what the reader should feel by the end of the chapter.
+    contextBudget: 2000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - wordCount > 50
+      semantic:
+        - pov declared in frontmatter
+        - chapter_goal stated
+
+  - id: scene-plan
+    generates: scene-plan.md
+    requires: [brief]
+    template: templates/scene-plan.md
+    instruction: >
+      Break the chapter into scenes. For each scene list: location, characters
+      present, narrative purpose, and estimated word count. Ensure scene order
+      supports the chapter goal declared in the brief.
+    contextBudget: 3000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - atLeastOneScene
+      semantic:
+        - scenes support chapter_goal
+        - pov consistent with brief
+
+  - id: draft
+    generates: draft.md
+    requires: [brief, scene-plan]
+    template: templates/draft.md
+    instruction: >
+      Write the full chapter draft following the scene plan. Maintain consistent
+      POV, tone, and voice. Use scene markers to separate scenes. Do not edit
+      for polish; focus on completing the narrative arc.
+    contextBudget: 12000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - wordCount > 1000
+        - sceneMarkersPresent
+      semantic:
+        - pov consistent with brief
+        - tone matches brief
+
+  - id: revision
+    generates: revision.md
+    requires: [draft]
+    template: templates/revision.md
+    instruction: >
+      Revise the draft for clarity, pacing, and emotional impact. Address any
+      continuity issues noted in the draft. Update frontmatter with revision
+      notes summarizing major changes.
+    contextBudget: 8000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - wordCount > 1000
+      semantic:
+        - revision notes explain major changes
+        - no unresolved continuity issues
+
+  - id: continuity-report
+    generates: continuity-report.md
+    requires: [revision]
+    template: templates/continuity-report.md
+    instruction: >
+      Analyze the revised chapter for continuity implications. Record: active
+      threads advanced or resolved, character knowledge changes, location state
+      changes, and any new contradictions flagged.
+    contextBudget: 4000
+    validation:
+      mechanical:
+        - frontmatterPresent
+      semantic:
+        - active threads listed
+        - character knowledge changes documented
+        - location state changes documented
+
+  - id: wiki-diff
+    generates: wiki-diff.md
+    requires: [continuity-report]
+    template: templates/wiki-diff.md
+    instruction: >
+      Translate the continuity report into structured wiki-diff operations.
+      Each operation must include a source citation (chapter and section).
+      Supported operations: add_current_state, add_knowledge_timeline,
+      update_relationship, update_thread_status, add_evidence, flag_contradiction,
+      update_field.
+    contextBudget: 4000
+    validation:
+      mechanical:
+        - frontmatterPresent
+        - operationsHaveSource
+      semantic:
+        - operations match continuity report
+        - no duplicate operations
+
+apply:
+  requires: [revision, wiki-diff]
+  target: manuscript/chapters/{{chapter}}.md
+  action: copy

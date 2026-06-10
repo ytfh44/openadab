@@ -1,0 +1,19 @@
+name: plan
+description: Check status and generate instructions for the next artifact
+category: workflow
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+  - name: artifact
+    type: string
+    required: false
+    description: Target artifact (auto-detected if omitted)
+steps:
+  - action: cli
+    command: openadab status --change {{change}} --json
+    capture: status_output
+  - action: cli
+    command: openadab instructions {{artifact}} --change {{change}} --json
+    capture: instructions_output

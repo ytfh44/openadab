@@ -1,0 +1,27 @@
+name: draft
+description: Context pack -> instructions -> write -> validate flow
+category: writing
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+  - name: artifact
+    type: string
+    required: false
+    default: draft
+    description: Artifact to draft
+steps:
+  - action: cli
+    command: openadab context pack --change {{change}} --artifact {{artifact}} --json
+    capture: context_pack
+  - action: cli
+    command: openadab instructions {{artifact}} --change {{change}} --json
+    capture: instructions_output
+  - action: read
+    paths: "{{context_pack.mustRead}}"
+  - action: write
+    path: "adab/changes/{{change}}/{{artifact}}.md"
+    content: "{{llm_output}}"
+  - action: cli
+    command: openadab validate --change {{change}} --mechanical

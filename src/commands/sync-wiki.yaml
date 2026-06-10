@@ -1,0 +1,13 @@
+name: sync-wiki
+description: Apply wiki-diff and sync indexes
+category: wiki
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+steps:
+  - action: cli
+    command: openadab wiki apply-diff adab/changes/{{change}}/wiki-diff.md --apply --change {{change}}
+  - action: cli
+    command: openadab wiki index

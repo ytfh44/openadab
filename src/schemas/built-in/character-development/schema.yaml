@@ -1,0 +1,19 @@
+name: character-development
+version: 1
+description: Placeholder schema for future character arc tracking workflow.
+context:
+  character: ""
+artifacts:
+  - id: arc-outline
+    generates: arc-outline.md
+    requires: []
+    instruction: >
+      Placeholder: define the character's arc across the story.
+    contextBudget: 2000
+
+  - id: arc-checkpoint
+    generates: arc-checkpoint.md
+    requires: [arc-outline]
+    instruction: >
+      Placeholder: review character state at a specific story point.
+    contextBudget: 2000

@@ -1,0 +1,24 @@
+name: revise
+description: Instructions -> write revision -> validate
+category: writing
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+  - name: artifact
+    type: string
+    required: false
+    default: revision
+    description: Artifact to revise
+steps:
+  - action: cli
+    command: openadab instructions {{artifact}} --change {{change}} --json
+    capture: instructions_output
+  - action: read
+    paths: "{{instructions_output.requiredReads}}"
+  - action: write
+    path: "adab/changes/{{change}}/{{artifact}}.md"
+    content: "{{llm_output}}"
+  - action: cli
+    command: openadab validate --change {{change}} --mechanical

@@ -1,0 +1,19 @@
+name: series-planning
+version: 1
+description: Placeholder schema for future series outline workflow.
+context:
+  series: ""
+artifacts:
+  - id: series-outline
+    generates: series-outline.md
+    requires: []
+    instruction: >
+      Placeholder: define the overall series arc and book breakdown.
+    contextBudget: 2000
+
+  - id: book-outline
+    generates: book-outline.md
+    requires: [series-outline]
+    instruction: >
+      Placeholder: outline an individual book within the series.
+    contextBudget: 2000

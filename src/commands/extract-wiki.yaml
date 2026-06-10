@@ -1,0 +1,14 @@
+name: extract-wiki
+description: Generate wiki-diff from continuity-report
+category: wiki
+parameters:
+  - name: change
+    type: string
+    required: true
+    description: Change identifier
+steps:
+  - action: read
+    paths: "adab/changes/{{change}}/continuity-report.md"
+  - action: write
+    path: "adab/changes/{{change}}/wiki-diff.md"
+    content: "{{llm_output}}"
