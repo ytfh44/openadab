@@ -262,7 +262,7 @@ export class WikiEngine {
    */
   async generateIndex(): Promise<void> {
     const pages = await this.listPages();
-    const groups = new Map<string, { path: string; name: string; status: string; summary: string }[]>();
+    const groups = new Map<string, { path: string; type: string; name: string; status: string; summary: string }[]>();
 
     for (const pagePath of pages) {
       try {

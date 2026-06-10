@@ -77,7 +77,7 @@ describe('ContextPacker', () => {
     const configLoader = new ConfigLoader(root);
     await configLoader.load();
 
-    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader, manifestManager);
+    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader);
     return { root, packer, wikiEngine };
   }
 

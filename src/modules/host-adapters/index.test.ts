@@ -12,7 +12,6 @@ import type { CommandDef } from '../../schemas/command-def.js';
 import type { GeneratedFile } from './index.js';
 
 import { AdapterFactory } from './adapter-factory.js';
-
 import {
   CommandDefLoader,
   AdapterBase,

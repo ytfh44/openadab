@@ -320,13 +320,12 @@ describe('MechanicalValidator', () => {
         'schema: chapter-draft\nversion: 1\nproject:\n  title: Test Novel\n  language: en-US\n  genre: fantasy\n  tense: past\n  pov: limited-third\n'
       );
 
-      const result = await validator.validateChange(changeDir);
-      // validateChange aggregates per-artifact results plus chapterSequence and validateConfig
-      expect(result.artifactId).toBe('all');
-      // Result should pass (valid artifacts, consecutive chapters, valid config)
-      expect(result.passed).toBe(true);
-      // Should not have error-level issues
-      expect(result.errors).toHaveLength(0);
+      const results = await validator.validateChange(changeDir);
+      const result = results.find(r => r.artifactId === 'all');
+      expect(result).toBeDefined();
+      expect(result?.artifactId).toBe('all');
+      expect(result?.passed).toBe(true);
+      expect(result?.errors).toHaveLength(0);
     });
   });
 

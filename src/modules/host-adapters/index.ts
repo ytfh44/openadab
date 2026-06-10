@@ -560,6 +560,14 @@ async function saveGenerationCache(projectRoot: string, cache: GenerationCache):
  * @param files       Array of generated files.
  * @returns Array of paths that were written.
  */
+export async function isUnchanged(filePath: string, expectedContent: string): Promise<boolean> {
+  const existingContent = await safeReadFile(filePath);
+  if (existingContent === null) {
+    return false;
+  }
+  return existingContent === expectedContent;
+}
+
 export async function writeGeneratedFiles(projectRoot: string, files: GeneratedFile[]): Promise<string[]> {
   const cache = await loadGenerationCache(projectRoot);
   const written: string[] = [];
