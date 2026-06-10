@@ -26,30 +26,31 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "chalk": "^5.4.1",
+    "chalk": "^5.6.2",
     "chokidar": "^4.0.3",
     "commander": "^13.1.0",
     "fast-glob": "^3.3.3",
     "gray-matter": "^4.0.3",
+    "openadab": "link:",
     "ora": "^8.2.0",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",
     "unified": "^11.0.5",
-    "yaml": "^2.7.0",
-    "zod": "^3.25.42"
+    "yaml": "^2.9.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@types/mdast": "^4.0.4",
-    "@types/node": "^22.15.25",
+    "@types/node": "^22.19.20",
     "@types/yaml": "^1.9.7",
     "eslint": "^9.39.4",
     "eslint-import-resolver-typescript": "^4.4.5",
     "eslint-plugin-import": "^2.32.0",
     "globals": "^17.6.0",
-    "tsx": "^4.19.4",
-    "typescript": "^5.8.3",
-    "typescript-eslint": "^8.60.1",
-    "vitest": "^3.2.3"
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^3.2.6"
   }
 }
