@@ -231,12 +231,15 @@ export class SyncEngine {
    */
   private async runPreSyncValidation(changePath: string, manifest: ChangeManifest): Promise<string[]> {
     const errors: string[] = [];
+    const OPTIONAL_ARTIFACTS = ['wiki-diff', 'brief', 'scene-plan'] as const;
     const validationResults = await this.validator.validateChange(changePath);
     for (const result of validationResults) {
       if (!result.passed) {
-        // Skip "File missing" errors for optional artifacts (wiki-diff) that are not done.
-        const isOptionalMissing = result.artifactId === 'wiki-diff' && result.errors.some((e) => e.startsWith('File missing:'));
-        if (!isOptionalMissing) {
+        const isOptionalMissing = OPTIONAL_ARTIFACTS.includes(result.artifactId as typeof OPTIONAL_ARTIFACTS[number]) &&
+          result.errors.some((e) => e.startsWith('File missing:'));
+        if (isOptionalMissing) {
+          console.warn(`[SyncEngine] wiki/${result.artifactId}.md not found — proceeding without it.`);
+        } else {
           errors.push(...result.errors);
         }
       }

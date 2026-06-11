@@ -89,7 +89,8 @@ describe('SyncEngine', () => {
 
   it('validation failure aborts sync', async () => {
     const { engine } = setupSyncEngine({ manifestStatus: 'in_progress' });
-    (engine as any).validator.validateChange = vi.fn().mockResolvedValue([{ artifactId: 'brief', passed: false, errors: ['File missing: brief.md'], warnings: [] }]);
+    // Use 'draft' artifact which is NOT in the optional list (wiki-diff, brief, scene-plan)
+    (engine as any).validator.validateChange = vi.fn().mockResolvedValue([{ artifactId: 'draft', passed: false, errors: ['File missing: draft.md'], warnings: [] }]);
     await expect(engine.sync('draft-ch-001')).rejects.toThrow(AdabError);
     await expect(engine.sync('draft-ch-001')).rejects.toThrow(/validation failed/i);
   });
@@ -122,5 +123,60 @@ describe('SyncEngine', () => {
     // Index errors should be logged in the report
     expect(report.indexesRegenerated).toContain('adab/index/wikilinks.json');
     expect(report.logEntry.result).toBe('success'); // Wiki-diff applied successfully
+  });
+
+  // L6: brief.md missing should not block sync
+  it('brief.md missing does not block sync', async () => {
+    const { engine } = setupSyncEngine({ manifestStatus: 'in_progress' });
+    // Mock validator to return "File missing: brief.md" error
+    (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+      { artifactId: 'brief', passed: false, errors: ['File missing: brief.md'], warnings: [] },
+      { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+      { artifactId: 'wiki-diff', passed: false, errors: ['File missing: wiki-diff.md'], warnings: [] },
+    ]);
+    (engine as any).validator.requireNonEmpty = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' });
+    (engine as any).validator.validateDependencies = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] });
+
+    // Should not throw - brief.md missing is optional
+    const report = await engine.sync('draft-ch-001');
+    expect(report.changeId).toBe('draft-ch-001');
+  });
+
+  // L6: scene-plan.md missing should not block sync
+  it('scene-plan.md missing does not block sync', async () => {
+    const { engine } = setupSyncEngine({ manifestStatus: 'in_progress' });
+    // Mock validator to return "File missing: scene-plan.md" error
+    (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+      { artifactId: 'scene-plan', passed: false, errors: ['File missing: scene-plan.md'], warnings: [] },
+      { artifactId: 'brief', passed: true, errors: [], warnings: [] },
+      { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+    ]);
+    (engine as any).validator.requireNonEmpty = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' });
+    (engine as any).validator.validateDependencies = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] });
+
+    // Should not throw - scene-plan.md missing is optional
+    const report = await engine.sync('draft-ch-001');
+    expect(report.changeId).toBe('draft-ch-001');
+  });
+
+  // L6 regression: manifest missing should still block sync
+  it('manifest missing still blocks sync', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-se-manifest-'));
+    const changeDir = join(root, 'adab', 'changes', 'draft-ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    // Do NOT create manifest - should block
+
+    const wikiDiffParser = { parse: vi.fn().mockResolvedValue({ changeId: 'draft-ch-001', operations: [] }) } as unknown as WikiDiffParser;
+    const wikiDiffApplier = { apply: vi.fn().mockResolvedValue({ success: true, operationsApplied: 0, pagesModified: 0, contradictionsFlagged: 0, summary: 'ok', warnings: [] }) } as unknown as WikiDiffApplier;
+    const wikiEngine = { generateWikilinks: vi.fn().mockResolvedValue(undefined), generateIndex: vi.fn().mockResolvedValue(undefined) } as unknown as WikiEngine;
+    const mentionIndexer = { incrementalIndex: vi.fn().mockResolvedValue(undefined), indexAll: vi.fn().mockResolvedValue(undefined), generateContextMap: vi.fn().mockResolvedValue(undefined) } as unknown as MentionIndexer;
+    const progressionTracker = { generateProgressionsJson: vi.fn().mockResolvedValue(undefined) } as unknown as ProgressionTracker;
+    const contextPacker = { packContext: vi.fn().mockResolvedValue({ mustRead: [], optionalRead: [], excluded: [], reasons: {} }) } as unknown as ContextPacker;
+    const validator = { validateChange: vi.fn().mockResolvedValue([]), requireNonEmpty: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' }), validateDependencies: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] }) } as unknown as MechanicalValidator;
+
+    const engine = new SyncEngine(root, wikiDiffParser, wikiDiffApplier, wikiEngine, mentionIndexer, progressionTracker, contextPacker, validator);
+
+    await expect(engine.sync('draft-ch-001')).rejects.toThrow(AdabError);
+    await expect(engine.sync('draft-ch-001')).rejects.toThrow(/manifest/i);
   });
 });
