@@ -25,7 +25,8 @@ const _changeManifestShape = _ChangeManifestBase.shape;
 export const ChangeManifestSchema = _ChangeManifestBase.passthrough().refine((data) => {
   for (const key of Object.keys(data as Record<string, unknown>)) {
     if (!(key in _changeManifestShape)) {
-      process.emitWarning(`[ChangeManifestSchema] Unknown manifest field: ${key}`);
+      // eslint-disable-next-line no-console
+      console.warn(`[ChangeManifestSchema] Unknown manifest field: ${key}`);
     }
   }
   return true;

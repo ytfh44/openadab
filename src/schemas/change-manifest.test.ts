@@ -1,7 +1,7 @@
 /**
  * Unit tests for ChangeManifestSchema.
  */
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 
 import { ChangeManifestSchema, ArtifactStatusSchema } from "./change-manifest.js";
 
@@ -100,5 +100,44 @@ describe("ChangeManifestSchema", () => {
       artifacts: { brief: "pending" },
     };
     expect(() => ChangeManifestSchema.parse(input)).toThrow();
+  });
+});
+
+describe("ChangeManifestSchema — unknown field warnings", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Build a minimal valid manifest payload and attach an unknown top-level
+   * key so the refine callback fires.
+   */
+  function makeInputWithUnknownField(): Record<string, unknown> {
+    return {
+      changeId: "draft-ch-099",
+      schema: "chapter-draft",
+      version: 1,
+      created: "2026-06-06T10:00:00Z",
+      status: "in_progress",
+      artifacts: {},
+      surpriseUnknownKey: "should-warn",
+    };
+  }
+
+  it("does not call process.emitWarning when an unknown field is present", () => {
+    const emitWarningSpy = vi.spyOn(process, "emitWarning");
+    const result = ChangeManifestSchema.safeParse(makeInputWithUnknownField());
+    expect(result.success).toBe(true);
+    expect(emitWarningSpy).not.toHaveBeenCalled();
+  });
+
+  it("calls console.warn when an unknown field is present", () => {
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const result = ChangeManifestSchema.safeParse(makeInputWithUnknownField());
+    expect(result.success).toBe(true);
+    expect(consoleWarnSpy).toHaveBeenCalled();
+    const warnedMessage = consoleWarnSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(warnedMessage).toContain("Unknown manifest field");
+    expect(warnedMessage).toContain("surpriseUnknownKey");
   });
 });

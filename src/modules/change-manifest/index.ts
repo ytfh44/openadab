@@ -109,7 +109,8 @@ export class ManifestManager {
       const shape = schema.shape as Record<string, z.ZodType<unknown>>;
       for (const key of Object.keys(obj)) {
         if (!(key in shape)) {
-          process.emitWarning(`[ManifestManager] Unknown manifest field: ${prefix ? `${prefix}.` : ''}${key}`);
+          // eslint-disable-next-line no-console
+          console.warn(`[ManifestManager] Unknown manifest field: ${prefix ? `${prefix}.` : ''}${key}`);
         } else if (obj[key] !== null && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
           this.warnUnknownFields(obj[key] as Record<string, unknown>, shape[key], `${prefix ? `${prefix}.` : ''}${key}`);
         }
@@ -153,14 +154,11 @@ export class ManifestManager {
     manifest.artifacts[artifactId] = status;
     manifest.currentArtifact = artifactId;
 
-    // Cascade: unblock artifacts whose dependencies are all done.
     if (schema) {
-      for (const [id, artStatus] of Object.entries(manifest.artifacts)) {
-        if (artStatus === 'blocked') {
-          const depsDone = this.areAllDependenciesDone(id, manifest, schema);
-          if (depsDone) {
-            manifest.artifacts[id] = 'ready';
-          }
+      for (const [id, currentStatus] of Object.entries(manifest.artifacts)) {
+        const newStatus = this.recomputeArtifactStatus(id, currentStatus, manifest, schema);
+        if (manifest.artifacts[id] !== newStatus) {
+          manifest.artifacts[id] = newStatus;
         }
       }
     }
@@ -186,6 +184,60 @@ export class ManifestManager {
       }
     }
     return true;
+  }
+
+  /**
+   * Recompute a single artifact's status from its current dependency state.
+   *
+   * Pure function: given the artifact's `currentStatus` and the live manifest,
+   * decide what the artifact's status should be RIGHT NOW given which of its
+   * dependencies are currently `done`. This is the building block of the
+   * bidirectional cascade that runs after every `updateArtifactStatus` call.
+   *
+   * Design rules (in order of precedence):
+   *
+   * 1. **`done` is a user-asserted terminal state and is never auto-reverted.**
+   *    Auto-reverting a completed artifact would silently discard finished
+   *    work, which is far more dangerous than a transient `ready` artifact
+   *    in flight. If the user wants to undo a `done` artifact, they must
+   *    explicitly transition it (e.g. `done → ready`); the cascade will not
+   *    do it for them.
+   *
+   * 2. **For every non-`done` status, the status is fully derived from
+   *    dependency state.** If all dependencies are `done` (or there are
+   *    none), the artifact is `ready`. Otherwise the artifact is `blocked`.
+   *    This collapses the historical `blocked` / `ready` (and any future
+   *    intermediate states such as `in_progress`) into a single
+   *    "non-terminal" bucket, so a `ready` artifact whose dependency was
+   *    just rolled back will be re-blocked, and a `blocked` artifact whose
+   *    last dependency just became `done` will be unblocked.
+   *
+   * 3. **Conservative policy for in-flight work:** if a future
+   *    `in_progress` (or any other non-`done`) status is introduced, an
+   *    artifact in that state will also be reverted to `blocked` when its
+   *    dependencies are no longer satisfied. This is deliberate: a writer
+   *    mid-draft on top of a stale dependency is in an unsafe state, and
+   *    it is safer to force them to re-confirm readiness than to let them
+   *    keep writing against a rolled-back foundation.
+   *
+   * @param id            Artifact identifier.
+   * @param currentStatus The artifact's current status (read from the
+   *                      manifest immediately before the cascade ran).
+   * @param manifest      The live manifest (used to inspect sibling statuses).
+   * @param schema        Schema definition (used to look up `requires`).
+   * @returns The status the artifact should have after the cascade.
+   */
+  private recomputeArtifactStatus(
+    id: string,
+    currentStatus: ArtifactStatus,
+    manifest: ChangeManifest,
+    schema: SchemaDef,
+  ): ArtifactStatus {
+    if (currentStatus === 'done') {
+      return 'done';
+    }
+    const depsDone = this.areAllDependenciesDone(id, manifest, schema);
+    return depsDone ? 'ready' : 'blocked';
   }
 
   /**
@@ -271,13 +323,15 @@ export class ManifestManager {
   /**
    * Extract a chapter identifier from a change ID string.
    *
-   * Looks for the `ch-NNN` segment (e.g. `draft-ch-012` → `ch-012`).
+   * Looks for the `ch-NNN` segment (e.g. `draft-ch-012` → `ch-012`) and returns
+   * the full slug including the `ch-` prefix, preserving any leading zeros.
    *
    * @param changeId Change identifier.
-   * @returns Extracted chapter string (e.g. `ch-012`), or `undefined` if none found.
+   * @returns Full chapter slug in the form `ch-NNN` (preserves leading zeros),
+   *   or `undefined` if no `ch-NNN` segment is found.
    */
   private extractChapter(changeId: string): string | undefined {
     const match = /ch-(\d+)/i.exec(changeId);
-    return match ? match[1] : undefined;
+    return match ? `ch-${match[1]}` : undefined;
   }
 }
