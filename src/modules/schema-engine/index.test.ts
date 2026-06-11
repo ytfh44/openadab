@@ -2,11 +2,13 @@
  * Unit tests for the Schema Engine module.
  */
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+import * as resourcePaths from '../../utils/resource-paths.js';
 import { SchemaValidationError, AdabError, CycleDetectedError } from '../../utils/errors.js';
 
 import {
@@ -17,6 +19,14 @@ import {
   interpolateVariables,
   interpolateConfigVariables,
 } from './index.js';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readdir: vi.fn(actual.readdir),
+  };
+});
 
 
 describe('SchemaLoader', () => {
@@ -75,6 +85,62 @@ describe('SchemaLoader', () => {
   it('forkSchema throws for non-existent base schema', async () => {
     const loader = new SchemaLoader(tempDir);
     await expect(loader.forkSchema('nonexistent', 'my-copy')).rejects.toBeInstanceOf(SchemaValidationError);
+  });
+});
+
+describe('SchemaLoader.listBuiltInSchemas (L9 — silent catch fix)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'openadab-l9-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('returns [] when the built-in schemas directory cannot be located (resolveBuiltInSchemasDir throws)', async () => {
+    vi.spyOn(resourcePaths, 'resolveBuiltInSchemasDir').mockImplementation(() => {
+      throw new Error('Could not locate built-in schemas directory');
+    });
+    const loader = new SchemaLoader(tempDir);
+    const list = await loader.listBuiltInSchemas();
+    expect(list).toEqual([]);
+  });
+
+  it('rethrows non-ENOENT readdir errors (e.g. EACCES) instead of silently swallowing them', async () => {
+    const fakeBuiltInDir = join(tempDir, 'fake-built-in');
+    mkdirSync(fakeBuiltInDir, { recursive: true });
+    vi.spyOn(resourcePaths, 'resolveBuiltInSchemasDir').mockReturnValue(fakeBuiltInDir);
+    const eaccesErr: NodeJS.ErrnoException = new Error('permission denied');
+    eaccesErr.code = 'EACCES';
+    vi.mocked(fsPromises.readdir).mockRejectedValueOnce(eaccesErr);
+    const loader = new SchemaLoader(tempDir);
+    await expect(loader.listBuiltInSchemas()).rejects.toThrow('permission denied');
+  });
+
+  it('returns parsed schema directory names when the built-in directory is readable', async () => {
+    const fakeBuiltInDir = join(tempDir, 'fake-built-in');
+    mkdirSync(join(fakeBuiltInDir, 'schema-a'), { recursive: true });
+    mkdirSync(join(fakeBuiltInDir, 'schema-b'), { recursive: true });
+    writeFileSync(join(fakeBuiltInDir, 'noise.md'), 'not a directory');
+    vi.spyOn(resourcePaths, 'resolveBuiltInSchemasDir').mockReturnValue(fakeBuiltInDir);
+    const loader = new SchemaLoader(tempDir);
+    const list = await loader.listBuiltInSchemas();
+    expect(list).toContain('schema-a');
+    expect(list).toContain('schema-b');
+    expect(list).not.toContain('noise.md');
+  });
+
+  it('returns [] and does not throw when the resolved directory disappears between resolve and readdir (ENOENT race)', async () => {
+    const fakeBuiltInDir = join(tempDir, 'fake-built-in');
+    mkdirSync(fakeBuiltInDir, { recursive: true });
+    rmSync(fakeBuiltInDir, { recursive: true, force: true });
+    vi.spyOn(resourcePaths, 'resolveBuiltInSchemasDir').mockReturnValue(fakeBuiltInDir);
+    const loader = new SchemaLoader(tempDir);
+    const list = await loader.listBuiltInSchemas();
+    expect(list).toEqual([]);
   });
 });
 

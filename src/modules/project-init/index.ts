@@ -2,13 +2,13 @@
  * Project Init Module — scaffolds a new OpenAdab project directory.
  */
 import { readFile, readdir, copyFile } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 import YAML from 'yaml';
 
 import { AdabError } from '../../utils/errors.js';
 import { atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
+import { resolveBuiltInSchemasDir, resolveCommandsDir } from '../../utils/resource-paths.js';
 import {
   detectHost,
   CommandDefLoader,
@@ -44,18 +44,34 @@ export class ProjectInitializer {
    * Initialize a new OpenAdab project.
    *
    * Creates all required directories, default files, and built-in schema copies.
-   * Throws {@link AdabError} if `adab/` already exists.
+   * If `adab/` exists but `config.yaml` is missing (half-initialized state),
+   * automatically recovers by creating the missing configuration.
    *
    * @param options Optional initialization overrides.
-   * @throws {AdabError} If the project has already been initialized.
+   * @throws {AdabError} If the project has already been fully initialized.
    */
   async init(options: InitOptions = {}): Promise<void> {
     const adabDir = join(this.targetDir, 'adab');
+    const configPath = join(adabDir, 'config.yaml');
+
     if (await fileExists(adabDir)) {
-      throw new AdabError(
-        `Project already initialized: ${adabDir} exists. Use \`openadab update\` to refresh schemas and host adapters.`,
-        'PROJECT_ALREADY_INITIALIZED'
-      );
+      if (await fileExists(configPath)) {
+        throw new AdabError(
+          `Project already initialized: ${adabDir} exists. Use \`openadab update\` to refresh schemas and host adapters.`,
+          'PROJECT_ALREADY_INITIALIZED'
+        );
+      }
+      // Half-initialized state: adab/ exists but config.yaml is missing.
+      // Automatically recover by creating missing files.
+      await this.scaffoldDirectories(adabDir);
+      await this.createDefaultWikiTemplates(adabDir);
+      await this.createDefaultConfig(adabDir, options.schema ?? 'chapter-draft');
+      await this.copyBuiltInSchemas(adabDir);
+      await this.updateGitignore();
+      await this.createLogMd(adabDir);
+      await this.createEmptyIndexFiles(adabDir);
+      await this.generateHostAdapters(options.host);
+      return;
     }
 
     await this.scaffoldDirectories(adabDir);
@@ -167,20 +183,10 @@ created: ${new Date().toISOString()}
   }
 
   private async copyBuiltInSchemas(adabDir: string): Promise<void> {
-    const candidates = [
-      join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schemas', 'built-in'),
-      join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'src', 'schemas', 'built-in'),
-    ];
-    let builtInDir: string | null = null;
-    for (const c of candidates) {
-      if (await fileExists(c)) {
-        builtInDir = c;
-        break;
-      }
-    }
-    if (builtInDir === null) {
+    const builtInDir = resolveBuiltInSchemasDir(import.meta.url);
+    if (!(await fileExists(builtInDir))) {
       throw new AdabError(
-        `Built-in schema source directory not found. Tried: ${candidates.join(' and ')}`,
+        `Built-in schema source directory not found: ${builtInDir}`,
         'BUILT_IN_SCHEMAS_NOT_FOUND'
       );
     }
@@ -271,18 +277,8 @@ created: ${new Date().toISOString()}
       host = 'generic';
     }
 
-    const candidates = [
-      join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'commands'),
-      join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'src', 'commands'),
-    ];
-    let commandsDir: string | null = null;
-    for (const c of candidates) {
-      if (await fileExists(c)) {
-        commandsDir = c;
-        break;
-      }
-    }
-    if (commandsDir === null) {
+    const commandsDir = resolveCommandsDir(import.meta.url);
+    if (!(await fileExists(commandsDir))) {
       return;
     }
 

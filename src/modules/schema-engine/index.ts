@@ -1,7 +1,7 @@
 /**
  * Schema Engine — loads, validates, forks, and interpolates workflow schemas.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readdir, copyFile } from 'node:fs/promises';
 import { join , dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ import { SchemaDefSchema, type SchemaDef, type ArtifactDef } from '../../schemas
 import type { ValidationResult } from '../../schemas/types.js';
 import { SchemaValidationError, CycleDetectedError, UnresolvedVariableError, TemplateNotFoundError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
+import { resolveBuiltInSchemasDir } from '../../utils/resource-paths.js';
 
 /**
  * Loads and validates schema YAML from a directory.
@@ -60,25 +61,40 @@ export class SchemaLoader {
   /**
    * List available built-in schema names shipped with the CLI.
    *
-   * @returns Array of built-in schema directory names.
+   * Returns an empty array when the built-in schemas directory cannot be
+   * located (e.g. in a stripped-down distribution) or when the directory
+   * has been removed between path resolution and readdir. I/O errors other
+   * than the directory being missing — most notably permission denied
+   * (EACCES) — are propagated to the caller, since silently swallowing
+   * them would mask real failures and make the CLI report "no schemas
+   * available" when the actual problem is a broken installation or
+   * misconfigured filesystem.
+   *
+   * @param activeSchema Optional name of the currently active schema; the
+   *                     matching entry will be tagged with ` [active]`.
+   * @returns Array of built-in schema directory names (possibly empty).
    */
   async listBuiltInSchemas(activeSchema?: string): Promise<string[]> {
-    const candidates = [
-      join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'schemas', 'built-in'),
-      join(process.cwd(), 'src', 'schemas', 'built-in'),
-    ];
-    for (const builtInDir of candidates) {
-      try {
-        const entries = await readdir(builtInDir, { withFileTypes: true });
-        return entries
-          .filter((d) => d.isDirectory())
-          .map((d) => (d.name === activeSchema ? `${d.name} [active]` : d.name));
-      } catch (err) {
-        console.warn('[SchemaEngine] Failed to read built-in schema candidates dir:', err instanceof Error ? err.message : String(err));
-        // Try next candidate.
-      }
+    let builtInDir: string;
+    try {
+      builtInDir = resolveBuiltInSchemasDir(import.meta.url);
+    } catch {
+      return [];
     }
-    return [];
+    if (!existsSync(builtInDir)) {
+      return [];
+    }
+    try {
+      const entries = await readdir(builtInDir, { withFileTypes: true });
+      return entries
+        .filter((d) => d.isDirectory())
+        .map((d) => (d.name === activeSchema ? `${d.name} [active]` : d.name));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw err;
+    }
   }
 
   private async copyDirContents(src: string, dest: string): Promise<void> {
@@ -106,7 +122,7 @@ export class SchemaLoader {
    * @throws {SchemaValidationError} If the base schema does not exist.
    */
   async forkSchema(baseName: string, newName: string): Promise<void> {
-    const builtInDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'schemas', 'built-in');
+    const builtInDir = resolveBuiltInSchemasDir(import.meta.url);
     const srcDir = join(builtInDir, baseName);
     if (!(await fileExists(srcDir))) {
       const available = await this.listBuiltInSchemas();

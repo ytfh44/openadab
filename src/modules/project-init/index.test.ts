@@ -13,6 +13,77 @@ import * as hostAdapters from '../host-adapters/index.js';
 
 import { ProjectInitializer } from './index.js';
 
+describe('ProjectInitializer — half-initialized recovery', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'openadab-half-init-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  /**
+   * Simulates a half-initialized state: adab/ directory exists but config.yaml is missing.
+   * This can happen if init was interrupted or manually created the directory.
+   */
+  function setupHalfInitializedState(projectRoot: string): void {
+    mkdirSync(join(projectRoot, 'adab', 'manuscript'), { recursive: true });
+    mkdirSync(join(projectRoot, 'adab', 'wiki'), { recursive: true });
+    mkdirSync(join(projectRoot, 'adab', 'raw'), { recursive: true });
+    // Intentionally do NOT create config.yaml
+  }
+
+  it('recovers when adab/ exists but config.yaml is missing', async () => {
+    setupHalfInitializedState(tempDir);
+    const initializer = new ProjectInitializer(tempDir);
+    // Should NOT throw — should recover automatically
+    await expect(initializer.init()).resolves.toBeUndefined();
+    // Verify config.yaml was created
+    expect(existsSync(join(tempDir, 'adab', 'config.yaml'))).toBe(true);
+  });
+
+  it('still throws when adab/ exists AND config.yaml is present (fully initialized)', async () => {
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    const secondInitializer = new ProjectInitializer(tempDir);
+    // Full init should still throw PROJECT_ALREADY_INITIALIZED
+    await expect(secondInitializer.init()).rejects.toBeInstanceOf(AdabError);
+    await expect(secondInitializer.init()).rejects.toThrow(/Project already initialized/);
+  });
+
+  it('creates all required subdirectories when recovering from half-initialized state', async () => {
+    setupHalfInitializedState(tempDir);
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    // Verify key directories exist with .gitkeep files
+    expect(existsSync(join(tempDir, 'adab', 'manuscript', 'chapters', '.gitkeep'))).toBe(true);
+    expect(existsSync(join(tempDir, 'adab', 'wiki', 'characters', '.gitkeep'))).toBe(true);
+    expect(existsSync(join(tempDir, 'adab', 'schemas', '.gitkeep'))).toBe(true);
+  });
+
+  it('creates config.yaml with default values when recovering', async () => {
+    setupHalfInitializedState(tempDir);
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    const configRaw = readFileSync(join(tempDir, 'adab', 'config.yaml'), 'utf-8');
+    expect(configRaw).toContain('schema: chapter-draft');
+    expect(configRaw).toContain('title: Untitled Novel');
+    expect(configRaw).toContain('language: zh-CN');
+  });
+
+  it('does not create duplicate directories when recovering (no error)', async () => {
+    setupHalfInitializedState(tempDir);
+    const initializer = new ProjectInitializer(tempDir);
+    // Should not throw even though some directories already exist
+    await expect(initializer.init()).resolves.toBeUndefined();
+    // Verify directories still exist
+    expect(existsSync(join(tempDir, 'adab', 'manuscript'))).toBe(true);
+    expect(existsSync(join(tempDir, 'adab', 'wiki'))).toBe(true);
+  });
+});
+
 describe('ProjectInitializer', () => {
   let tempDir: string;
 

@@ -552,6 +552,35 @@ async function saveGenerationCache(projectRoot: string, cache: GenerationCache):
 }
 
 /**
+ * Check whether a file on disk already holds the exact bytes a caller
+ * is about to write.
+ *
+ * @public
+ *
+ * Public utility exported for consumers that need a cheap "is the
+ * on-disk file in sync with what I am about to write?" check — for
+ * example, to skip a redundant write when regenerating scaffold,
+ * instruction, or config files inside their own generators.
+ *
+ * Unlike a hash-based comparison, this helper compares the raw string
+ * contents directly, which is sufficient for the small text files the
+ * CLI generates.
+ *
+ * @param filePath         Absolute path to the file to inspect.
+ * @param expectedContent  The content the caller intends to write.
+ * @returns `true` when the file exists and its contents exactly equal
+ *          `expectedContent`; `false` when the file is missing or its
+ *          content differs in any way.
+ */
+export async function isUnchanged(filePath: string, expectedContent: string): Promise<boolean> {
+  const existingContent = await safeReadFile(filePath);
+  if (existingContent === null) {
+    return false;
+  }
+  return existingContent === expectedContent;
+}
+
+/**
  * Write generated files, preserving user modifications when baselines differ.
  *
  * For each generated file:
@@ -565,14 +594,6 @@ async function saveGenerationCache(projectRoot: string, cache: GenerationCache):
  * @param files       Array of generated files.
  * @returns Array of paths that were written.
  */
-export async function isUnchanged(filePath: string, expectedContent: string): Promise<boolean> {
-  const existingContent = await safeReadFile(filePath);
-  if (existingContent === null) {
-    return false;
-  }
-  return existingContent === expectedContent;
-}
-
 export async function writeGeneratedFiles(projectRoot: string, files: GeneratedFile[]): Promise<string[]> {
   const cache = await loadGenerationCache(projectRoot);
   const written: string[] = [];
