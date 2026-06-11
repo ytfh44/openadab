@@ -193,7 +193,9 @@ export class ConfigWriter {
           target = [];
         }
         if ((target as unknown[]).length <= k) {
-          (target as unknown[]).push({});
+          while ((target as unknown[]).length <= k) {
+            (target as unknown[]).push({});
+          }
         }
         target = (target as unknown[])[k] as unknown as Record<string, unknown> | unknown[];
       } else if (typeof target !== 'object' || target === null) {

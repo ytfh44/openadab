@@ -342,6 +342,25 @@ export class WikiDiffApplier {
       }
 
       if (!dryRun) {
+        // Track page change counts for summary in non-dry-run mode (B21 fix)
+        // Note: contradictionsFlagged is incremented in the switch case below
+        if (op.type !== 'flag_contradiction') {
+          modifiedPages.add(op.target);
+          const existing = pageChangeCounts.get(op.target) ?? { count: 0, details: [] };
+          existing.count++;
+          if (op.type === 'update_thread_status') {
+            let oldStatus = '?';
+            try {
+              const page = await this.wikiEngine.readPage(op.target);
+              oldStatus = String(page.frontmatter.status ?? '?');
+            } catch {
+              // Keep '?' if page cannot be read
+            }
+            existing.details.push(`status: ${oldStatus}→${op.status}`);
+          }
+          pageChangeCounts.set(op.target, existing);
+        }
+        // Apply the operation
         switch (op.type) {
           case 'add_current_state':
             await this.applyAddCurrentState(op);
@@ -583,6 +602,8 @@ export class WikiDiffApplier {
    */
   private async applyUpdateThreadStatus(op: Extract<WikiDiffOperation, { type: 'update_thread_status' }>): Promise<void> {
     const page = await this.wikiEngine.readPage(op.target);
+    const oldBody = page.body;
+    const oldStatus = page.frontmatter.status;
     page.frontmatter.status = op.status;
     let body = page.body;
     if (op.evidence !== undefined && op.evidence.length > 0) {
@@ -595,6 +616,8 @@ export class WikiDiffApplier {
         body += `\n## Evidence\n\n${lines}\n`;
       }
     }
+    // Skip write if nothing changed (B9 fix)
+    if (body === oldBody && oldStatus === op.status) {return;}
     page.frontmatter.last_updated = op.source;
     await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
   }
@@ -604,6 +627,7 @@ export class WikiDiffApplier {
    */
   private async applyAddEvidence(op: Extract<WikiDiffOperation, { type: 'add_evidence' }>): Promise<void> {
     const page = await this.wikiEngine.readPage(op.target);
+    const oldBody = page.body;
     let body = page.body;
     const section = extractSectionsByHeading(body, 'Evidence');
     if (section !== null) {
@@ -612,6 +636,8 @@ export class WikiDiffApplier {
     } else {
       body += `\n## Evidence\n\n- ${op.evidence}\n`;
     }
+    // Skip write if nothing changed (B9 fix)
+    if (body === oldBody) {return;}
     page.frontmatter.last_updated = op.source;
     await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
   }
@@ -654,6 +680,8 @@ export class WikiDiffApplier {
           'WIKI_DIFF_TYPE_MISMATCH',
         );
       }
+      // Skip write if value unchanged (B9 fix)
+      if (existing === op.value) {return;}
     }
     page.frontmatter[op.field] = op.value;
     page.frontmatter.last_updated = op.source;

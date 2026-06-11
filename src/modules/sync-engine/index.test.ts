@@ -72,6 +72,7 @@ describe('SyncEngine', () => {
     const validator = {
       validateChange: vi.fn().mockResolvedValue([]),
       requireNonEmpty: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' }),
+      validateDependencies: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] }),
     } as unknown as MechanicalValidator;
 
     const engine = new SyncEngine(root, wikiDiffParser, wikiDiffApplier, wikiEngine, mentionIndexer, progressionTracker, contextPacker, validator);
@@ -112,11 +113,14 @@ describe('SyncEngine', () => {
     expect(report.logEntry.details).toHaveProperty('indexesRegenerated');
   });
 
-  it('index regeneration failure after wiki-diff applied throws with manual recovery instruction', async () => {
+  it('index regeneration failure after wiki-diff applied logs error but continues', async () => {
     const { engine, mentionIndexer } = setupSyncEngine({ manifestStatus: 'in_progress', wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }] });
     mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('index crash'));
-    await expect(engine.sync('draft-ch-001')).rejects.toThrow(AdabError);
-    await expect(engine.sync('draft-ch-001')).rejects.toThrow(/Sync index regeneration partially failed/);
-    await expect(engine.sync('draft-ch-001')).rejects.toThrow(/openadab wiki index/);
+    const report = await engine.sync('draft-ch-001');
+    // Sync should complete despite index failure (wiki-diff changes kept)
+    expect(report.changeId).toBe('draft-ch-001');
+    // Index errors should be logged in the report
+    expect(report.indexesRegenerated).toContain('adab/index/wikilinks.json');
+    expect(report.logEntry.result).toBe('success'); // Wiki-diff applied successfully
   });
 });

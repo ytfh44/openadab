@@ -559,14 +559,14 @@ export class ContextPacker {
     return best !== null ? `ch-${String(best).padStart(3, '0')}.md` : null;
   }
 
-  /**
-   * Check whether the mention index is stale by comparing `.last-indexed`
-   * against the most recent manuscript modification time.
-   *
-   * @returns Warning string if stale, otherwise `null`.
-   */
-  private async checkStaleIndex(): Promise<string | null> {
-    const lastIndexedPath = join(this.projectRoot, 'adab', 'index', '.last-indexed');
+   /**
+    * Check whether the mention index is stale by comparing `.last-mention-indexed`
+    * against the most recent manuscript modification time.
+    *
+    * @returns Warning string if stale, otherwise `null`.
+    */
+   private async checkStaleIndex(): Promise<string | null> {
+     const lastIndexedPath = join(this.projectRoot, 'adab', 'index', '.last-mention-indexed');
     const lastIndexedRaw = await safeReadFile(lastIndexedPath);
     if (lastIndexedRaw === null) {
       return 'Mention index has never been built. Run `openadab sync` or `openadab wiki index` first.';
@@ -592,7 +592,7 @@ export class ContextPacker {
     }
 
     if (maxMtime > lastIndexed) {
-      return `Mention index is stale (last indexed ${new Date(lastIndexed).toISOString()}, manuscript updated ${new Date(maxMtime).toISOString()}). Run \\\`openadab sync\\\` to refresh.`;
+      return `Mention index is stale (last indexed ${new Date(lastIndexed).toISOString()}, manuscript updated ${new Date(maxMtime).toISOString()}). Run \`openadab sync\` to refresh.`;
     }
     return null;
   }

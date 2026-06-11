@@ -114,7 +114,7 @@ export class SchemaLoader {
         `Schema '${baseName}' not found. Available: ${available.join(', ') || 'none'}`
       );
     }
-    const destDir = join(this.schemaDir, '..', newName);
+    const destDir = join(this.schemaDir, newName);
     await ensureDir(destDir);
     await this.copyDirContents(srcDir, destDir);
 

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename, mkdir, access, unlink } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 import { AdabError } from './errors.js';
 
@@ -37,7 +38,7 @@ export function safeReadFileSync(path: string): string | null {
     return readFileSync(path, 'utf-8');
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
-    if (e.code === 'ENOENT') {
+    if (e.code === 'ENOENT' || e.code === 'EISDIR') {
       return null;
     }
     throw new AdabError(`Failed to read "${path}": ${e.message}`, 'FS_READ_ERROR', { cause: err });
@@ -56,6 +57,7 @@ export function safeReadFileSync(path: string): string | null {
 export async function atomicWriteFile(path: string, content: string): Promise<void> {
   const tempPath = `${path}.tmp.${randomUUID()}`;
   try {
+    await mkdir(dirname(path), { recursive: true });
     await writeFile(tempPath, content, 'utf-8');
     await rename(tempPath, path);
   } catch (err) {
@@ -96,11 +98,11 @@ export async function fileExists(path: string): Promise<boolean> {
     await access(path);
     return true;
   } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === 'ENOENT') {
-      return false;
-    }
-    if (e.code === 'EACCES' || e.code === 'EPERM') {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === 'ENOENT') {
+        return false;
+      }
+      if (e.code === 'EACCES' || e.code === 'EPERM') {
       throw new AdabError(`Permission denied accessing "${path}": ${e.message}`, 'FS_ACCESS_ERROR', { cause: err });
     }
     throw new AdabError(`Failed to access "${path}": ${e.message}`, 'FS_ACCESS_ERROR', { cause: err });

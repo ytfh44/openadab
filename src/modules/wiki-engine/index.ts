@@ -134,7 +134,6 @@ export class WikiEngine {
    * already regenerating the index, subsequent calls are no-ops.
    */
   async endBatch(): Promise<void> {
-    this.batchMode = false;
     if (!this.generatingIndex) {
       this.generatingIndex = true;
       try {
@@ -144,6 +143,7 @@ export class WikiEngine {
         this.generatingIndex = false;
       }
     }
+    this.batchMode = false;
   }
 
   /**
@@ -468,15 +468,15 @@ export class WikiEngine {
 
     if (newEntries.length === 0) {
       // Only updates were made (no new entries) — write the updated existing content
-      if (existing !== ((await safeReadFile(contradictionsPath)) ?? '')) {
+      // Only write if the file existed before (to avoid creating empty file)
+      if (existing.length > 0) {
         await atomicWriteFile(contradictionsPath, existing.trim() + '\n');
       }
       return;
     }
 
-    // Re-read before appending to avoid losing concurrent changes
-    const fresh = (await safeReadFile(contradictionsPath)) ?? '';
-    const output = `${fresh.trim()}\n${newEntries.join('\n')}`;
+    // Append new entries to the updated existing content (not fresh read from disk)
+    const output = `${existing.trim()}\n${newEntries.join('\n')}`;
     await atomicWriteFile(contradictionsPath, `${output.trim()}\n`);
   }
 

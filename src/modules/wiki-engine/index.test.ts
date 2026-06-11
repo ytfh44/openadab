@@ -224,7 +224,11 @@ describe('WikiEngine', () => {
 
     it('does nothing when no flag_contradiction operations', async () => {
       await engine.updateContradictions([]);
-      expect(() => readFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'))).toThrow();
+      // File should not be created when there are no operations
+      const path = join(tempDir, 'adab', 'wiki', 'contradictions.md');
+      const { fileExists } = await import('../../utils/fs.js');
+      const exists = await fileExists(path);
+      expect(exists).toBe(false);
     });
   });
 });

@@ -456,8 +456,13 @@ export class MonolithicPromptAdapter extends AdapterBase {
     const divisor = this.getTokenDivisor();
     const approxTokens = Math.ceil(content.length / divisor);
     if (approxTokens > this.budget) {
-      const truncLen = Math.floor(this.budget * 4);
+      const truncLen = Math.floor(this.budget * divisor);
       content = content.slice(0, truncLen);
+      // Backtrack to the last complete `## ` section boundary
+      const lastSection = content.lastIndexOf('\n## ');
+      if (lastSection > 0) {
+        content = content.slice(0, lastSection);
+      }
       content += '\n\n[Content truncated to fit token budget]\n';
     }
 

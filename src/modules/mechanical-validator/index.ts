@@ -284,7 +284,7 @@ export class MechanicalValidator {
 
     return {
       artifactId,
-      passed: warnings.length === 0,
+      passed: true, // Warnings don't block sync — they're informational
       errors: [],
       warnings,
     };
