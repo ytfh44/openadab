@@ -132,6 +132,18 @@ describe('WikiDiffParser', () => {
     await expect(parser.parse(markdown)).rejects.toThrow(/Duplicate operation/);
   });
 
+  it('deduplicates operations with same target+action regardless of sources order', async () => {
+    const markdown = `---\nchangeId: draft-ch-012\n---\n\n### [[characters/mara]]\nSource: manuscript/chapters/ch-012.md\n\n#### Add to Current State\n- Mara knows.\n\n### [[characters/mara]]\nSource: manuscript/chapters/ch-013.md\n\n#### Add to Current State\n- Mara knows.\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(WikiDiffParseError);
+    await expect(parser.parse(markdown)).rejects.toThrow(/Duplicate operation/);
+  });
+
+  it('does not deduplicate operations with different targets', async () => {
+    const markdown = `---\nchangeId: draft-ch-012\n---\n\n### [[characters/mara]]\nSource: manuscript/chapters/ch-012.md\n\n#### Add to Current State\n- Mara knows.\n\n### [[characters/lin]]\nSource: manuscript/chapters/ch-012.md\n\n#### Add to Current State\n- Lin knows.\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(2);
+  });
+
   it('skips H3 heading without wiki link (non-target headings are harmless)', async () => {
     const markdown = `---\nchangeId: draft-ch-012\n---\n\n### Just a Heading\nSome content.\n\n### [[characters/mara]]\nSource: manuscript/chapters/ch-012.md\n\n#### Add to Current State\n- Mara knows.\n`;
     const doc = await parser.parse(markdown);

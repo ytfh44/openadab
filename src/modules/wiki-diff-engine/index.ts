@@ -80,11 +80,11 @@ export class WikiDiffParser {
         const blockMarkdown = this.nodesToMarkdown(blockNodes, markdown);
         const ops = this.parseBlock(blockMarkdown, targetPath, markdown, i);
         for (const op of ops) {
-          const key = `${op.type}:${op.target}:${JSON.stringify(op)}`;
-          if (seen.has(key)) {
+          const dedupKey = `${op.target}::${op.action}`;
+          if (seen.has(dedupKey)) {
             throw new WikiDiffParseError(`Duplicate operation detected for target ${op.target}`);
           }
-          seen.add(key);
+          seen.add(dedupKey);
           operations.push(op);
         }
         i = blockEnd;
