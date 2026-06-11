@@ -23,9 +23,6 @@ importers:
       gray-matter:
         specifier: ^4.0.3
         version: 4.0.3
-      openadab:
-        specifier: 'link:'
-        version: 'link:'
       ora:
         specifier: ^8.2.0
         version: 8.2.0

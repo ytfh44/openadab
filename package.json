@@ -32,7 +32,6 @@
     "commander": "^13.1.0",
     "fast-glob": "^3.3.3",
     "gray-matter": "^4.0.3",
-    "openadab": "link:",
     "ora": "^8.2.0",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",

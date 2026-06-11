@@ -98,7 +98,9 @@ function resolveProjectRoot(): string {
  * @param fallback Default to use when value is not a valid non-empty string.
  */
 function safeStringOption(value: unknown, fallback: string): string {
-  if (typeof value === 'string' && value.length > 0) return value;
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
   return fallback;
 }
 

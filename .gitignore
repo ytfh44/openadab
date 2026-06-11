@@ -68,3 +68,10 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+adab/index/*.json
+adab/index/.last-mention-indexed
+adab/index/.last-progression-indexed
+adab/log.md
+adab/wiki/index.md
+adab/wiki/overview.md
+adab/wiki/contradictions.md
