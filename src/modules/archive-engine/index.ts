@@ -97,7 +97,7 @@ export class ArchiveEngine {
     }
     const manuscriptDir = join(this.projectRoot, 'adab', 'manuscript', 'chapters');
     await mkdir(manuscriptDir, { recursive: true });
-    const manuscriptPath = join(manuscriptDir, `ch-${chapterId}.md`);
+    const manuscriptPath = join(manuscriptDir, `${chapterId}.md`);
 
     const revisionFileName = await this.resolveRevisionFilename(manifest);
     const revisionPath = join(changePath, revisionFileName);
@@ -232,10 +232,17 @@ export class ArchiveEngine {
 
   /**
    * Infer the chapter identifier from the change directory name.
+   *
+   * Looks for the `ch-NNN` segment (e.g. `draft-ch-012` → `ch-012`) and returns
+   * the full slug including the `ch-` prefix, preserving any leading zeros.
+   *
+   * @param changeDir Change directory name (e.g. `draft-ch-012`).
+   * @returns Full chapter slug in the form `ch-NNN` (preserves leading zeros),
+   *   or `null` if no `ch-NNN` segment is found.
    */
   private inferChapterId(changeDir: string): string | null {
     const match = /ch-(\d+)/i.exec(changeDir);
-    return match ? match[1] : null;
+    return match ? `ch-${match[1]}` : null;
   }
 
   /**

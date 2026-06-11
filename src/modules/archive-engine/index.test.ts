@@ -84,4 +84,23 @@ describe('ArchiveEngine', () => {
     await expect(engine.archive('nonexistent')).rejects.toThrow(AdabError);
     await expect(engine.archive('nonexistent')).rejects.toThrow(/not found/);
   });
+
+  it('writes manuscript as ch-NNN.md (not ch-ch-NNN.md, not bare NNN.md)', async () => {
+    const { root } = setupProject({ manifestStatus: 'synced' });
+    const engine = new ArchiveEngine(root);
+    const report = await engine.archive('draft-ch-012');
+    const expectedPath = join(root, 'adab', 'manuscript', 'chapters', 'ch-012.md');
+    expect(report.manuscriptPath).toBe(expectedPath);
+    expect(existsSync(expectedPath)).toBe(true);
+    expect(existsSync(join(root, 'adab', 'manuscript', 'chapters', 'ch-ch-012.md'))).toBe(false);
+    expect(existsSync(join(root, 'adab', 'manuscript', 'chapters', '012.md'))).toBe(false);
+  });
+
+  it('infers chapterId as the full ch-NNN slug (consumed uniformly by callers)', async () => {
+    const { root } = setupProject({ manifestStatus: 'synced' });
+    const engine = new ArchiveEngine(root);
+    const report = await engine.archive('draft-ch-012');
+    expect(report.logEntry.details?.chapter).toBe('ch-012');
+    expect(report.manuscriptPath).toContain('ch-012.md');
+  });
 });
