@@ -9,8 +9,9 @@
   "main": "./dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.build.json",
-    "prepare": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-resources.mjs",
+    "prepare": "tsc -p tsconfig.build.json && node scripts/copy-resources.mjs",
+    "copy:resources": "node scripts/copy-resources.mjs",
     "test": "vitest run",
     "test:watch": "vitest watch",
     "lint": "eslint src tests"
