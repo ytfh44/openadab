@@ -28,18 +28,22 @@ export function extractFrontmatter(content: string): FrontmatterResult {
  * Extract all wiki-style links (`[[...]]`) from a Markdown string.
  *
  * Supports links with or without display text (`[[Target|Display]]`).
- * Only the target portion is returned.
+ * Only the target portion is returned. Wiki links inside inline code
+ * (backticks) or HTML `<code>` tags are excluded.
  *
  * @param content Markdown content.
  * @returns Array of link targets (deduplicated, in order of first appearance).
  */
 export function extractWikiLinks(content: string): string[] {
+  const withoutCode = content
+    .replace(/`[^`\n]*`/g, '')
+    .replace(/<code[^>]*>[\s\S]*?<\/code>/gi, '');
   const regex = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
   const targets: string[] = [];
   const seen = new Set<string>();
 
   let match: RegExpExecArray | null;
-  while ((match = regex.exec(content)) !== null) {
+  while ((match = regex.exec(withoutCode)) !== null) {
     const target = match[1].trim();
     if (target && !seen.has(target)) {
       seen.add(target);

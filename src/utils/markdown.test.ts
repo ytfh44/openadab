@@ -69,6 +69,36 @@ describe('extractWikiLinks', () => {
     const input = 'Line 1 [[A]]\nLine 2 [[B]]';
     expect(extractWikiLinks(input)).toEqual(['A', 'B']);
   });
+
+  it('should not extract wiki links inside backtick inline code', () => {
+    const input = '`[[Foo]]`';
+    expect(extractWikiLinks(input)).toEqual([]);
+  });
+
+  it('should not extract multiple wiki links when entire line is in backticks', () => {
+    const input = '`[[Foo]] and [[Bar]]`';
+    expect(extractWikiLinks(input)).toEqual([]);
+  });
+
+  it('should extract wiki link after inline code ends', () => {
+    const input = 'Text `[[Foo]]` more [[Bar]]';
+    expect(extractWikiLinks(input)).toEqual(['Bar']);
+  });
+
+  it('should extract wiki link in normal text before inline code', () => {
+    const input = 'Text before [[Foo]] `[[Bar]]` after';
+    expect(extractWikiLinks(input)).toEqual(['Foo']);
+  });
+
+  it('should not extract wiki links inside HTML <code> tags', () => {
+    const input = '<code>[[Foo]]</code>';
+    expect(extractWikiLinks(input)).toEqual([]);
+  });
+
+  it('should extract only code-external wiki links in mixed content', () => {
+    const input = '`[[Foo]]` [[Bar]]';
+    expect(extractWikiLinks(input)).toEqual(['Bar']);
+  });
 });
 
 describe('extractSectionsByHeading', () => {
