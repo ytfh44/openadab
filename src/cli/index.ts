@@ -6,12 +6,11 @@
  * configuration, and logging.
  */
 import { mkdir, readdir } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import util from 'node:util';
 
 import chalk from 'chalk';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import ora from 'ora';
 import YAML from 'yaml';
 
@@ -29,6 +28,7 @@ import { MentionIndexer } from '../modules/mention-indexer/index.js';
 import { ProgressionTracker } from '../modules/progression-tracker/index.js';
 import { ConfigLoader, ConfigWriter } from '../modules/project-config/index.js';
 import { ProjectInitializer } from '../modules/project-init/index.js';
+import { resolveCommandsDir } from '../utils/resource-paths.js';
 import { SchemaLoader, SchemaValidator } from '../modules/schema-engine/index.js';
 import { SyncEngine } from '../modules/sync-engine/index.js';
 import { WikiDiffApplier, WikiDiffParser } from '../modules/wiki-diff-engine/index.js';
@@ -37,6 +37,7 @@ import { ProjectConfigSchema } from '../schemas/project-config.js';
 import type { ValidationResult } from '../schemas/types.js';
 import { AdabError } from '../utils/errors.js';
 import { fileExists, safeReadFile } from '../utils/fs.js';
+import { extractWikiTargets } from '../utils/wiki-link-regex.js';
 
 /**
  * CLI options shared across multiple commands.
@@ -105,6 +106,24 @@ function safeStringOption(value: unknown, fallback: string): string {
 }
 
 /**
+ * Resolve the dryRun flag for `wiki apply-diff` from the parsed CLI options.
+ *
+ * `--apply` always wins: if it is explicitly set to true, the wiki-diff
+ * must be written to disk and dryRun is false. Otherwise, dry-run is the
+ * safe default (dryRun=true), so passing neither flag will not silently
+ * mutate project files.
+ *
+ * This pure helper is exported so the priority rule can be unit-tested
+ * independently of Commander and the wiki engines.
+ *
+ * @param options Parsed options object passed by Commander.
+ * @returns true if the operation should be a dry run, false to write changes.
+ */
+export function resolveApplyDryRun(options: Record<string, unknown>): boolean {
+  return options.apply !== true;
+}
+
+/**
  * Load and validate project config, throwing on failure.
  *
  * @param projectRoot Absolute path to the project root.
@@ -166,13 +185,15 @@ export function createProgram(): Command {
     .description('Regenerate host adapters and refresh schemas')
     .option('--schemas', 'Also refresh built-in schemas', false)
     .option('--host <name>', 'Host adapter to generate')
+    .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab update --schemas --host cursor')
     .action(async (options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
       await ensureProjectConfig(projectRoot);
       const spinner = ora('Updating host adapters...').start();
+      const isJson = options.json === true;
       try {
-        const commandsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'commands');
+        const commandsDir = resolveCommandsDir(import.meta.url);
         const loader = new CommandDefLoader(commandsDir);
         const defs = await loader.loadAll();
         const host: string = typeof options.host === 'string' ? options.host : ((await detectHost(projectRoot)) ?? 'generic');
@@ -180,35 +201,69 @@ export function createProgram(): Command {
         const files: GeneratedFile[] = adapter.generate(defs);
         await writeGeneratedFiles(projectRoot, files);
 
+        let schemasRefreshed: string[] = [];
+        let schemasWarning: string | undefined;
+
         if (options.schemas === true) {
           spinner.text = 'Refreshing built-in schemas...';
           const schemaLoader = new SchemaLoader(join(projectRoot, 'adab', 'schemas'));
-          const builtInSchemas = await schemaLoader.listBuiltInSchemas();
-          const projectSchemasDir = join(projectRoot, 'adab', 'schemas');
-          for (const schemaName of builtInSchemas) {
-            const destDir = join(projectSchemasDir, schemaName);
-            const schemaPath = join(destDir, 'schema.yaml');
-            let isForked = false;
-            let rawSchema: string | null = null;
-            try {
-              rawSchema = await safeReadFile(schemaPath);
-              if (rawSchema !== null) {
-                const parsed = YAML.parse(rawSchema) as Record<string, unknown>;
-                isForked = parsed.forked_from !== undefined;
+          let builtInSchemas: string[];
+          try {
+            builtInSchemas = await schemaLoader.listBuiltInSchemas();
+          } catch (err) {
+            throw new AdabError(
+              `Failed to list built-in schemas: ${(err as Error).message}`,
+              'SCHEMA_LIST_FAILED',
+              { cause: err instanceof Error ? err : undefined },
+            );
+          }
+          if (builtInSchemas.length === 0) {
+            schemasWarning = 'No built-in schemas found';
+          } else {
+            const projectSchemasDir = join(projectRoot, 'adab', 'schemas');
+            for (const schemaName of builtInSchemas) {
+              const destDir = join(projectSchemasDir, schemaName);
+              const schemaPath = join(destDir, 'schema.yaml');
+              let isForked = false;
+              let rawSchema: string | null = null;
+              try {
+                rawSchema = await safeReadFile(schemaPath);
+                if (rawSchema !== null) {
+                  const parsed = YAML.parse(rawSchema) as Record<string, unknown>;
+                  isForked = parsed.forked_from !== undefined;
+                }
+              } catch {
+                // Not a valid schema file; treat as not forked.
               }
-            } catch {
-              // Not a valid schema file; treat as not forked.
-            }
-            if (isForked || rawSchema === null) {
-              await schemaLoader.forkSchema(schemaName, schemaName);
+              if (isForked || rawSchema === null) {
+                await schemaLoader.forkSchema(schemaName, schemaName);
+              }
+              schemasRefreshed.push(schemaName);
             }
           }
         }
 
         spinner.succeed(chalk.green('Update complete.'));
+        if (isJson) {
+          if (options.schemas === true) {
+            const payload: Record<string, unknown> = {
+              success: true,
+              commandsRun: schemasRefreshed,
+              mode: 'schemas',
+            };
+            if (schemasWarning !== undefined) {
+              payload.warning = schemasWarning;
+            }
+            output(payload, { json: true });
+          } else {
+            output({ success: true, mode: 'host-adapters' }, { json: true });
+          }
+        } else if (schemasWarning !== undefined) {
+          console.log(chalk.yellow(`Warning: ${schemasWarning}`));
+        }
       } catch (err) {
         spinner.fail(chalk.red('Update failed.'));
-        process.exitCode = handleError(err);
+        process.exitCode = handleError(err, { json: isJson });
       }
     });
 
@@ -558,6 +613,7 @@ export function createProgram(): Command {
       const wikiEngine = new WikiEngine(projectRoot);
       const pages = await wikiEngine.listPages();
       const errors: string[] = [];
+      const warnings: string[] = [];
       for (const page of pages) {
         try {
           await wikiEngine.readPage(page);
@@ -565,22 +621,41 @@ export function createProgram(): Command {
           errors.push(`${page}: ${(err as Error).message}`);
         }
       }
-      if (errors.length === 0) {
+      const systemIssues = await wikiEngine.checkSystemPages();
+      for (const issue of systemIssues) {
+        const entry = `${issue.file}: ${issue.message}`;
+        if (issue.severity === 'error') {
+          errors.push(entry);
+        } else {
+          warnings.push(entry);
+        }
+      }
+      if (errors.length === 0 && warnings.length === 0) {
         if (options.json !== true) {
           console.log(chalk.green('All wiki pages valid.'));
         } else {
-          output({ valid: true, errors: [] }, { json: true });
+          output({ valid: true, errors: [], warnings: [] }, { json: true });
         }
       } else {
         if (options.json !== true) {
-          console.log(chalk.yellow(`${String(errors.length)} wiki page(s) have issues:`));
-          for (const e of errors) {
-            console.log(chalk.yellow(`  - ${e}`));
+          if (errors.length > 0) {
+            console.log(chalk.yellow(`${String(errors.length)} wiki page(s) have issues:`));
+            for (const e of errors) {
+              console.log(chalk.yellow(`  - ${e}`));
+            }
+          }
+          if (warnings.length > 0) {
+            console.log(chalk.yellow(`${String(warnings.length)} wiki page(s) have warnings:`));
+            for (const w of warnings) {
+              console.log(chalk.yellow(`  - ${w}`));
+            }
           }
         } else {
-          output({ valid: false, errors }, { json: true });
+          output({ valid: errors.length === 0, errors, warnings }, { json: true });
         }
-        process.exitCode = handleError(new AdabError(`${String(errors.length)} wiki page(s) have issues`, 'VALIDATION_ERROR'), { json: options.json === true });
+        if (errors.length > 0) {
+          process.exitCode = handleError(new AdabError(`${String(errors.length)} wiki page(s) have issues`, 'VALIDATION_ERROR'), { json: options.json === true });
+        }
       }
     });
 
@@ -600,11 +675,9 @@ export function createProgram(): Command {
           process.exitCode = handleError(new AdabError(`Manuscript not found: ${typeof options.from === 'string' ? options.from : ''}`, 'TARGET_NOT_FOUND'), { json: options.json === true });
           return;
         }
-        const wikiLinkRegex = /\[\[([^\]]+)\]\]/g;
         const matches = new Set<string>();
-        let m: RegExpExecArray | null;
-        while ((m = wikiLinkRegex.exec(raw)) !== null) {
-          matches.add(m[1].trim());
+        for (const target of extractWikiTargets(raw)) {
+          matches.add(target);
         }
         const links = Array.from(matches);
         const report = await Promise.all(
@@ -655,7 +728,7 @@ export function createProgram(): Command {
     .command('apply-diff [path]')
     .description('Apply semantic wiki-diff operations')
     .option('--dry-run', 'Preview changes without writing')
-    .option('--apply', 'Apply changes')
+    .addOption(new Option('--apply', 'Apply changes').conflicts(['dryRun']))
     .option('--change <id>', 'Change identifier (resolves to adab/changes/<id>/wiki-diff.md)')
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab wiki apply-diff adab/changes/ch-001/wiki-diff.md --apply')
@@ -682,7 +755,7 @@ export function createProgram(): Command {
       }
       const parser = new WikiDiffParser();
       const doc = await parser.parse(raw);
-      const dryRun = options.dryRun === true || options.apply !== true;
+      const dryRun = resolveApplyDryRun(options);
       const result = await applier.apply(doc, dryRun);
       if (options.json !== true) {
         const icon = result.success ? chalk.green('✔') : chalk.red('✖');
@@ -799,17 +872,34 @@ export function createProgram(): Command {
   configCmd
     .command('set <path> <value>')
     .description('Set a config value by dot-path')
-    .option('--json', 'Output as JSON')
+    .option('--json', 'Parse value as JSON before storing')
     .addHelpText('after', '\nExample:\n  openadab config set project.title "My Novel"')
     .action(async (path: string, value: string, options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
       await ensureProjectConfig(projectRoot);
       const writer = new ConfigWriter(projectRoot);
+      /**
+       * The stored value. In raw mode (default) this is the verbatim string
+       * the user typed. In `--json` mode this is the result of `JSON.parse`,
+       * which lets callers persist numbers, booleans, objects, and arrays
+       * without quoting. In raw mode, the string is stored as-is — including
+       * any literal quotes — so `config set project.title My Title` stores
+       * `My Title` (no surrounding quotes), while
+       * `config set project.title "My Title" --json` parses to `My Title`
+       * and `config set project.title My Title` stores `My Title`.
+       */
       let parsed: unknown = value;
-      try {
-        parsed = JSON.parse(value);
-      } catch {
-        // keep as string
+      if (options.json === true) {
+        try {
+          parsed = JSON.parse(value);
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          throw new AdabError(
+            `Invalid JSON for config value at "${path}": ${reason}`,
+            'CONFIG_INVALID_VALUE',
+            { cause: err },
+          );
+        }
       }
       try {
         await writer.set(path, parsed);
@@ -863,10 +953,10 @@ export function createProgram(): Command {
   program
     .command('log')
     .description('Display log entries')
-    .option('--limit <N>', 'Limit number of entries', (v: string) => {
-      const n = parseInt(v, 10);
-      if (Number.isNaN(n)) {
-        throw new AdabError('Invalid --limit value: must be a positive integer', 'USAGE_ERROR');
+    .option('--limit <N>', 'Limit number of entries (must be a positive integer)', (v: string) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new AdabError(`Invalid --limit value: must be a positive integer, got "${v}"`, 'USAGE_ERROR');
       }
       return n;
     })
@@ -881,6 +971,11 @@ export function createProgram(): Command {
       if (options.change !== undefined && options.change !== '') {
         entries = entries.filter((e) => e.change === options.change);
       }
+      // The `--limit` parser rejects non-positive integers up front, so the
+      // `> 0` guard below is purely defensive and is not expected to fire in
+      // normal operation. Keeping it makes the slice call safe even if a
+      // future caller bypasses the parser (e.g. unit tests invoking the
+      // action handler directly with a hand-built options object).
       if (options.limit !== undefined && typeof options.limit === 'number' && options.limit > 0) {
         entries = entries.slice(-options.limit);
       }
