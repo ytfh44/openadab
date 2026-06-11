@@ -398,4 +398,78 @@ describe('MechanicalValidator', () => {
       expect(result.errors.some((e) => e.includes('empty'))).toBe(true);
     });
   });
+
+  describe('MechanicalValidator.parseRules — default requireNonEmpty', () => {
+    it('does NOT enforce non-empty when artifact has no validation block', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'foo', generates: 'foo.md', requires: [] },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'foo.md'), '');
+      const result = await validator.validateArtifact(changeDir, 'foo');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('does NOT enforce non-empty when mechanical rules array is empty', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'foo', generates: 'foo.md', requires: [], validation: { mechanical: [] } },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'foo.md'), '');
+      const result = await validator.validateArtifact(changeDir, 'foo');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('enforces non-empty when schema explicitly opts in via requireNonEmpty rule', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'foo', generates: 'foo.md', requires: [], validation: { mechanical: ['requireNonEmpty'] } },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'foo.md'), '');
+      const result = await validator.validateArtifact(changeDir, 'foo');
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('empty'))).toBe(true);
+    });
+
+    it('does NOT enforce non-empty when schema explicitly opts out via requireNonEmpty:false', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'foo', generates: 'foo.md', requires: [], validation: { mechanical: ['requireNonEmpty:false'] } },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'foo.md'), '');
+      const result = await validator.validateArtifact(changeDir, 'foo');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+  });
 });

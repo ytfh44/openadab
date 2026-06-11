@@ -467,12 +467,19 @@ export class MechanicalValidator {
   /**
    * Parse mechanical validation rules from an artifact definition.
    *
+   * Behavior is opt-in: `requireNonEmpty` defaults to `false` and is only set
+   * to `true` when the schema explicitly includes a `requireNonEmpty` or
+   * `requireNonEmpty:true` rule string in `validation.mechanical`. A
+   * `requireNonEmpty:false` rule string keeps the check disabled (useful as
+   * an explicit override). `requiredFields` remains an empty array unless
+   * `requireField:<name>` rule strings are present.
+   *
    * @param art Artifact definition (may be undefined).
    * @returns Parsed rules.
    */
   private parseRules(art: ArtifactDef | undefined): MechanicalRules {
     const rules: MechanicalRules = {
-      requireNonEmpty: true,
+      requireNonEmpty: false,
       requiredFields: [],
     };
     if (!art?.validation?.mechanical) {return rules;}
@@ -484,6 +491,11 @@ export class MechanicalValidator {
       if (maxMatch) {rules.maxWords = parseInt(maxMatch[1], 10);}
       const fieldMatch = /requireField:(\w[\w-]*)/.exec(rule);
       if (fieldMatch) {rules.requiredFields!.push(fieldMatch[1]);}
+      if (rule === 'requireNonEmpty' || rule === 'requireNonEmpty:true') {
+        rules.requireNonEmpty = true;
+      } else if (rule === 'requireNonEmpty:false') {
+        rules.requireNonEmpty = false;
+      }
     }
     return rules;
   }
