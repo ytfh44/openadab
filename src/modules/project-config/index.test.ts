@@ -185,6 +185,104 @@ describe('ConfigWriter', () => {
   });
 });
 
+describe('ConfigWriter.set — nested path edge cases', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'openadab-configwriter-edge-'));
+    mkdirSync(join(tempDir, 'adab'), { recursive: true });
+    const configPath = join(tempDir, 'adab', 'config.yaml');
+    writeFileSync(
+      configPath,
+      'schema: chapter-draft\nproject:\n  title: Old\n  language: zh-CN\n  genre: fantasy\n  tense: past\n  pov: limited-third\ncontext:\n  maxTokens: 18000\n  alwaysInclude: []\n  tokenHeuristic: chars-per-token\n  excludePatterns: []\nrules:\n  draft: []\n  revision: []\narchive:\n  backupOnOverwrite: false\n',
+      'utf-8'
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('writes a nested object path', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('project.title', 'New Title');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.project.title).toBe('New Title');
+  });
+
+  it('writes a numeric value', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('context.maxTokens', 99999);
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.context.maxTokens).toBe(99999);
+  });
+
+  it('writes into array index slots', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('context.alwaysInclude[0]', 'a');
+    await writer.set('context.alwaysInclude[1]', 'b');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.context.alwaysInclude).toEqual(['a', 'b']);
+  });
+
+  it('writes into array slot created from object parent (rules.draft[0])', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('rules.draft[0]', 'first rule');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.rules.draft).toEqual(['first rule']);
+  });
+
+  it('writes into multiple sibling array slots under object parent', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('rules.draft[0]', 'a');
+    await writer.set('rules.revision[0]', 'b');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.rules.draft).toEqual(['a']);
+    expect(loaded.rules.revision).toEqual(['b']);
+  });
+
+  it('creates a new top-level path with passthrough', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('customTag', true);
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect((loaded as unknown as { customTag?: boolean }).customTag).toBe(true);
+  });
+
+  it('extends an array beyond its current length', async () => {
+    const configPath = join(tempDir, 'adab', 'config.yaml');
+    writeFileSync(
+      configPath,
+      'schema: chapter-draft\nproject:\n  title: T\ncontext:\n  alwaysInclude: []\n',
+      'utf-8'
+    );
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('context.alwaysInclude[3]', 'd');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.context.alwaysInclude.length).toBeGreaterThanOrEqual(4);
+    expect(loaded.context.alwaysInclude[3]).toBe('d');
+  });
+
+  it('throws ConfigValidationError when set produces invalid config', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await expect(writer.set('project.tense', 'invalid-tense')).rejects.toBeInstanceOf(ConfigValidationError);
+  });
+
+  it('replaces the entire array when value is an array', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('context.alwaysInclude', ['x', 'y']);
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect(loaded.context.alwaysInclude).toEqual(['x', 'y']);
+  });
+});
+
 describe('resolveVariable', () => {
   const config = {
     schema: 'chapter-draft',
