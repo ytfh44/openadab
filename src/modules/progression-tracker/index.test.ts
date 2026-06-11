@@ -28,7 +28,7 @@ describe('ProgressionTracker', () => {
   it('parses wiki-diff knowledge entry', async () => {
     const { root, tracker } = setupTracker();
     const file = join(root, 'wiki-diff.md');
-    writeFileSync(file, '---\nchangeId: ch-002\n---\n\n## Operations\n- add_knowledge_timeline: Alice learns the truth\n');
+    writeFileSync(file, `---\nchangeId: ch-002\n---\n\n### [[characters/Alice]]\nSource: manuscript/chapters/ch-002.md\n\n#### Add to Current State\n- Alice learns the truth\n`);
     const events = await tracker.parseWikiDiff(file);
     expect(events.length).toBe(1);
     expect(events[0].entity).toBe('Alice');
@@ -38,11 +38,10 @@ describe('ProgressionTracker', () => {
   it('detects thread status changes', async () => {
     const { root, tracker } = setupTracker();
     const file = join(root, 'wiki-diff.md');
-    writeFileSync(file, '---\nchangeId: ch-003\n---\n\n## Operations\n- update_thread_status: The Prophecy from open to resolved\n');
+    writeFileSync(file, `---\nchangeId: ch-003\n---\n\n### [[threads/The Prophecy]]\nSource: manuscript/chapters/ch-003.md\n\n#### Update Thread Status\nStatus: resolved\n`);
     const events = await tracker.parseWikiDiff(file);
     expect(events.length).toBe(1);
     expect(events[0].type).toBe('thread_status');
-    expect(events[0].from).toBe('open');
     expect(events[0].to).toBe('resolved');
   });
 

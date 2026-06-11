@@ -305,10 +305,12 @@ export class MentionIndexer {
     // modified files rather than dropping all mention data.
     const mentionsPath = join(this.projectRoot, 'adab', 'index', 'mentions.json');
     const existingMentionsRaw = await safeReadFile(mentionsPath);
+    let existingMentions: MentionsIndex | null = null;
     if (existingMentionsRaw !== null) {
       try {
-        const existingMentions: MentionsIndex = JSON.parse(existingMentionsRaw);
-        for (const [name, existingEntry] of Object.entries(existingMentions)) {
+        const parsed = JSON.parse(existingMentionsRaw) as MentionsIndex;
+        existingMentions = parsed;
+        for (const [name, existingEntry] of Object.entries(parsed)) {
           const registryEntry = this.entityRegistry.get(name);
           if (registryEntry) {
             registryEntry.appearances = existingEntry.appearances || [];
@@ -316,6 +318,15 @@ export class MentionIndexer {
         }
       } catch {
         console.warn('[MentionIndexer] Corrupted mentions.json — rebuilding from scratch.');
+      }
+    }
+
+    // Identify newly registered entities (not in the existing index).
+    // These need a full scan of ALL files, not just modifiedFiles.
+    const newEntityNames: string[] = [];
+    for (const [name] of this.entityRegistry) {
+      if (!existingMentions?.[name]) {
+        newEntityNames.push(name);
       }
     }
 
@@ -332,20 +343,42 @@ export class MentionIndexer {
       }
     }
 
-    if (modifiedFiles.length === 0) {
+    // Pre-scan ALL files for newly registered entities (B7 fix).
+    // Existing entities keep the incremental modifiedFiles-only scan.
+    if (newEntityNames.length > 0) {
+      const newNameSet = new Set(newEntityNames);
+      for (const file of files) {
+        const results = await this.scanFile(file);
+        for (const [entity, appearances] of results) {
+          if (newNameSet.has(entity)) {
+            const entry = this.entityRegistry.get(entity);
+            if (entry) {
+              entry.appearances.push(...appearances);
+            }
+          }
+        }
+      }
+    }
+
+    if (modifiedFiles.length === 0 && newEntityNames.length === 0) {
       return;
     }
 
-    for (const [, entry] of this.entityRegistry) {
-      entry.appearances = entry.appearances.filter((a) => !modifiedFiles.includes(a.file));
-    }
+    if (modifiedFiles.length > 0) {
+      // Remove stale appearances from modified files for EXISTING entities only
+      for (const [, entry] of this.entityRegistry) {
+        if (entry.appearances.length > 0) {
+          entry.appearances = entry.appearances.filter((a) => !modifiedFiles.includes(a.file));
+        }
+      }
 
-    for (const file of modifiedFiles) {
-      const results = await this.scanFile(file);
-      for (const [entity, appearances] of results) {
-        const entry = this.entityRegistry.get(entity);
-        if (entry) {
-          entry.appearances.push(...appearances);
+      for (const file of modifiedFiles) {
+        const results = await this.scanFile(file);
+        for (const [entity, appearances] of results) {
+          const entry = this.entityRegistry.get(entity);
+          if (entry) {
+            entry.appearances.push(...appearances);
+          }
         }
       }
     }
@@ -370,30 +403,35 @@ export class MentionIndexer {
     const files: string[] = [];
     for (const dir of dirs) {
       if (!(await fileExists(dir))) {continue;}
-      const found = await glob('**/*.md', { cwd: dir, onlyFiles: true, absolute: true });
+      const found = await glob('**/*.md', { 
+        cwd: dir, 
+        onlyFiles: true, 
+        absolute: true,
+        ignore: ['**/archive/**'],
+      });
       files.push(...found.map((f) => normalize(f)));
     }
     return files;
   }
 
-  /**
-   * Read the timestamp of the last full or incremental index.
-   *
-   * @returns Timestamp in milliseconds, or `null` if never indexed.
-   */
-  private async readLastIndexed(): Promise<number | null> {
-    const path = join(this.projectRoot, 'adab', 'index', '.last-indexed');
-    const raw = await safeReadFile(path);
-    if (raw === null) {return null;}
-    const ts = parseInt(raw.trim(), 10);
-    return Number.isNaN(ts) ? null : ts;
-  }
+   /**
+    * Read the timestamp of the last full or incremental index.
+    *
+    * @returns Timestamp in milliseconds, or `null` if never indexed.
+    */
+   private async readLastIndexed(): Promise<number | null> {
+     const path = join(this.projectRoot, 'adab', 'index', '.last-mention-indexed');
+     const raw = await safeReadFile(path);
+     if (raw === null) {return null;}
+     const ts = parseInt(raw.trim(), 10);
+     return Number.isNaN(ts) ? null : ts;
+   }
 
-  /**
-   * Write the current timestamp as the last index time.
-   */
-  private async writeLastIndexed(): Promise<void> {
-    const path = join(this.projectRoot, 'adab', 'index', '.last-indexed');
-    await atomicWriteFile(path, String(Date.now()));
-  }
+   /**
+    * Write the current timestamp as the last index time.
+    */
+   private async writeLastIndexed(): Promise<void> {
+     const path = join(this.projectRoot, 'adab', 'index', '.last-mention-indexed');
+     await atomicWriteFile(path, String(Date.now()));
+   }
 }

@@ -122,6 +122,12 @@ export class ProgressionTracker {
   /**
    * Parse a wiki-diff and extract progression-relevant operations.
    *
+   * The wiki-diff uses `### [[Entity]]` blocks with sub-sections:
+   * - `#### Add to Current State` — entity knowledge updates
+   * - `#### Add to Knowledge Timeline` — timeline entries
+   * - `#### Update Thread Status` — thread status changes
+   * - `#### Update Relationship` — relationship changes
+   *
    * @param path Absolute path to the wiki-diff file.
    * @returns Array of extracted events.
    */
@@ -134,41 +140,76 @@ export class ProgressionTracker {
     const { data: frontmatter } = extractFrontmatter(raw);
     const changeId = typeof frontmatter.changeId === 'string' ? frontmatter.changeId : chapter;
 
-    const opsSection = extractSectionsByHeading(raw, 'Operations');
-    if (opsSection === null || opsSection.length === 0) {return events;}
+    // Parse each ### [[Entity]] block
+    const lines = raw.split('\n');
+    let currentEntity: string | null = null;
 
-    for (const line of opsSection.split('\n')) {
-      const threadMatch = /^-\s+update_thread_status:\s+(.+?)\s+from\s+(\S+)\s+to\s+(\S+)$/i.exec(line);
-      if (threadMatch !== null) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // Match ### [[entity/path]]
+      const entityMatch = /^###\s+\[\[(.+?)\]\]/.exec(line);
+      if (entityMatch !== null) {
+        // Extract just the entity name (last path segment, without .md)
+        currentEntity = entityMatch[1].trim().replace(/\.md$/, '').split('/').pop() ?? '';
+        continue;
+      }
+
+      if (currentEntity === null) {continue;}
+
+      // Match #### Update Thread Status
+      if (/^####\s+Update Thread Status/i.test(line)) {
+        let status = 'unknown';
+        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+          const statusMatch = /^Status:\s*(\S+)/i.exec(lines[j]);
+          if (statusMatch !== null) {
+            status = statusMatch[1];
+            break;
+          }
+        }
         events.push(this.recordEvent({
           chapter: changeId,
-          entity: threadMatch[1].trim(),
+          entity: currentEntity,
           type: 'thread_status',
-          change: `Thread status changed from ${threadMatch[2]} to ${threadMatch[3]}`,
-          from: threadMatch[2],
-          to: threadMatch[3],
+          change: `Thread status changed to ${status}`,
+          to: status,
         }));
       }
 
-      const knowledgeMatch = /^-\s+add_knowledge_timeline:\s+(.+?)\s+learns?\s+(.+)$/i.exec(line);
-      if (knowledgeMatch !== null) {
-        events.push(this.recordEvent({
-          chapter: changeId,
-          entity: knowledgeMatch[1].trim(),
-          type: 'knowledge',
-          change: `Learned ${knowledgeMatch[2].trim()}`,
-        }));
+      // Match #### Add to Current State
+      if (/^####\s+Add to Current State/i.test(line)) {
+        const contentParts: string[] = [];
+        for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+          const contentMatch = /^-\s+(.+)/.exec(lines[j]);
+          if (contentMatch !== null) {
+            contentParts.push(contentMatch[1].trim());
+          } else if (lines[j].startsWith('#')) {
+            break;
+          }
+        }
+        if (contentParts.length > 0) {
+          events.push(this.recordEvent({
+            chapter: changeId,
+            entity: currentEntity,
+            type: 'knowledge',
+            change: contentParts.join('; '),
+          }));
+        }
       }
 
-      const relationshipMatch = /^-\s+update_relationship:\s+(.+?)\s+(.+?)\s+(.+)$/i.exec(line);
-      if (relationshipMatch !== null) {
-        events.push(this.recordEvent({
-          chapter: changeId,
-          entity: relationshipMatch[1].trim(),
-          type: 'relationship',
-          change: relationshipMatch[3].trim(),
-          relatedEntity: relationshipMatch[2].trim(),
-        }));
+      // Match #### Update Relationship
+      if (/^####\s+Update Relationship/i.test(line)) {
+        const nextLine = lines[i + 1] ?? '';
+        const relMatch = /(.+?)\s+and\s+(.+?)\s+are\s+now\s+(.+)/i.exec(nextLine);
+        if (relMatch !== null) {
+          events.push(this.recordEvent({
+            chapter: changeId,
+            entity: currentEntity,
+            type: 'relationship',
+            change: relMatch[3].trim(),
+            relatedEntity: relMatch[2].trim(),
+          }));
+        }
       }
     }
 
@@ -250,18 +291,18 @@ export class ProgressionTracker {
     return contradictions;
   }
 
-  /**
-   * Incrementally update progressions by appending new events.
-   *
-   * Scans change directories for modified continuity-report/wiki-diff files
-   * (mtime newer than `.last-indexed`), parses them, and merges.
-   */
-  async incrementalUpdate(): Promise<void> {
-    const indexPath = join(this.projectRoot, 'adab', 'index', 'progressions.json');
-    const lastIndexedPath = join(this.projectRoot, 'adab', 'index', '.last-indexed');
-    const lastIndexedRaw = await safeReadFile(lastIndexedPath);
-    const lastIndexed = lastIndexedRaw !== null ? parseInt(lastIndexedRaw.trim(), 10) : 0;
-    const cutoff = Number.isNaN(lastIndexed) ? 0 : lastIndexed;
+   /**
+    * Perform an incremental update of the progressions index.
+    *
+    * Scans change directories for modified continuity-report/wiki-diff files
+    * (mtime newer than `.last-progression-indexed`), parses them, and merges.
+    */
+   async incrementalUpdate(): Promise<void> {
+     const indexPath = join(this.projectRoot, 'adab', 'index', 'progressions.json');
+     const lastIndexedPath = join(this.projectRoot, 'adab', 'index', '.last-progression-indexed');
+     const lastIndexedRaw = await safeReadFile(lastIndexedPath);
+     const lastIndexed = lastIndexedRaw !== null ? parseInt(lastIndexedRaw.trim(), 10) : 0;
+     const cutoff = Number.isNaN(lastIndexed) ? 0 : lastIndexed;
 
     const existingRaw = await safeReadFile(indexPath);
     let existingChapters: ProgressionChapter[] = [];
@@ -291,10 +332,10 @@ export class ProgressionTracker {
     const chapters = Array.from(chapterMap.values());
     // M12: Numeric chapter sort
     chapters.sort((a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter));
-    // Write .last-indexed BEFORE progressions.json so a crash between writes
-    // doesn't cause duplicate events on restart (B9 fix).
-    await atomicWriteFile(lastIndexedPath, String(Date.now()));
+    // Write progressions.json BEFORE .last-progression-indexed so a crash between writes
+    // doesn't cause data loss on restart (B5 fix).
     await atomicWriteFile(indexPath, JSON.stringify({ chapters }, null, 2));
+    await atomicWriteFile(lastIndexedPath, String(Date.now()));
   }
 
   /**
