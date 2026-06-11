@@ -102,6 +102,22 @@ export interface LogCallback {
 }
 
 /**
+ * A single issue reported by the wiki engine's linting surface.
+ *
+ * Issues are accumulated by {@link WikiEngine.checkSystemPages} and surfaced
+ * to the CLI for the `wiki lint` command.  The CLI decides whether to treat
+ * them as warnings or errors based on {@link severity}.
+ */
+export interface LintIssue {
+  /** Severity classification; the CLI promotes errors to non-zero exit codes. */
+  severity: 'warning' | 'error';
+  /** Basename of the offending file (e.g. `index.md`). */
+  file: string;
+  /** Human-readable description of the issue. */
+  message: string;
+}
+
+/**
  * Core engine for managing project wiki pages.
  */
 export class WikiEngine {
@@ -149,12 +165,21 @@ export class WikiEngine {
   /**
    * Read a wiki page, parse its frontmatter, and validate per-type schema.
    *
-   * @param pagePath Wiki page path relative to `adab/wiki/` (e.g. `characters/mara.md`).
+   * If the page has no frontmatter (frontmatter exists but is missing the required
+   * `type` field), this method falls back to a synthetic frontmatter with
+   * `{ type: options.fallbackType ?? 'unknown', title: pagePath, _synthetic: true }`.
+   * This prevents pages from silently disappearing from `listPages` when a type filter
+   * is applied.  Other frontmatter validation failures (e.g. missing required fields
+   * for a known type, or invalid enum values) still throw an error.
+   *
+   * @param pagePath  Wiki page path relative to `adab/wiki/` (e.g. `characters/mara.md`).
+   * @param options   Optional fallback options.
+   * @param options.fallbackType  The `type` value to use for synthetic frontmatter. Defaults to `'unknown'`.
    * @returns Parsed wiki page with frontmatter and body.
    * @throws {TargetNotFoundError} If the page file does not exist.
-   * @throws {AdabError} If frontmatter validation fails.
+   * @throws {AdabError} If frontmatter validation fails for reasons other than a missing `type` field.
    */
-  async readPage(pagePath: string): Promise<WikiPage> {
+  async readPage(pagePath: string, options: { fallbackType?: string } = {}): Promise<WikiPage> {
     const absPath = resolveWikiPage(this.projectRoot, pagePath);
     const raw = await safeReadFile(absPath);
     if (raw === null) {
@@ -162,6 +187,20 @@ export class WikiEngine {
     }
     const parsed = matter(raw);
     const frontmatter = parsed.data as Record<string, unknown>;
+
+    if (!Object.prototype.hasOwnProperty.call(frontmatter, 'type')) {
+      const syntheticFrontmatter = {
+        type: options.fallbackType ?? 'unknown',
+        title: pagePath,
+        _synthetic: true,
+      };
+      return {
+        path: pagePath,
+        frontmatter: syntheticFrontmatter,
+        body: parsed.content,
+      };
+    }
+
     this.validateFrontmatter(frontmatter, pagePath);
     return {
       path: pagePath,
@@ -253,6 +292,47 @@ export class WikiEngine {
         this.generatingIndex = false;
       }
     }
+  }
+
+  /**
+   * Inspect the three system-generated wiki files (`index.md`, `overview.md`,
+   * `contradictions.md`) and report any issues found.
+   *
+   * Unlike {@link listPages}, this method does not exclude these files — it
+   * treats them as first-class lint targets because the `wiki index`,
+   * `wiki overview`, and contradiction management commands can silently
+   * produce stale or malformed output, which would then mislead downstream
+   * commands such as `wiki diff --from <page>`.
+   *
+   * Severity rules:
+   *  - A missing system file yields a `warning` (the project may simply
+   *    never have generated that artifact yet).
+   *  - A present file whose frontmatter cannot be parsed or validated
+   *    yields an `error` (the file is corrupted and should be regenerated).
+   *
+   * This method never throws — it returns the accumulated issues so the
+   * caller can decide how to surface them.
+   *
+   * @returns Array of {@link LintIssue} entries, one per detected problem.
+   */
+  async checkSystemPages(): Promise<LintIssue[]> {
+    const issues: LintIssue[] = [];
+    const systemFiles = ['index.md', 'overview.md', 'contradictions.md'] as const;
+    const wikiDir = join(this.projectRoot, 'adab', 'wiki');
+    for (const file of systemFiles) {
+      const filePath = join(wikiDir, file);
+      if (!(await fileExists(filePath))) {
+        issues.push({ severity: 'warning', file, message: 'System page missing' });
+        continue;
+      }
+      try {
+        await this.readPage(file);
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        issues.push({ severity: 'error', file, message: `Failed to parse frontmatter: ${detail}` });
+      }
+    }
+    return issues;
   }
 
   /**
