@@ -388,4 +388,45 @@ describe('ContextPacker', () => {
     await packer.packContext('ch-001', 'draft');
     expect(cache.size).toBeLessThanOrEqual(1); // may have re-cached the active schema
   });
+
+  // L5: getAlwaysInclude throws CONFIG_NOT_INITIALIZED when config not loaded
+  it('throws CONFIG_NOT_INITIALIZED when config is not initialized', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-cp-noinit-'));
+    // Do NOT create config.yaml — simulating uninitialized project
+
+    const wikiEngine = {
+      readPage: vi.fn().mockResolvedValue({ frontmatter: { name: 'Test', type: 'character' }, body: '' }),
+      listPages: vi.fn().mockResolvedValue([]),
+    } as unknown as WikiEngine;
+
+    const mentionIndexer = {
+      buildEntityRegistry: vi.fn().mockResolvedValue(undefined),
+      incrementalIndex: vi.fn().mockResolvedValue(undefined),
+    } as unknown as MentionIndexer;
+
+    const progressionTracker = {
+      parseContinuityReport: vi.fn().mockResolvedValue([]),
+      generateProgressionsJson: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ProgressionTracker;
+
+    const { ConfigLoader } = await import('../project-config/index.js');
+    const configLoader = new ConfigLoader(root);
+    // Intentionally do NOT call configLoader.load()
+
+    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+
+    const changeDir = join(root, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(join(changeDir, 'brief.md'), '---\nstatus: done\n---\n\nbrief');
+
+    await expect(packer.packContext('ch-001', 'draft')).rejects.toThrow();
+    try {
+      await packer.packContext('ch-001', 'draft');
+    } catch (e) {
+      expect(e).toBeInstanceOf(Error);
+      const adabError = e as { code?: string; message?: string };
+      expect(adabError.code).toBe('CONFIG_NOT_INITIALIZED');
+      expect(adabError.message).toMatch(/init/i);
+    }
+  });
 });

@@ -23,6 +23,7 @@ import type { ConfigLoader } from '../project-config/index.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 import { SchemaLoader } from '../schema-engine/index.js';
 import { ManifestManager } from '../change-manifest/index.js';
+import { AdabError, ConfigValidationError } from '../../utils/errors.js';
 
 /**
  * A single candidate file with an assigned priority score and an optional
@@ -112,7 +113,19 @@ export class ContextPacker {
   async buildCandidates(changeDir: string, artifactId: string): Promise<Candidate[]> {
     const candidates: Candidate[] = [];
 
-    const alwaysInclude = this.configLoader.getAlwaysInclude();
+    let alwaysInclude: string[];
+    try {
+      alwaysInclude = this.configLoader.getAlwaysInclude();
+    } catch (e) {
+      if (e instanceof ConfigValidationError) {
+        throw new AdabError(
+          `Context packer requires a valid project config. Run 'openadab init' first.`,
+          'CONFIG_NOT_INITIALIZED',
+          e,
+        );
+      }
+      throw e;
+    }
     for (const rel of alwaysInclude) {
       const abs = join(this.projectRoot, rel);
       if (await fileExists(abs)) {
