@@ -8,7 +8,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 
 import { ArchiveEngine } from '../../src/modules/archive-engine/index.js';
@@ -23,6 +23,7 @@ import { SchemaLoader } from '../../src/modules/schema-engine/index.js';
 import { SyncEngine } from '../../src/modules/sync-engine/index.js';
 import { WikiDiffApplier, WikiDiffParser } from '../../src/modules/wiki-diff-engine/index.js';
 import { WikiEngine } from '../../src/modules/wiki-engine/index.js';
+import type { ValidationResult } from '../../src/schemas/types.js';
 import { fileExists, safeReadFile } from '../../src/utils/fs.js';
 
 import { createMinimalProject } from './fixture.js';
@@ -164,5 +165,129 @@ describe('sync → archive pipeline', () => {
 
     const syncedManifest = await manifestManager.readManifest(changeDir);
     expect(syncedManifest.status).toBe('synced');
+  });
+
+  it('regression: aggregate result errors from optional artifacts must not block sync', async () => {
+    const configLoader = new ConfigLoader(projectRoot);
+    await configLoader.load();
+    const schemaDir = join(projectRoot, 'adab', 'schemas', configLoader.getActiveSchema());
+    const schema = await new SchemaLoader(schemaDir).load();
+    const manifestManager = new ManifestManager();
+    const wikiEngine = new WikiEngine(projectRoot);
+    const mentionIndexer = new MentionIndexer(projectRoot, wikiEngine);
+    const progressionTracker = new ProgressionTracker(projectRoot);
+    const contextPacker = new ContextPacker(projectRoot, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+
+    /**
+     * Scaffold a fresh in_progress change with one `done` artifact so the
+     * downstream index/manifest steps have a real surface to operate on.
+     */
+    const makeChange = async (changeId: string): Promise<void> => {
+      const changeDir = join(projectRoot, 'adab', 'changes', changeId);
+      const manifest = manifestManager.createManifest(changeId, schema);
+      await mkdir(changeDir, { recursive: true });
+      await manifestManager.writeManifest(changeDir, manifest);
+      await writeFile(join(changeDir, 'brief.md'), '---\npov: Mara\n---\n\n# Brief\n\nSteal.\n', 'utf-8');
+      await manifestManager.updateArtifactStatus(changeDir, 'brief', 'done', schema);
+    };
+
+    /**
+     * Build a stubbed MechanicalValidator that returns a controlled set of
+     * child results plus an aggregate (`artifactId: 'all'`) carrying the
+     * caller-specified errors — exactly what the real `aggregateResults`
+     * would produce given those children. The dependency and non-empty
+     * checks are stubbed to pass.
+     */
+    const makeValidator = (aggregateErrors: string[], children: ValidationResult[]): MechanicalValidator => {
+      const aggregate: ValidationResult = {
+        artifactId: 'all',
+        passed: aggregateErrors.length === 0,
+        errors: aggregateErrors,
+        warnings: [],
+      };
+      return {
+        validateChange: vi.fn().mockResolvedValue([...children, aggregate]),
+        validateDependencies: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] }),
+        requireNonEmpty: vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' }),
+      } as unknown as MechanicalValidator;
+    };
+
+    const makeEngine = (validator: MechanicalValidator): SyncEngine => new SyncEngine(
+      projectRoot,
+      new WikiDiffParser(),
+      new WikiDiffApplier(projectRoot, wikiEngine),
+      wikiEngine,
+      mentionIndexer,
+      progressionTracker,
+      contextPacker,
+      validator,
+    );
+
+    const optionalFileMissing: ValidationResult = {
+      artifactId: 'wiki-diff',
+      passed: false,
+      errors: ['File missing: wiki-diff.md'],
+      warnings: [],
+    };
+    const nonOptionalFrontmatter: ValidationResult = {
+      artifactId: 'brief',
+      passed: false,
+      errors: ['Frontmatter missing or empty'],
+      warnings: [],
+    };
+    const passedChild: ValidationResult = {
+      artifactId: 'brief',
+      passed: true,
+      errors: [],
+      warnings: [],
+    };
+
+    // Angle 1: aggregate with mixed errors (some optional FILE_MISSING, some non-optional).
+    // Only the non-optional error should propagate; the optional FILE_MISSING must not
+    // leak back into the errors array via the aggregate's concatenated errors.
+    {
+      const changeId = 'ch-aggregate-mixed';
+      await makeChange(changeId);
+      const validator = makeValidator(
+        ['File missing: wiki-diff.md', 'Frontmatter missing or empty'],
+        [optionalFileMissing, nonOptionalFrontmatter],
+      );
+      const engine = makeEngine(validator);
+      let caught: Error | undefined;
+      try {
+        await engine.sync(changeId);
+      } catch (err) {
+        caught = err as Error;
+      }
+      expect(caught).toBeDefined();
+      expect(caught?.message).toContain('Frontmatter missing or empty');
+      expect(caught?.message).not.toContain('File missing: wiki-diff.md');
+    }
+
+    // Angle 2: aggregate is empty (no errors). Sync must not fail at validation,
+    // regardless of what the aggregate entry contains or doesn't contain.
+    {
+      const changeId = 'ch-aggregate-empty';
+      await makeChange(changeId);
+      const validator = makeValidator([], [passedChild]);
+      const engine = makeEngine(validator);
+      const report = await engine.sync(changeId);
+      expect(report.changeId).toBe(changeId);
+    }
+
+    // Angle 3: aggregate's only errors are FILE_MISSING on optional artifacts.
+    // Sync must not fail at validation; the per-child loop correctly filters the
+    // optional FILE_MISSING, and the aggregate must not re-inject it.
+    {
+      const changeId = 'ch-aggregate-optional-only';
+      await makeChange(changeId);
+      const validator = makeValidator(
+        ['File missing: wiki-diff.md'],
+        [optionalFileMissing],
+      );
+      const engine = makeEngine(validator);
+      const report = await engine.sync(changeId);
+      expect(report.changeId).toBe(changeId);
+    }
   });
 });
