@@ -6,13 +6,24 @@
  * configuration, and logging.
  */
 import { mkdir, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import util from 'node:util';
 
 import chalk from 'chalk';
 import { Command, Option } from 'commander';
 import ora from 'ora';
 import YAML from 'yaml';
+
+// `chalk@5` automatically honours the standard colour-suppression
+// environment variables:
+//   - `NO_COLOR`      (any non-empty value disables colour)
+//   - `FORCE_COLOR=0` disables colour even on a TTY
+//   - `FORCE_COLOR=1` forces colour even when stdout is piped
+// No explicit `chalk.level = ...` assignment is needed: the library
+// reads these on import.  Tests that want a deterministic output can
+// temporarily set `process.env.NO_COLOR = '1'` before importing
+// this module.
 
 import { ArchiveEngine } from '../modules/archive-engine/index.js';
 import { ArtifactGraph } from '../modules/artifact-graph/index.js';
@@ -35,8 +46,9 @@ import { WikiDiffApplier, WikiDiffParser } from '../modules/wiki-diff-engine/ind
 import { WikiEngine } from '../modules/wiki-engine/index.js';
 import { ProjectConfigSchema } from '../schemas/project-config.js';
 import type { ValidationResult } from '../schemas/types.js';
-import { AdabError } from '../utils/errors.js';
+import { AdabError, UsageError } from '../utils/errors.js';
 import { fileExists, safeReadFile } from '../utils/fs.js';
+import { redactConfigValue } from '../utils/redact.js';
 import { extractWikiTargets } from '../utils/wiki-link-regex.js';
 
 /**
@@ -82,11 +94,64 @@ function handleError(err: unknown, options?: GlobalOptions): number {
 }
 
 /**
+ * Maximum number of parent-directory hops the project-root search
+ * will attempt.  Mirrors {@link findPackageRoot}'s cap and is
+ * generous enough to handle a CLI invoked from a sub-directory of a
+ * typical monorepo checkout.
+ */
+const PROJECT_ROOT_HOPS = 16;
+
+/**
+ * Marker that identifies the OpenAdab project root.
+ *
+ * A directory is considered a project root when it contains
+ * `adab/config.yaml`.  We use the config file (not `package.json`)
+ * because the project root is the *user's* project, which may or may
+ * not be a Node package.
+ */
+const PROJECT_ROOT_MARKER = 'adab/config.yaml';
+
+/**
+ * Walk up from `start` looking for the directory containing
+ * `adab/config.yaml`.  Returns the first match, or `null` if no
+ * ancestor (within {@link PROJECT_ROOT_HOPS} hops) contains the
+ * marker.
+ *
+ * @param start Absolute directory to start searching from.
+ * @returns The project root directory, or `null` when not found.
+ */
+function findProjectRoot(start: string): string | null {
+  let current = start;
+  for (let i = 0; i < PROJECT_ROOT_HOPS; i++) {
+    if (existsSync(join(current, PROJECT_ROOT_MARKER))) {
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+  return null;
+}
+
+/**
  * Resolve the project root from the current working directory.
  *
- * For now, assumes the current working directory is the project root.
+ * Walks up from `process.cwd()` looking for the closest directory
+ * containing `adab/config.yaml`.  This lets users run the CLI from
+ * any sub-directory of the project (e.g. `adab/changes/ch-001`) and
+ * still get the correct root.
+ *
+ * Falls back to `process.cwd()` when no marker is found so commands
+ * that do not require an existing project (such as `init`) still
+ * operate on a sensible directory.
  */
 function resolveProjectRoot(): string {
+  const fromWalk = findProjectRoot(process.cwd());
+  if (fromWalk !== null) {
+    return fromWalk;
+  }
   return process.cwd();
 }
 
@@ -167,16 +232,52 @@ export function createProgram(): Command {
     .addHelpText('after', '\nExample:\n  openadab init --schema chapter-draft --host cursor')
     .action(async (options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
-      const initializer = new ProjectInitializer(projectRoot);
+      const isJson = options.json === true;
+      const spinner = ora('Scaffolding project...').start();
       try {
+        const initializer = new ProjectInitializer(projectRoot);
         await initializer.init({ schema: safeStringOption(options.schema, 'chapter-draft'), host: typeof options.host === 'string' ? options.host : undefined });
-        if (options.json !== true) {
-          console.log(chalk.green('Project initialized successfully.'));
+        // After the project files are on disk, generate host-adapter
+        // files immediately.  `init` honours `--host <name>` so the
+        // user does not need a separate `openadab update --host ...`
+        // round-trip just to materialise the adapter output for the
+        // freshly created project.
+        try {
+          const commandsDir = resolveCommandsDir(import.meta.url);
+          const loader = new CommandDefLoader(commandsDir);
+          const defs = await loader.loadAll();
+          const host: string = typeof options.host === 'string'
+            ? options.host
+            : ((await detectHost(projectRoot)) ?? 'generic');
+          const adapter: AdapterBase = AdapterFactory.create(host);
+          const files: GeneratedFile[] = adapter.generate(defs);
+          await writeGeneratedFiles(projectRoot, files);
+        } catch (adapterErr) {
+          // Adapter generation is a best-effort side effect of init.
+          // The project scaffold itself succeeded, so the user still
+          // gets a successful spinner; the warning explains they can
+          // re-run `openadab update --host <name>` to retry.
+          spinner.warn(chalk.yellow(`Project initialized; host adapter generation deferred: ${(adapterErr as Error).message}`));
+          if (isJson) {
+            output({
+              success: true,
+              message: 'Project initialized successfully.',
+              warning: `Host adapter generation deferred: ${(adapterErr as Error).message}`,
+            }, { json: true });
+          } else {
+            console.log(chalk.yellow('Run `openadab update --host <name>` to generate the host adapter later.'));
+          }
+          return;
+        }
+        spinner.succeed(chalk.green('Project initialized successfully.'));
+        if (!isJson) {
+          console.log(chalk.green(`Project root: ${projectRoot}`));
         } else {
-          output({ success: true, message: 'Project initialized successfully.' }, { json: true });
+          output({ success: true, message: 'Project initialized successfully.', projectRoot }, { json: true });
         }
       } catch (err) {
-        process.exitCode = handleError(err, { json: options.json === true });
+        spinner.fail(chalk.red('Project initialization failed.'));
+        process.exitCode = handleError(err, { json: isJson });
       }
     });
 
@@ -228,12 +329,26 @@ export function createProgram(): Command {
               let rawSchema: string | null = null;
               try {
                 rawSchema = await safeReadFile(schemaPath);
-                if (rawSchema !== null) {
-                  const parsed = YAML.parse(rawSchema) as Record<string, unknown>;
-                  isForked = parsed.forked_from !== undefined;
+              } catch (readErr) {
+                // The schema file is missing or unreadable.  Treat as
+                // "not forked" and let forkSchema() regenerate it.
+                // We surface the read error so a permission problem
+                // is not silently swallowed.
+                console.warn(`[update] Could not read ${schemaPath}: ${(readErr as Error).message}`);
+              }
+              if (rawSchema !== null) {
+                try {
+                  const parsed = YAML.parse(rawSchema) as Record<string, unknown> | null;
+                  if (parsed !== null && typeof parsed === 'object') {
+                    isForked = parsed.forked_from !== undefined;
+                  }
+                } catch (parseErr) {
+                  // Malformed YAML in the user's project should not
+                  // brick `update`; log the parse failure and treat
+                  // the schema as fresh so forkSchema() can rebuild
+                  // it from the built-in source.
+                  console.warn(`[update] Could not parse ${schemaPath}: ${(parseErr as Error).message}`);
                 }
-              } catch {
-                // Not a valid schema file; treat as not forked.
               }
               if (isForked || rawSchema === null) {
                 await schemaLoader.forkSchema(schemaName, schemaName);
@@ -390,7 +505,7 @@ export function createProgram(): Command {
   program
     .command('new')
     .description('Create a new change')
-    .argument('<type>', 'Change type (e.g., chapter)')
+    .argument('<type>', 'Change kind (e.g. chapter, revision, plan). Stored on the manifest metadata under `kind`.')
     .argument('<id>', 'Change identifier')
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab new chapter ch-001')
@@ -406,13 +521,20 @@ export function createProgram(): Command {
         const schema = await schemaLoader.load();
         const manifestManager = new ManifestManager();
         const manifest = manifestManager.createManifest(id, schema);
+        // Surface the user-supplied `type` argument on the manifest so
+        // downstream tools (search, filters, reports) can distinguish
+        // chapter vs revision vs plan changes without parsing the
+        // directory name.  Stored in `metadata.kind` because the
+        // ChangeManifest schema reserves a small set of top-level
+        // fields and `kind` is not one of them.
+        manifest.metadata = { ...manifest.metadata, kind: type };
         const changeDir = join(projectRoot, 'adab', 'changes', id);
         await mkdir(changeDir, { recursive: true });
         await manifestManager.writeManifest(changeDir, manifest);
         if (options.json !== true) {
           console.log(chalk.green(`Created ${type} change ${id}`));
         } else {
-          output({ success: true, type, id }, { json: true });
+          output({ success: true, type, id, kind: type }, { json: true });
         }
       } catch (err) {
         process.exitCode = handleError(err, { json: options.json === true });
@@ -512,11 +634,22 @@ export function createProgram(): Command {
     .action(async (options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
       await ensureProjectConfig(projectRoot);
-      const changeDir = join(projectRoot, 'adab', 'changes', String(options.change));
+      const changeId = String(options.change);
+      const changeDir = join(projectRoot, 'adab', 'changes', changeId);
       const manifestManager = new ManifestManager();
       const changeManifest = await manifestManager.readManifest(changeDir);
       const results: ValidationResult[] = [];
-      if (options.mechanical === true || options.semantic !== true) {
+
+      // Validator selection matrix:
+      //   --mechanical only          → mechanical
+      //   --semantic   only          → semantic
+      //   --mechanical --semantic    → both
+      //   neither                    → mechanical (default; matches the
+      //                                 spec's "mechanical is automatic" rule)
+      const wantMechanical = options.mechanical === true || (options.mechanical === undefined && options.semantic === undefined);
+      const wantSemantic = options.semantic === true;
+
+      if (wantMechanical) {
         const configLoader = new ConfigLoader(projectRoot);
         const projectConfig = await configLoader.load();
         const schemaName = changeManifest.schema;
@@ -527,7 +660,7 @@ export function createProgram(): Command {
         const changeResults = await validator.validateChange(changeDir);
         results.push(...changeResults);
       }
-      if (options.semantic === true) {
+      if (wantSemantic) {
         const configLoader = new ConfigLoader(projectRoot);
         const projectConfig = await configLoader.load();
         const wikiEngine = new WikiEngine(projectRoot);
@@ -536,7 +669,6 @@ export function createProgram(): Command {
         const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
         const schemaLoader = new SchemaLoader(schemaDir);
         const schema = await schemaLoader.load();
-        // Artifact IDs that have non-empty validation profiles in ContinuityLinter.
         const profileArtifactIds = new Set(['draft', 'revision', 'wiki-diff']);
         for (const artDef of schema.artifacts) {
           if (!profileArtifactIds.has(artDef.id)) {continue;}
@@ -566,15 +698,30 @@ export function createProgram(): Command {
           }
         }
         if (hasErrors) {
-          console.log(chalk.red(`Validation failed for ${String(options.change)}`));
+          console.log(chalk.red(`Validation failed for ${changeId}`));
         } else {
-          console.log(chalk.green(`Validation passed for ${String(options.change)}`));
+          console.log(chalk.green(`Validation passed for ${changeId}`));
         }
       } else {
         output(results, { json: true });
       }
       if (hasErrors) {
-        process.exitCode = 1;
+        // In --json mode, route the failure through handleError so the
+        // exit code is non-zero and a structured error envelope is
+        // emitted on stderr.  In human mode, the loop above already
+        // printed the per-artifact diagnostics; the non-zero exit
+        // code is the only thing the shell wrapper needs.
+        if (options.json === true) {
+          process.exitCode = handleError(
+            new AdabError(
+              `Validation failed for ${changeId}: ${results.filter((r) => !r.passed).length} artifact(s) with errors`,
+              'VALIDATION_ERROR',
+            ),
+            { json: true },
+          );
+        } else {
+          process.exitCode = 1;
+        }
       }
     });
 
@@ -586,19 +733,38 @@ export function createProgram(): Command {
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab wiki index')
     .action(async (options: Record<string, unknown>) => {
+      const isJson = options.json === true;
       const spinner = ora('Regenerating wiki index...').start();
       try {
         const projectRoot = resolveProjectRoot();
         await ensureProjectConfig(projectRoot);
         const wikiEngine = new WikiEngine(projectRoot);
-        await wikiEngine.generateIndex();
-        spinner.succeed(chalk.green('Wiki index regenerated.'));
-        if (options.json === true) {
-          output({ success: true, message: 'Wiki index regenerated.' }, { json: true });
+        const result = await wikiEngine.generateIndex();
+        // Resolve the on-disk path of the regenerated index so the
+        // JSON consumer can confirm what was written.  In human mode
+        // the spinner.succeed line already conveys success; we still
+        // echo the path so operators can see exactly which file was
+        // touched.
+        const indexPath = join(projectRoot, 'adab', 'wiki', 'index.md');
+        spinner.succeed(chalk.green(`Wiki index regenerated: ${indexPath}`));
+        if (isJson) {
+          // `result` is whatever the wiki engine returned (an object
+          // describing the TOC or pages touched).  Fall back to a
+          // minimal envelope when the engine has nothing to report.
+          const payload = result !== undefined && result !== null
+            ? { success: true, indexPath, result }
+            : { success: true, indexPath };
+          output(payload, { json: true });
+        } else {
+          console.log(chalk.blue(`Index file: ${indexPath}`));
         }
       } catch (err) {
-        spinner.fail(chalk.red('Failed to regenerate wiki index.'));
-        process.exitCode = handleError(err, { json: options.json === true });
+        // Failure path: do NOT call spinner.fail() (that writes to
+        // stderr in addition to the JSON envelope that handleError
+        // will emit).  Stop the spinner quietly and let handleError
+        // produce a single, structured error message.
+        spinner.stop();
+        process.exitCode = handleError(err, { json: isJson });
       }
     });
 
@@ -742,7 +908,7 @@ export function createProgram(): Command {
       }
 
       if (!diffPath) {
-        process.exitCode = handleError(new AdabError('Either <path> or --change <id> is required', 'USAGE_ERROR'), { json: options.json === true });
+        process.exitCode = handleError(new UsageError('Either <path> or --change <id> is required'), { json: options.json === true });
         return;
       }
 
@@ -820,7 +986,7 @@ export function createProgram(): Command {
     .argument('<change-id>', 'Change identifier')
     .option('--force', 'Force archive even if a conflicting in-progress change exists')
     .option('--json', 'Output as JSON')
-    .addHelpText('after', '\nExample:\n  openadab archive ch-001')
+    .addHelpText('after', '\nExample:\n  openadab archive draft-ch-012')
     .action(async (changeId: string, options: Record<string, unknown>) => {
       const spinner = ora(`Archiving ${changeId}...`).start();
       try {
@@ -857,7 +1023,7 @@ export function createProgram(): Command {
       let value: unknown = config;
       for (const key of keys) {
         if (value === null || typeof value !== 'object') {
-          process.exitCode = handleError(new AdabError(`Invalid config path: ${path}`, 'USAGE_ERROR'), { json: options.json === true });
+          process.exitCode = handleError(new UsageError(`Invalid config path: ${path}`), { json: options.json === true });
           return;
         }
         value = (value as Record<string, unknown>)[key];
@@ -904,12 +1070,16 @@ export function createProgram(): Command {
       try {
         await writer.set(path, parsed);
         const logWriter = new LogWriter(projectRoot);
+        // S2: redact sensitive values (secrets.*, *.token, *.apiKey, *.password, …)
+        // before persisting them to adab/log.md so plaintext credentials never
+        // land in the audit log.
+        const logValue = redactConfigValue(path, parsed);
         await logWriter.append({
           ts: new Date().toISOString(),
           op: 'update',
           change: null,
           result: 'success',
-          details: { path, value: parsed },
+          details: { path, value: logValue },
         });
         if (options.json !== true) {
           console.log(chalk.green(`Set ${path} = ${value}`));
@@ -956,7 +1126,7 @@ export function createProgram(): Command {
     .option('--limit <N>', 'Limit number of entries (must be a positive integer)', (v: string) => {
       const n = Number(v);
       if (!Number.isInteger(n) || n <= 0) {
-        throw new AdabError(`Invalid --limit value: must be a positive integer, got "${v}"`, 'USAGE_ERROR');
+        throw new UsageError(`Invalid --limit value: must be a positive integer, got "${v}"`);
       }
       return n;
     })
