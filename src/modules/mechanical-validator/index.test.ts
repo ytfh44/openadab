@@ -298,6 +298,23 @@ describe('MechanicalValidator', () => {
       expect(result.passed).toBe(false);
       expect(result.errors.some((e) => e.includes('validation failed'))).toBe(true);
     });
+
+    it('missing config error message includes the absolute config path (M1 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const result = await validator.validateConfig();
+      expect(result.passed).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toMatch(/^Config file not found: /);
+      expect(result.errors[0]).toContain(join(root, 'adab', 'config.yaml'));
+    });
+
+    it('missing config returns artifactId "config" and empty warnings (M1 boundary)', async () => {
+      const { validator } = setupValidator();
+      const result = await validator.validateConfig();
+      expect(result.artifactId).toBe('config');
+      expect(result.warnings).toEqual([]);
+      expect(result.passed).toBe(false);
+    });
   });
 
   describe('validateChange', () => {
@@ -326,6 +343,82 @@ describe('MechanicalValidator', () => {
       expect(result?.artifactId).toBe('all');
       expect(result?.passed).toBe(true);
       expect(result?.errors).toHaveLength(0);
+    });
+
+    it('aggregate "all" result merges errors and warnings from every child (M3 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      // No draft.md → fileExists yields an error for 'draft'
+      // No wiki-diff.md → fileExists yields an error for 'wiki-diff'
+
+      // chapters: gap → warning
+      const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+      mkdirSync(chaptersDir, { recursive: true });
+      writeFileSync(join(chaptersDir, 'ch-001.md'), '');
+      writeFileSync(join(chaptersDir, 'ch-003.md'), '');
+
+      // No config.yaml → validateConfig yields an error (after M1 fix)
+
+      const results = await validator.validateChange(changeDir);
+      const all = results.find(r => r.artifactId === 'all');
+      expect(all).toBeDefined();
+      // Aggregate should have at least one error from each failing child
+      expect(all!.errors.length).toBeGreaterThan(0);
+      expect(all!.passed).toBe(false);
+      // Warning from chapter gap should be present
+      expect(all!.warnings.some((w) => w.includes('Gap'))).toBe(true);
+    });
+
+    it('aggregate "all" result is passed=true when only warnings are present (M3 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nA perfectly fine draft body that meets the limits.');
+      writeFileSync(join(changeDir, 'wiki-diff.md'), '---\ntitle: X\n---\n\nNo links here.');
+
+      const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+      mkdirSync(chaptersDir, { recursive: true });
+      writeFileSync(join(chaptersDir, 'ch-001.md'), '');
+      writeFileSync(join(chaptersDir, 'ch-003.md'), ''); // gap warning
+
+      const configDir = join(root, 'adab');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(
+        join(configDir, 'config.yaml'),
+        'schema: chapter-draft\nversion: 1\nproject:\n  title: Test Novel\n  language: en-US\n  genre: fantasy\n  tense: past\n  pov: limited-third\n'
+      );
+
+      const results = await validator.validateChange(changeDir);
+      const all = results.find(r => r.artifactId === 'all');
+      expect(all).toBeDefined();
+      expect(all!.passed).toBe(true);
+      expect(all!.errors).toEqual([]);
+      expect(all!.warnings.some((w) => w.includes('Gap'))).toBe(true);
+    });
+
+    it('aggregate "all" result exposes merged errors verbatim (M3 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      // No files at all → every artifact yields a "File missing" error
+      const configDir = join(root, 'adab');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(
+        join(configDir, 'config.yaml'),
+        'schema: chapter-draft\nversion: 1\nproject:\n  title: Test Novel\n  language: en-US\n  genre: fantasy\n  tense: past\n  pov: limited-third\n'
+      );
+
+      const results = await validator.validateChange(changeDir);
+      const all = results.find(r => r.artifactId === 'all');
+      expect(all).toBeDefined();
+      // Each child ValidationResult's errors should appear in the aggregate
+      for (const child of results) {
+        if (child.artifactId === 'all') {continue;}
+        for (const err of child.errors) {
+          expect(all!.errors).toContain(err);
+        }
+      }
     });
   });
 
@@ -363,6 +456,42 @@ describe('MechanicalValidator', () => {
       expect(result.passed).toBe(false);
       expect(result.errors.some((e) => e.includes('start at ch-001'))).toBe(true);
     });
+
+    it('missing-first-chapter is reported in errors, NOT warnings (M2 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+      mkdirSync(chaptersDir, { recursive: true });
+      writeFileSync(join(chaptersDir, 'ch-002.md'), '');
+      const result = await validator.chapterSequence();
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('start at ch-001'))).toBe(true);
+      expect(result.warnings.some((w) => w.includes('start at ch-001'))).toBe(false);
+      expect(result.warnings).toEqual([]);
+    });
+
+    it('gap is a warning: passed stays true and start-missing-chapter does not contaminate warnings (M2 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+      mkdirSync(chaptersDir, { recursive: true });
+      writeFileSync(join(chaptersDir, 'ch-001.md'), '');
+      writeFileSync(join(chaptersDir, 'ch-003.md'), '');
+      const result = await validator.chapterSequence();
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings.some((w) => w.includes('Gap'))).toBe(true);
+    });
+
+    it('mixed scenario: missing-first-chapter is error, gaps are warnings, passed is false (M2 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+      mkdirSync(chaptersDir, { recursive: true });
+      writeFileSync(join(chaptersDir, 'ch-002.md'), '');
+      writeFileSync(join(chaptersDir, 'ch-004.md'), '');
+      const result = await validator.chapterSequence();
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('start at ch-001'))).toBe(true);
+      expect(result.warnings.some((w) => w.includes('Gap'))).toBe(true);
+    });
   });
 
   describe('wikiLinkValidity', () => {
@@ -396,6 +525,44 @@ describe('MechanicalValidator', () => {
       const result = await validator.requireNonEmpty(changeDir, 'draft');
       expect(result.passed).toBe(false);
       expect(result.errors.some((e) => e.includes('empty'))).toBe(true);
+    });
+  });
+
+  describe('validateArtifact — word count warnings propagation (M4 boundary)', () => {
+    it('propagates wordCount warnings to result.warnings when below min', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      // Body has 1 word, schema requires minWords:10
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nshort.');
+      const result = await validator.validateArtifact(changeDir, 'draft');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings.some((w) => w.includes('below minimum'))).toBe(true);
+    });
+
+    it('propagates wordCount warnings to result.warnings when above max', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      // Default schema has maxWords:100; build a body of 150 words to trigger the upper bound.
+      const longBody = ('word ').repeat(150).trim();
+      writeFileSync(join(changeDir, 'draft.md'), `---\ntitle: X\n---\n\n${longBody}`);
+      const result = await validator.validateArtifact(changeDir, 'draft');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings.some((w) => w.includes('above maximum'))).toBe(true);
+    });
+
+    it('schemaCompliance reports word-count warnings as warnings (M4 boundary)', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nshort.');
+      const result = await validator.schemaCompliance(changeDir, 'draft');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings.some((w) => w.includes('Word count'))).toBe(true);
     });
   });
 

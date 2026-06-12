@@ -84,9 +84,8 @@ export class MechanicalValidator {
     }
 
     const wordCount = await this.wordCount(changeDir, artifactId);
-    if (!wordCount.passed) {
-      if (wordCount.errors.length > 0) {errors.push(...wordCount.errors);}
-      if (wordCount.warnings.length > 0) {warnings.push(...wordCount.warnings);}
+    if (wordCount.warnings.length > 0) {
+      warnings.push(...wordCount.warnings);
     }
 
     const schemaCompliance = await this.schemaCompliance(changeDir, artifactId);
@@ -122,8 +121,18 @@ export class MechanicalValidator {
   /**
    * Validate all artifacts in a change directory.
    *
+   * The returned array contains one entry per artifact in the schema, the
+   * chapter-sequence check, and the project-config check. A final entry with
+   * `artifactId === 'all'` is appended that aggregates every child result
+   * — its `errors` and `warnings` are the concatenation of all children's,
+   * and its `passed` is `true` only when no child produced an error
+   * (warnings are ignored for the aggregate, per spec scenario "Validate
+   * entire change"). Downstream callers (CLI, SyncEngine) can therefore
+   * inspect a single result to decide whether the change is syncable.
+   *
    * @param changeDir Absolute path to the change directory.
-   * @returns Array of per-artifact validation results.
+   * @returns Array of per-artifact validation results, ending with the
+   *          aggregate `artifactId: 'all'` entry.
    */
   async validateChange(changeDir: string): Promise<ValidationResult[]> {
     const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
@@ -136,7 +145,35 @@ export class MechanicalValidator {
     }
     results.push(await this.chapterSequence());
     results.push(await this.validateConfig());
+    results.push(this.aggregateResults(results));
     return results;
+  }
+
+  /**
+   * Combine a list of child validation results into a single aggregate entry.
+   *
+   * The aggregate's `errors` and `warnings` are the concatenation of all
+   * children's. `passed` is `true` iff no child contributed any error —
+   * warnings do not flip the aggregate to `false`, matching the spec's
+   * "aggregate results — overall pass/fail based on error severity
+   * (warnings don't fail)" requirement.
+   *
+   * @param children The per-artifact, chapter-sequence, and config results.
+   * @returns A single `ValidationResult` with `artifactId: 'all'`.
+   */
+  private aggregateResults(children: ValidationResult[]): ValidationResult {
+    const aggregateErrors: string[] = [];
+    const aggregateWarnings: string[] = [];
+    for (const child of children) {
+      aggregateErrors.push(...child.errors);
+      aggregateWarnings.push(...child.warnings);
+    }
+    return {
+      artifactId: 'all',
+      passed: aggregateErrors.length === 0,
+      errors: aggregateErrors,
+      warnings: aggregateWarnings,
+    };
   }
 
   /**
@@ -199,7 +236,7 @@ export class MechanicalValidator {
     const frontmatter = await this.frontmatterPresent(changeDir, artifactId);
     if (!frontmatter.passed) {errors.push(...frontmatter.errors);}
     const wordCount = await this.wordCount(changeDir, artifactId);
-    if (!wordCount.passed) {
+    if (wordCount.warnings.length > 0) {
       warnings.push(...wordCount.warnings);
     }
     return {
@@ -254,9 +291,17 @@ export class MechanicalValidator {
    * Word count is determined from the Markdown body (excluding frontmatter).
    * For Chinese text, characters are counted as words.
    *
+   * Per spec scenario "Word count check": out-of-range counts are reported
+   * with severity `warning` rather than `error`, and this method always
+   * returns `passed: true`. Callers must therefore check `warnings.length`
+   * (not `passed`) when deciding whether to surface the result. This
+   * invariant lets `validateArtifact` and `schemaCompliance` aggregate
+   * word-count warnings into their own result without re-checking `passed`.
+   *
    * @param changeDir  Absolute path to the change directory.
    * @param artifactId Artifact identifier.
-   * @returns Validation result. Out-of-range produces warnings (not errors).
+   * @returns Validation result. `passed` is always `true`; out-of-range
+   *          counts are surfaced via `warnings`.
    */
   async wordCount(changeDir: string, artifactId: string): Promise<ValidationResult> {
     const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
@@ -347,9 +392,17 @@ export class MechanicalValidator {
   /**
    * Check that manuscript chapters are consecutively numbered.
    *
-   * Scans `manuscript/chapters/` for `ch-NNN.md` files and reports gaps.
+   * Scans `manuscript/chapters/` for `ch-NNN.md` files and reports two kinds
+   * of issues, classified strictly per spec:
+   *  - Missing first chapter (e.g. only `ch-002.md` and `ch-003.md` exist)
+   *    is reported as a **error** with message `Chapters should start at
+   *    ch-001`. This is a hard requirement, not a stylistic note.
+   *  - Gaps between consecutive chapters (e.g. `ch-001` and `ch-003` with no
+   *    `ch-002`) are reported as **warnings** because the manuscript may be
+   *    intentionally out of order. Warnings do not flip `passed` to `false`.
    *
-   * @returns Validation result. Gaps produce warnings.
+   * @returns Validation result. `passed` reflects only the `errors` array;
+   *          `warnings` are informational and never fail the check.
    */
   async chapterSequence(): Promise<ValidationResult> {
     const chaptersDir = join(this.projectRoot, 'adab', 'manuscript', 'chapters');
@@ -361,6 +414,7 @@ export class MechanicalValidator {
         warnings: [],
       };
     }
+    const errors: string[] = [];
     const warnings: string[] = [];
     const entries = await readdir(chaptersDir);
     const numbers = entries
@@ -375,7 +429,7 @@ export class MechanicalValidator {
       .filter((n) => !Number.isNaN(n))
       .sort((a, b) => a - b);
     if (numbers.length > 0 && numbers[0] !== 1) {
-      warnings.push('Chapters should start at ch-001');
+      errors.push('Chapters should start at ch-001');
     }
     for (let i = 1; i < numbers.length; i++) {
       if (numbers[i] !== numbers[i - 1] + 1) {
@@ -385,8 +439,8 @@ export class MechanicalValidator {
 
     return {
       artifactId: 'chapter-sequence',
-      passed: warnings.length === 0,
-      errors: [],
+      passed: errors.length === 0,
+      errors,
       warnings,
     };
   }
@@ -394,15 +448,22 @@ export class MechanicalValidator {
   /**
    * Validate the project's `adab/config.yaml` against the zod schema.
    *
-   * @returns Validation result.
+   * Per spec scenario "Config file missing": when `adab/config.yaml` does not
+   * exist this method returns `passed: false` with an error message of the
+   * exact form `Config file not found: <absolute-path>`. The CLI uses this
+   * signal to abort the command; `openadab init` is the only command exempt
+   * from this check (it scaffolds the config from scratch).
+   *
+   * @returns Validation result. `passed` is `true` only when the config file
+   *          exists, parses as YAML, and conforms to `ProjectConfigSchema`.
    */
   async validateConfig(): Promise<ValidationResult> {
     const configPath = join(this.projectRoot, 'adab', 'config.yaml');
     if (!(await fileExists(configPath))) {
       return {
         artifactId: 'config',
-        passed: true,
-        errors: [],
+        passed: false,
+        errors: [`Config file not found: ${configPath}`],
         warnings: [],
       };
     }
