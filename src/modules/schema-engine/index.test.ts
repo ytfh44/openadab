@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import * as resourcePaths from '../../utils/resource-paths.js';
-import { SchemaValidationError, AdabError, CycleDetectedError } from '../../utils/errors.js';
+import { SchemaValidationError, AdabError, CycleDetectedError, UnresolvedVariableError } from '../../utils/errors.js';
 
 import {
   SchemaLoader,
@@ -226,6 +226,55 @@ describe('SchemaValidator', () => {
     };
     await expect(validator.validate(schema)).rejects.toBeInstanceOf(CycleDetectedError);
   });
+
+  it('SC-3: does not duplicate errors for name/version (zod has already enforced them)', async () => {
+    const validator = new SchemaValidator();
+    const schema = {
+      name: 'good',
+      version: 2,
+      artifacts: [{ id: 'a', generates: 'a.md', requires: [] }],
+    };
+    const result = await validator.validate(schema);
+    expect(result.passed).toBe(true);
+    expect(result.errors).toHaveLength(0);
+  });
+});
+
+describe('SchemaLoader SC-7 context multi-type', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'openadab-sc7-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('accepts numeric and boolean values in the schema context', async () => {
+    const schemaDir = join(tempDir, 'ctx');
+    mkdirSync(schemaDir, { recursive: true });
+    writeFileSync(
+      join(schemaDir, 'schema.yaml'),
+      [
+        'name: ctx-schema',
+        'version: 1',
+        'context:',
+        '  chapter: "001"',
+        '  count: 42',
+        '  enabled: true',
+        'artifacts:',
+        '  - id: a',
+        '    generates: a.md',
+        '    requires: []',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    const loader = new SchemaLoader(schemaDir);
+    const schema = await loader.load();
+    expect(schema.context).toEqual({ chapter: '001', count: 42, enabled: true });
+  });
 });
 
 describe('detectCycle', () => {
@@ -261,6 +310,24 @@ describe('detectCycle', () => {
     const artifacts = [{ id: 'a', generates: 'a.md', requires: ['missing'] }];
     expect(detectCycle(artifacts)).toBeNull();
   });
+
+  it('SC-4: throws CycleDetectedError listing missing refs when knownIds is supplied and a dep is unknown', () => {
+    const artifacts = [{ id: 'a', generates: 'a.md', requires: ['missing'] }];
+    expect(() => detectCycle(artifacts, undefined, new Set(['a'])))
+      .toThrow(CycleDetectedError);
+  });
+
+  it('SC-10: cycle path does not contain the synthetic "apply" virtual node', () => {
+    // Build a cycle: b -> apply -> c -> b, and tell detectCycle that
+    // b/c/apply are all known so it actually walks the cycle.
+    const artifacts = [
+      { id: 'b', generates: 'b.md', requires: ['apply'] },
+      { id: 'c', generates: 'c.md', requires: ['b'] },
+    ];
+    const cycle = detectCycle(artifacts, ['c'], new Set(['b', 'c', 'apply']));
+    expect(cycle).not.toBeNull();
+    expect(cycle).not.toContain('apply');
+  });
 });
 
 describe('resolveTemplatePath', () => {
@@ -285,6 +352,32 @@ describe('interpolateVariables', () => {
 
   it('throws AdabError for missing variable', () => {
     expect(() => interpolateVariables('{{missing}}', {})).toThrow(AdabError);
+  });
+
+  it('SC-8: aggregates repeated missing variables into a single error message', () => {
+    let caught: unknown;
+    try {
+      interpolateVariables('{{a}} and {{b}} and {{a}}', {});
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdabError);
+    const message = (caught as Error).message;
+    expect(message).toContain('{{a}}');
+    expect(message).toContain('{{b}}');
+    // a is referenced twice but reported only once
+    const matches = message.match(/\{\{a\}\}/g) ?? [];
+    expect(matches.length).toBe(1);
+  });
+
+  it('SC-8: reports all missing variables when there are several distinct ones', () => {
+    expect(() => interpolateVariables('{{x}}-{{y}}-{{z}}', {}))
+      .toThrow(/x.*y.*z|y.*x.*z/);
+  });
+
+  it('SC-7: stringifies non-string context values (number/boolean) when interpolating', () => {
+    expect(interpolateVariables('count={{count}} enabled={{flag}}', { count: 42, flag: true }))
+      .toBe('count=42 enabled=true');
   });
 
   it('returns unmodified text when no placeholders', () => {
@@ -332,5 +425,15 @@ describe('interpolateConfigVariables', () => {
 
   it('throws AdabError for intermediate missing path', () => {
     expect(() => interpolateConfigVariables('{{config.missing.field}}', config)).toThrow(AdabError);
+  });
+
+  it('SC-6: throws AdabError (not TypeError) for extra path segments past a leaf string', () => {
+    expect(() => interpolateConfigVariables('{{config.project.title.extra}}', config))
+      .toThrow(AdabError);
+  });
+
+  it('SC-6: throws AdabError for extra path segments past a numeric leaf', () => {
+    expect(() => interpolateConfigVariables('{{config.context.maxTokens.bogus}}', config))
+      .toThrow(AdabError);
   });
 });
