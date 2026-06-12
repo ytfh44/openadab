@@ -135,6 +135,71 @@ describe("WikiDiffOperationSchema", () => {
     };
     expect(() => WikiDiffOperationSchema.parse(input)).toThrow();
   });
+
+  // `update_field.value` is declared as `z.unknown()` so that
+  // callers may store arbitrary JSON-shaped values.  The schema MUST
+  // accept every primitive and the two container shapes that round-trip
+  // through gray-matter (arrays and objects), as well as the literal
+  // `null`, which is a legitimate "clear this field" signal.
+  it("accepts update_field with array value", () => {
+    const input = {
+      type: "update_field",
+      target: "characters/mara",
+      source: "manuscript/chapters/ch-012.md",
+      field: "tags",
+      value: ["spy", "ally"],
+    };
+    const result = WikiDiffOperationSchema.parse(input);
+    expect((result as any).value).toEqual(["spy", "ally"]);
+  });
+
+  it("accepts update_field with object value", () => {
+    const input = {
+      type: "update_field",
+      target: "characters/mara",
+      source: "manuscript/chapters/ch-012.md",
+      field: "metadata",
+      value: { rank: 3, oath: "until the end" },
+    };
+    const result = WikiDiffOperationSchema.parse(input);
+    expect((result as any).value).toEqual({ rank: 3, oath: "until the end" });
+  });
+
+  it("accepts update_field with null value", () => {
+    const input = {
+      type: "update_field",
+      target: "characters/mara",
+      source: "manuscript/chapters/ch-012.md",
+      field: "status",
+      value: null,
+    };
+    const result = WikiDiffOperationSchema.parse(input);
+    expect((result as any).value).toBeNull();
+  });
+
+  it("accepts update_field with numeric boolean and string values", () => {
+    expect((WikiDiffOperationSchema.parse({
+      type: "update_field",
+      target: "x",
+      source: "s",
+      field: "f",
+      value: 42,
+    }) as any).value).toBe(42);
+    expect((WikiDiffOperationSchema.parse({
+      type: "update_field",
+      target: "x",
+      source: "s",
+      field: "f",
+      value: true,
+    }) as any).value).toBe(true);
+    expect((WikiDiffOperationSchema.parse({
+      type: "update_field",
+      target: "x",
+      source: "s",
+      field: "f",
+      value: "alive",
+    }) as any).value).toBe("alive");
+  });
 });
 
 describe("WikiDiffDocumentSchema", () => {
