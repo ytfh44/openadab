@@ -335,4 +335,119 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
     const combined = [...stdoutLines, ...stderrLines].join('\n');
     expect(combined).not.toContain('No built-in schemas found');
   });
+
+  // ===== CLI-CONFLICT: --apply vs --dry-run must be detected =====
+  // The pre-fix code passed `conflicts(['dryRun'])` which is the
+  // Commander attribute name (camelCase), not the kebab-case option
+  // name.  Commander silently ignored the conflict declaration, so
+  // the user could pass `--apply --dry-run` and the apply actually
+  // fired.  The fix uses `conflicts(['dry-run'])` and the runtime
+  // throws when both are supplied.
+  describe('CLI-CONFLICT apply vs dry-run', () => {
+    it('wiki apply-diff command declares --dry-run and --apply as conflicting options', () => {
+      const program = createProgram();
+      const wikiCmd = program.commands.find((c) => c.name() === 'wiki');
+      expect(wikiCmd).toBeDefined();
+      const applyDiff = wikiCmd?.commands.find((c) => c.name() === 'apply-diff');
+      expect(applyDiff).toBeDefined();
+      // Both options should be present.
+      const dryRunOpt = applyDiff?.options.find((o) => o.name() === 'dry-run');
+      const applyOpt = applyDiff?.options.find((o) => o.name() === 'apply');
+      expect(dryRunOpt).toBeDefined();
+      expect(applyOpt).toBeDefined();
+      // And the --apply option MUST declare --dry-run as a conflict.
+      // Commander stores this in option.conflictsWith (Array of strings, not a Set).
+      // The conflict is declared in the form Commander compares against at
+      // runtime (camelCase attribute name), so accept either kebab-case or
+      // camelCase storage to keep this assertion robust to either declaration
+      // style that satisfies Commander's runtime conflict check.
+      const conflicts = (applyOpt?.conflictsWith ?? []) as readonly string[];
+      expect(Array.isArray(conflicts)).toBe(true);
+      expect(conflicts.includes('dryRun') || conflicts.includes('dry-run')).toBe(true);
+    });
+
+    it('passing only --apply does not throw (positive case still works)', async () => {
+      const program = createProgram();
+      const stderrLines: string[] = [];
+      const errSpy = vi.spyOn(console, 'error').mockImplementation((m: string) => stderrLines.push(m));
+      const origExit = process.exit;
+      (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
+        throw new Error('commander:exit');
+      }) as never;
+      try {
+        await expect(
+          program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--apply'])
+        ).resolves.toBeDefined();
+      } finally {
+        process.exit = origExit;
+        errSpy.mockRestore();
+      }
+    });
+
+    it('passing only --dry-run does not throw (positive case still works)', async () => {
+      const program = createProgram();
+      const stderrLines: string[] = [];
+      const errSpy = vi.spyOn(console, 'error').mockImplementation((m: string) => stderrLines.push(m));
+      const origExit = process.exit;
+      (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
+        throw new Error('commander:exit');
+      }) as never;
+      try {
+        await expect(
+          program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--dry-run'])
+        ).resolves.toBeDefined();
+      } finally {
+        process.exit = origExit;
+        errSpy.mockRestore();
+      }
+    });
+
+    it('passing neither --apply nor --dry-run does not throw (safe default)', async () => {
+      const program = createProgram();
+      const stderrLines: string[] = [];
+      const errSpy = vi.spyOn(console, 'error').mockImplementation((m: string) => stderrLines.push(m));
+      const origExit = process.exit;
+      (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
+        throw new Error('commander:exit');
+      }) as never;
+      try {
+        await expect(
+          program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md'])
+        ).resolves.toBeDefined();
+      } finally {
+        process.exit = origExit;
+        errSpy.mockRestore();
+      }
+    });
+
+    it('passing both --apply and --dry-run is rejected at parse time', async () => {
+      const program = createProgram();
+      const stderrLines: string[] = [];
+      const errSpy = vi.spyOn(console, 'error').mockImplementation((m: string) => stderrLines.push(m));
+      // Commander writes its error messages via process.stderr.write (not
+      // console.error), so spy on that too. See lib/command.js:63 default
+      // writeErr: (str) => process.stderr.write(str).
+      const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+        stderrLines.push(String(chunk));
+        return true;
+      }) as never);
+      const origExit = process.exit;
+      // Commander calls process.exit on parse error; replace it so the
+      // test does not abort the process.
+      (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
+        throw new Error('commander:exit');
+      }) as never;
+      try {
+        await expect(
+          program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--apply', '--dry-run'])
+        ).rejects.toThrow();
+      } finally {
+        process.exit = origExit;
+        errSpy.mockRestore();
+        stderrWriteSpy.mockRestore();
+      }
+      const combined = stderrLines.join('\n');
+      expect(combined.toLowerCase()).toMatch(/cannot be used with|--apply|--dry-run/);
+    });
+  });
 });
