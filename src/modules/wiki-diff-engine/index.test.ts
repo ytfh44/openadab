@@ -1,7 +1,7 @@
 /**
  * Unit tests for the Wiki Diff Engine.
  */
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -721,6 +721,94 @@ describe('WikiDiffApplier', () => {
     expect(page.body).toContain('guard saw insider');
   });
 
+  it('re-applying the same add_evidence op twice produces the same page bytes (idempotency)', async () => {
+    writeWikiPage(
+      root,
+      'threads/dupe-1.md',
+      `---\ntype: thread\nname: Dupe One\nstatus: open\nlast_updated: "2024-01-01"\n---\n\n# Dupe One\n\n## Evidence\n- existing\n`,
+    );
+    const doc = {
+      changeId: 'draft-ch-101',
+      operations: [
+        {
+          type: 'add_evidence' as const,
+          target: 'threads/dupe-1.md',
+          source: 'manuscript/chapters/ch-101.md',
+          evidence: 'guard saw insider',
+        },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-1.md'), 'utf-8');
+    // Re-apply the same op — body must not grow, and last_updated must
+    // not be reset on every re-apply.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-1.md'), 'utf-8');
+    // The two byte streams should be identical (no-op on the second pass).
+    expect(afterSecond).toBe(afterFirst);
+    // Body MUST contain the new evidence exactly once.
+    const occurrences = (afterSecond.match(/^- guard saw insider$/gm) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it('applying add_evidence with an item already in Evidence does not append a duplicate', async () => {
+    writeWikiPage(
+      root,
+      'threads/dupe-2.md',
+      `---\ntype: thread\nname: Dupe Two\nstatus: open\n---\n\n# Dupe Two\n\n## Evidence\n- existing\n- already on page\n`,
+    );
+    const doc = {
+      changeId: 'draft-ch-102',
+      operations: [
+        {
+          type: 'add_evidence' as const,
+          target: 'threads/dupe-2.md',
+          source: 'manuscript/chapters/ch-102.md',
+          evidence: 'already on page',
+        },
+      ],
+    };
+    const before = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-2.md'), 'utf-8');
+    await applier.apply(doc, false);
+    const after = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-2.md'), 'utf-8');
+    // Body MUST be unchanged because the evidence item was already present.
+    expect(after).toBe(before);
+    // The line MUST appear exactly once, not twice.
+    const occurrences = (after.match(/^- already on page$/gm) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it('applying add_evidence to a page with no Evidence section creates the section exactly once on re-apply', async () => {
+    writeWikiPage(
+      root,
+      'threads/dupe-3.md',
+      `---\ntype: thread\nname: Dupe Three\nstatus: open\n---\n\n# Dupe Three\n\nNo evidence section here yet.\n`,
+    );
+    const doc = {
+      changeId: 'draft-ch-103',
+      operations: [
+        {
+          type: 'add_evidence' as const,
+          target: 'threads/dupe-3.md',
+          source: 'manuscript/chapters/ch-103.md',
+          evidence: 'first clue',
+        },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-3.md'), 'utf-8');
+    // Section was created with the single evidence entry.
+    expect(afterFirst).toContain('## Evidence');
+    expect((afterFirst.match(/^- first clue$/gm) ?? []).length).toBe(1);
+    // Re-apply the SAME op — entry is already present, so no duplicate
+    // section header and no duplicate evidence line.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'dupe-3.md'), 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+    expect((afterSecond.match(/^- first clue$/gm) ?? []).length).toBe(1);
+    expect((afterSecond.match(/^## Evidence$/gm) ?? []).length).toBe(1);
+  });
+
   it('applies flag_contradiction', async () => {
     writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\n---\n\n# Mara\n`);
     const doc = {
@@ -920,5 +1008,117 @@ describe('WikiDiffApplier', () => {
     // timestamp, but the contract is "not the stale value").
     expect(page.frontmatter.last_updated).not.toBe(initialUpdated);
     expect(page.frontmatter.last_updated).toBeTruthy();
+  });
+
+  it('re-applying the same update_thread_status op twice produces the same page bytes (idempotency)', async () => {
+    writeWikiPage(root, 'threads/quest.md', `---\ntype: thread\nname: Quest\nstatus: advanced\nlast_updated: "2024-01-01"\n---\n\n# Quest\n\n## Evidence\n- existing\n`);
+    const doc = {
+      changeId: 'draft-ch-014',
+      operations: [
+        {
+          type: 'update_thread_status' as const,
+          target: 'threads/quest.md',
+          source: 'manuscript/chapters/ch-014.md',
+          status: 'advanced' as const,
+          evidence: ['newest clue'],
+        },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'quest.md'), 'utf-8');
+    // Re-apply with the same op — body shouldn't grow (no duplicate append),
+    // and last_updated shouldn't be reset on every re-apply.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'quest.md'), 'utf-8');
+    // The two byte streams should be identical (no-op on the second pass).
+    expect(afterSecond).toBe(afterFirst);
+    // Body MUST contain the new evidence exactly once.
+    const occurrences = (afterSecond.match(/newest clue/g) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it('applying the same update_thread_status op with overlapping evidence is idempotent (dedups existing items)', async () => {
+    writeWikiPage(root, 'threads/mystery.md', `---\ntype: thread\nname: Mystery\nstatus: advanced\nlast_updated: "2024-01-01"\n---\n\n# Mystery\n\n## Evidence\n- a\n- b\n`);
+    const doc = {
+      changeId: 'draft-ch-015',
+      operations: [
+        {
+          type: 'update_thread_status' as const,
+          target: 'threads/mystery.md',
+          source: 'manuscript/chapters/ch-015.md',
+          status: 'advanced' as const,
+          evidence: ['b', 'c'],
+        },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'mystery.md'), 'utf-8');
+    // First apply: 'b' is already present (deduped), only 'c' is appended.
+    // Final evidence list MUST be exactly ['a', 'b', 'c'] in order, with no duplicates.
+    expect(afterFirst).toMatch(/## Evidence\n- a\n- b\n- c\n/);
+    expect((afterFirst.match(/^- b$/gm) ?? []).length).toBe(1);
+    expect((afterFirst.match(/^- c$/gm) ?? []).length).toBe(1);
+    // Re-apply the SAME op — every entry is already present, so the
+    // body must not change at all (idempotency contract).
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'mystery.md'), 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+  });
+
+  it('applying update_thread_status without evidence is idempotent (no body change)', async () => {
+    const initialUpdated = 'manuscript/chapters/ch-016.md';
+    writeWikiPage(root, 'threads/quiet.md', `---\ntype: thread\nname: Quiet\nstatus: advanced\nlast_updated: ${initialUpdated}\n---\n\n# Quiet\n\n## Evidence\n- existing\n`);
+    const doc = {
+      changeId: 'draft-ch-016',
+      operations: [
+        {
+          type: 'update_thread_status' as const,
+          target: 'threads/quiet.md',
+          source: 'manuscript/chapters/ch-016.md',
+          status: 'advanced' as const,
+          evidence: [],
+        },
+      ],
+    };
+    const before = readFileSync(join(root, 'adab', 'wiki', 'threads', 'quiet.md'), 'utf-8');
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'quiet.md'), 'utf-8');
+    // First apply: status matches, no evidence → no-op path; bytes unchanged.
+    expect(afterFirst).toBe(before);
+    // Re-apply: must remain unchanged.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'quiet.md'), 'utf-8');
+    expect(afterSecond).toBe(before);
+    // last_updated must NOT have been refreshed.
+    const page = await wikiEngine.readPage('threads/quiet.md');
+    expect(page.frontmatter.last_updated).toBe(initialUpdated);
+  });
+
+  it('applying update_thread_status with new evidence when section does not exist yet creates the section exactly once', async () => {
+    writeWikiPage(root, 'threads/fresh.md', `---\ntype: thread\nname: Fresh\nstatus: open\nlast_updated: "2024-01-01"\n---\n\n# Fresh\n\nNo evidence section here yet.\n`);
+    const doc = {
+      changeId: 'draft-ch-017',
+      operations: [
+        {
+          type: 'update_thread_status' as const,
+          target: 'threads/fresh.md',
+          source: 'manuscript/chapters/ch-017.md',
+          status: 'advanced' as const,
+          evidence: ['first clue'],
+        },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'threads', 'fresh.md'), 'utf-8');
+    // Section was created with the single evidence entry.
+    expect(afterFirst).toContain('## Evidence');
+    expect((afterFirst.match(/^- first clue$/gm) ?? []).length).toBe(1);
+    // Re-apply the SAME op — entry is already present, so no duplicate
+    // section header and no duplicate evidence line.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'threads', 'fresh.md'), 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+    expect((afterSecond.match(/^- first clue$/gm) ?? []).length).toBe(1);
+    expect((afterSecond.match(/^## Evidence$/gm) ?? []).length).toBe(1);
   });
 });

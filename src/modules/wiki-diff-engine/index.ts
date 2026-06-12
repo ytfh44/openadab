@@ -927,12 +927,31 @@ export class WikiDiffApplier {
     let body = page.body;
     if (op.evidence !== undefined && op.evidence.length > 0) {
       const section = extractSectionsByHeading(body, 'Evidence');
-      const lines = op.evidence.map((e) => `- ${e}`).join('\n');
+      // Collect any evidence lines already present in the section so a
+      // re-apply of the same op doesn't duplicate them.  When every
+      // requested entry is already on the page we leave `body` untouched,
+      // which lets the early-return guard below treat the apply as a
+      // no-op and avoid refreshing `last_updated` on every re-apply.
+      const existingEvidence = new Set<string>();
       if (section !== null) {
-        const insertIndex = this.sectionInsertionPoint(body, section);
-        body = `${body.slice(0, insertIndex)}\n${lines}\n${body.slice(insertIndex)}`;
-      } else {
-        body += `\n## Evidence\n\n${lines}\n`;
+        for (const line of section.split('\n')) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('- ')) {
+            existingEvidence.add(trimmed);
+          }
+        }
+      }
+      const newLines = op.evidence
+        .map((e) => `- ${e}`)
+        .filter((formatted) => !existingEvidence.has(formatted));
+      if (newLines.length > 0) {
+        const lines = newLines.join('\n');
+        if (section !== null) {
+          const insertIndex = this.sectionInsertionPoint(body, section);
+          body = `${body.slice(0, insertIndex)}\n${lines}\n${body.slice(insertIndex)}`;
+        } else {
+          body += `\n## Evidence\n\n${lines}\n`;
+        }
       }
     }
     // `last_updated` MUST be refreshed on every apply call per
@@ -952,22 +971,31 @@ export class WikiDiffApplier {
    */
   private async applyAddEvidence(op: Extract<WikiDiffOperation, { type: 'add_evidence' }>): Promise<void> {
     const page = await this.wikiEngine.readPage(op.target);
-    const oldBody = page.body;
     let body = page.body;
     const section = extractSectionsByHeading(body, 'Evidence');
+    // Collect any evidence lines already present in the section so a
+    // re-apply of the same op doesn't duplicate the entry.  When the
+    // requested item is already on the page we leave `body` untouched,
+    // which preserves both the page bytes and the existing `last_updated`
+    // across re-applies (idempotency contract).
+    const existingEvidence = new Set<string>();
+    if (section !== null) {
+      for (const line of section.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('- ')) {
+          existingEvidence.add(trimmed);
+        }
+      }
+    }
+    const formatted = `- ${op.evidence}`;
+    if (existingEvidence.has(formatted)) {
+      return;
+    }
     if (section !== null) {
       const insertIndex = this.sectionInsertionPoint(body, section);
-      body = `${body.slice(0, insertIndex)}\n- ${op.evidence}\n${body.slice(insertIndex)}`;
+      body = `${body.slice(0, insertIndex)}\n${formatted}\n${body.slice(insertIndex)}`;
     } else {
-      body += `\n## Evidence\n\n- ${op.evidence}\n`;
-    }
-    // see note in {@link applyUpdateThreadStatus}.  Always
-    // refresh `last_updated`, even when the body would otherwise be a
-    // no-op.
-    if (body === oldBody) {
-      page.frontmatter.last_updated = op.source;
-      await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
-      return;
+      body += `\n## Evidence\n\n${formatted}\n`;
     }
     page.frontmatter.last_updated = op.source;
     await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
