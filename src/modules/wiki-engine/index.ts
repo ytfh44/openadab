@@ -278,7 +278,9 @@ export class WikiEngine {
       merged = { ...existing.data, ...frontmatter };
     }
     const validated = this.validateFrontmatter(merged, pagePath);
-    validated.last_updated = new Date().toISOString();
+    if (typeof validated.last_updated !== 'string' || validated.last_updated.length === 0) {
+      validated.last_updated = new Date().toISOString();
+    }
     await ensureDir(dirname(absPath));
     const output = matter.stringify(body, validated);
     await atomicWriteFile(absPath, output);
@@ -433,12 +435,19 @@ export class WikiEngine {
    * Generate `adab/wiki/index.md` with a table of contents grouped by type.
    *
    * Each entry is a `[[type/name]]` link with a brief summary.
+   * The system-generated files `index.md`, `overview.md`, and
+   * `contradictions.md` are skipped inside the loop as a defensive
+   * guard, on top of `listPages` already excluding them, so that
+   * an external write to one of those files (e.g. a hand-authored
+   * `index.md` carrying a valid frontmatter) cannot produce a
+   * self-referential entry on the next `generateIndex` call.
    */
   async generateIndex(): Promise<void> {
     const pages = await this.listPages();
     const groups = new Map<string, { path: string; type: string; name: string; status: string; summary: string }[]>();
 
     for (const pagePath of pages) {
+      if (pagePath === 'index.md' || pagePath === 'overview.md' || pagePath === 'contradictions.md') {continue;}
       try {
         const page = await this.readPage(pagePath);
         const type = (page.frontmatter.type as string | undefined) ?? 'other';
@@ -482,6 +491,12 @@ export class WikiEngine {
    * Generate `adab/wiki/overview.md` synopsis from wiki pages.
    *
    * Summarizes setting, characters, conflict, and current state.
+   * The system-generated files `index.md`, `overview.md`, and
+   * `contradictions.md` are skipped inside the loop as a defensive
+   * guard, mirroring {@link generateIndex}'s guard, so that a
+   * hand-authored `index.md` carrying a valid `character`,
+   * `location`, or `thread` frontmatter cannot leak into the
+   * overview.
    */
   async generateOverview(): Promise<void> {
     const pages = await this.listPages();
@@ -490,6 +505,7 @@ export class WikiEngine {
     const threads: { name: string; status: string }[] = [];
 
     for (const pagePath of pages) {
+      if (pagePath === 'index.md' || pagePath === 'overview.md' || pagePath === 'contradictions.md') {continue;}
       try {
         const page = await this.readPage(pagePath);
         const type = (page.frontmatter.type as string | undefined) ?? '';

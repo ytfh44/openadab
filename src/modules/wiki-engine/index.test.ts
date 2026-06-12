@@ -237,6 +237,82 @@ describe('WikiEngine', () => {
       expect(index).toContain('[[characters/a]]');
       expect(index).toContain('[[characters/b]]');
     });
+
+    // P0-3 regression: callers (notably WikiDiffApplier) supply a semantic
+    // `last_updated` value (e.g., the operation's source path) and writePage
+    // must preserve it instead of always overwriting with the wall clock.
+    it('preserves caller-supplied last_updated value (does not overwrite)', async () => {
+      const semanticStamp = 'manuscript/chapters/ch-014.md';
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon', last_updated: semanticStamp },
+        '# Mara'
+      );
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      // Accept either bare or YAML-quoted serialization of the semantic
+      // stamp (gray-matter may single-quote strings starting with a slash
+      // path, depending on version).
+      const hasBare = raw.includes(`last_updated: ${semanticStamp}`);
+      const hasSingle = raw.includes(`last_updated: '${semanticStamp}'`);
+      const hasDouble = raw.includes(`last_updated: "${semanticStamp}"`);
+      expect(hasBare || hasSingle || hasDouble).toBe(true);
+    });
+
+    // P0-3 regression: when the caller does not supply `last_updated`,
+    // writePage must still default to the current ISO timestamp so the
+    // field remains populated for non-diff callers.
+    it('defaults last_updated to current ISO only when the field is absent', async () => {
+      const before = new Date().toISOString();
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon' },
+        '# Mara'
+      );
+      const after = new Date().toISOString();
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      const match = /last_updated: (?:"([^"]+)"|'([^']+)'|(\S+))/.exec(raw);
+      expect(match).not.toBeNull();
+      const stamp = match?.[1] ?? match?.[2] ?? match?.[3] ?? '';
+      // The defaulted stamp must be a parseable ISO string within the window
+      // bracketing the call — not the synthetic source path from the diff
+      // applier, and not a value pinned to caller-supplied semantics.
+      expect(stamp).not.toBe('manuscript/chapters/ch-014.md');
+      expect(Number.isNaN(Date.parse(stamp))).toBe(false);
+      expect(Date.parse(stamp) >= Date.parse(before)).toBe(true);
+      expect(Date.parse(stamp) <= Date.parse(after)).toBe(true);
+    });
+
+    // P0-3 regression: when a page already on disk carries a `last_updated`
+    // (the typical case after a first write that used either a caller
+    // semantic value or the default ISO) and the next caller does not
+    // supply `last_updated`, writePage must preserve the on-disk value
+    // rather than re-stamping it with the wall clock. This covers the
+    // synthetic-fallback read path: `readPage` may produce a synthetic
+    // frontmatter that omits `last_updated`, but on a subsequent
+    // `writePage` round-trip we must not silently re-time-stamp the page.
+    it('preserves existing last_updated from the file on disk when caller does not supply it', async () => {
+      const pinnedStamp = '2024-01-15T10:00:00.000Z';
+      // First write establishes the page with an explicit `last_updated`.
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon', last_updated: pinnedStamp },
+        '# Mara v1'
+      );
+      // Second write omits `last_updated`. The existing on-disk value
+      // (merged into the validated frontmatter) must be preserved.
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'advanced' },
+        '# Mara v2'
+      );
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      // YAML may quote the ISO string on round-trip because it contains a
+      // colon; accept either the bare or quoted serialization.
+      const hasBare = raw.includes(`last_updated: ${pinnedStamp}`);
+      const hasSingle = raw.includes(`last_updated: '${pinnedStamp}'`);
+      const hasDouble = raw.includes(`last_updated: "${pinnedStamp}"`);
+      expect(hasBare || hasSingle || hasDouble).toBe(true);
+    });
   });
 
   describe('listPages', () => {
@@ -590,6 +666,100 @@ describe('WikiEngine', () => {
       await expect(
         engine.writePage('misc/foo.md', { type: 'unknown', name: 'Foo' } as unknown as Record<string, unknown>, '# Foo')
       ).rejects.toBeInstanceOf(AdabError);
+    });
+  });
+
+  // ===== WE-SYSPAGES: generateIndex / generateOverview skip system files =====
+  // The pre-fix implementation trusted listPages() to filter out
+  // index.md, overview.md, and contradictions.md.  If any of those files
+  // sneaked in (hand-authored `index.md` with valid frontmatter, a stray
+  // file, etc.) it would appear as a self-referential entry.  The fix
+  // adds a defensive in-loop guard.
+  describe('WE-SYSPAGES system-page filtering', () => {
+    beforeEach(() => {
+      mkdirSync(join(tempDir, 'adab', 'wiki', 'characters'), { recursive: true });
+    });
+
+    it('generateIndex skips index.md / overview.md / contradictions.md even when listPages returns them', async () => {
+      // Inject a hand-authored index.md with valid character frontmatter
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'index.md'),
+        '---\ntype: character\nname: Self\nstatus: canon\n---\n# Self',
+        'utf-8',
+      );
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'overview.md'),
+        '---\ntype: character\nname: Overview\nstatus: canon\n---\n# Overview',
+        'utf-8',
+      );
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'contradictions.md'),
+        '---\ntype: character\nname: Contradictions\nstatus: canon\n---\n# Contradictions',
+        'utf-8',
+      );
+      // Real page
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'),
+        '---\ntype: character\nname: Mara\nstatus: canon\n---\n# Mara',
+        'utf-8',
+      );
+
+      // Stub listPages to bypass the engine's built-in filter so we
+      // exercise the in-loop guard in generateIndex.
+      (engine as unknown as { listPages: () => Promise<string[]> }).listPages = async () => [
+        'index.md',
+        'overview.md',
+        'contradictions.md',
+        'characters/mara.md',
+      ];
+
+      await engine.generateIndex();
+      const index = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
+      expect(index).toContain('[[characters/mara]]');
+      expect(index).not.toContain('[[index]]');
+      expect(index).not.toContain('[[overview]]');
+      expect(index).not.toContain('[[contradictions]]');
+    });
+
+    it('generateOverview skips index.md / overview.md / contradictions.md', async () => {
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'index.md'),
+        '---\ntype: character\nname: Self\nstatus: canon\n---\n# Self',
+        'utf-8',
+      );
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'overview.md'),
+        '---\ntype: character\nname: Overview\nstatus: canon\n---\n# Overview',
+        'utf-8',
+      );
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'contradictions.md'),
+        '---\ntype: thread\nname: Contradiction\nstatus: open\n---\n# Contradictions',
+        'utf-8',
+      );
+      writeFileSync(
+        join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'),
+        '---\ntype: character\nname: Mara\nstatus: canon\n---\n# Mara',
+        'utf-8',
+      );
+
+      (engine as unknown as { listPages: () => Promise<string[]> }).listPages = async () => [
+        'index.md',
+        'overview.md',
+        'contradictions.md',
+        'characters/mara.md',
+      ];
+
+      await engine.generateOverview();
+      const overview = readFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), 'utf-8');
+      // Mara should appear; system pages should not leak their names
+      expect(overview).toContain('Mara');
+      // The hand-authored system files have type character with a name
+      // and type thread; if the guard is missing they would be classified
+      // as such and appear in the output.
+      expect(overview).not.toContain('— Self');
+      expect(overview).not.toContain('— Overview');
+      expect(overview).not.toContain('Contradiction (open)');
     });
   });
 });
