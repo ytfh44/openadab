@@ -8,6 +8,7 @@ export const ArtifactDefSchema = z.object({
   instruction: z.string().optional(),
   instructionFile: z.string().optional(),
   contextBudget: z.number().optional(),
+  required: z.boolean().default(true),
   validation: z.object({
     mechanical: z.array(z.string()).optional(),
     semantic: z.array(z.string()).optional(),
@@ -18,7 +19,7 @@ export const SchemaDefSchema = z.object({
   name: z.string(),
   version: z.number(),
   description: z.string().optional(),
-  context: z.record(z.string()).optional(),
+  context: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   artifacts: z.array(ArtifactDefSchema),
   apply: z.object({
     requires: z.array(z.string()),

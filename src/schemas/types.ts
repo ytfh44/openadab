@@ -9,6 +9,13 @@ export interface ArtifactDef {
   instruction?: string;
   instructionFile?: string;
   contextBudget?: number;
+  /**
+   * Whether this artifact must be present for sync to succeed.
+   *
+   * When `false`, a missing artifact is non-fatal: the engine logs a
+   * warning and proceeds without it. Defaults to `true` when absent.
+   */
+  required?: boolean;
   validation?: {
     mechanical?: string[];
     semantic?: string[];
@@ -24,7 +31,7 @@ export interface SchemaDef {
   name: string;
   version: number;
   description?: string;
-  context?: Record<string, string>;
+  context?: Record<string, string | number | boolean>;
   artifacts: ArtifactDef[];
   apply?: {
     requires: string[];

@@ -94,6 +94,7 @@ artifacts:
     generates: wiki-diff.md
     requires: [continuity-report]
     template: templates/wiki-diff.md
+    required: false
     instruction: >
       Translate the continuity report into structured wiki-diff operations.
       Each operation must include a source citation (chapter and section).
