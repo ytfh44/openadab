@@ -199,172 +199,315 @@ export class WikiDiffParser {
   /**
    * Parse the Markdown block under a single target heading into operations.
    */
-  private parseBlock(block: string, targetPath: string, _fullMarkdown: string, _headingIndex: number): WikiDiffOperation[] {
+  private parseBlock(block: string, targetPath: string, fullMarkdown: string, headingIndex: number): WikiDiffOperation[] {
     const ops: WikiDiffOperation[] = [];
     const sourceMatch = /Source:\s*(.+)/.exec(block);
     const source = sourceMatch !== null ? sourceMatch[1].trim() : '';
 
-    const currentState = extractSectionsByHeading(block, 'Add to Current State');
-    if (currentState !== null) {
-      for (const line of currentState.split('\n')) {
-        const m = /^-\s+(.+)$/.exec(line);
-        if (m !== null) {
-          ops.push({ type: 'add_current_state', target: targetPath, source, content: m[1].trim() });
-        }
+    const context: ParseContext = { targetPath, source, fullMarkdown, headingIndex };
+
+    for (const strategy of this.operationStrategies) {
+      const section = extractSectionsByHeading(block, strategy.sectionName);
+      if (section !== null) {
+        ops.push(...strategy.parse(section, context));
       }
     }
 
-    const knowledge = extractSectionsByHeading(block, 'Add to Knowledge Timeline');
-    if (knowledge !== null) {
-      for (const rawLine of knowledge.split('\n')) {
-        // cells may legitimately contain a `|` character (escaped
-        // in the source as `\|` or appearing as plain text).  The previous
-        // `^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$` regex assumed exactly two cells
-        // and would mis-split or drop rows containing internal `|`.  We
-        // instead split on `|`, drop the leading/trailing empty cells
-        // produced by the table framing, and join the remainder with `|`
-        // so internal pipes survive.
-        const trimmed = rawLine.trim();
-        if (!trimmed.startsWith('|')) {continue;}
-        const cells = trimmed.split('|').slice(1, -1).map((c) => c.trim());
-        if (cells.length < 2) {continue;}
-        const chapter = cells[0] ?? '';
-        const knowledgeText = cells.slice(1).join(' | ');
-        if (chapter !== 'Chapter' && !/^[-]+$/.test(chapter) && !/^[-]+$/.test(knowledgeText)) {
-          ops.push({ type: 'add_knowledge_timeline', target: targetPath, source, chapter, knowledge: knowledgeText });
-        }
-      }
-    }
-
-    const relationship = extractSectionsByHeading(block, 'Update Relationship');
-    if (relationship !== null) {
-      // a single regex with non-greedy quantifiers
-      // (`(.+?)\s+and\s+(.+?)\s+are\s+now\s+(.+)`) cannot reliably split
-      // subjects of the form "X and Y and Z are now W": the inner non-
-      // greedy capture would expand to swallow the next " and " segment
-      // because the surrounding anchors tolerate it.  Instead, we split on
-      // the longest " are now " suffix, then take the substring *after the
-      // last* " and " in the remaining prefix.  This guarantees that the
-      // related entity is exactly the final conjunction operand.
-      const areNowMatch = /^(.*)\s+are\s+now\s+(.+)$/s.exec(relationship);
-      if (areNowMatch !== null) {
-        const head = areNowMatch[1] ?? '';
-        const tail = (areNowMatch[2] ?? '').trim();
-        const lastAnd = head.lastIndexOf(' and ');
-        if (lastAnd >= 0) {
-          const relatedEntity = head.slice(lastAnd + ' and '.length).trim();
-          const relationship = tail;
-          ops.push({ type: 'update_relationship', target: targetPath, source, relatedEntity, relationship });
-        }
-      }
-    }
-
-    const threadStatus = extractSectionsByHeading(block, 'Update Thread Status');
-    if (threadStatus !== null) {
-      const statusMatch = /Status:\s*(\S+)/.exec(threadStatus);
-      const evidenceMatches = threadStatus.match(/New evidence:\s*(.+)/g);
-      const evidence = evidenceMatches !== null ? evidenceMatches.map((s) => s.replace(/New evidence:\s*/, '').trim()) : undefined;
-      if (statusMatch !== null) {
-        const rawStatus = statusMatch[1].trim();
-        const validStatuses = new Set(['open', 'advanced', 'resolved']);
-        if (!validStatuses.has(rawStatus)) {
-          throw new WikiDiffParseError(`Invalid thread status: "${rawStatus}" — must be one of: open, advanced, resolved`);
-        }
-        const status = rawStatus as 'open' | 'advanced' | 'resolved';
-        ops.push({ type: 'update_thread_status', target: targetPath, source, status, evidence });
-      }
-    }
-
-    const evidenceSection = extractSectionsByHeading(block, 'Add Evidence');
-    if (evidenceSection !== null) {
-      for (const line of evidenceSection.split('\n')) {
-        const m = /^-\s+(.+)$/.exec(line);
-        if (m !== null) {
-          ops.push({ type: 'add_evidence', target: targetPath, source, evidence: m[1].trim() });
-        }
-      }
-    }
-
-    const contradiction = extractSectionsByHeading(block, 'Flag Contradiction');
-    if (contradiction !== null) {
-      const descMatch = /Description:\s*(.+)/.exec(contradiction);
-      const sources: { page: string; claim: string }[] = [];
-      for (const rawLine of contradiction.split('\n')) {
-        const m = /^-\s+(.+)$/.exec(rawLine);
-        if (m === null) {continue;}
-        const payload = m[1] ?? '';
-        // the source line may have a page identifier that itself
-        // contains ":" (for example `wiki:characters/mara`) followed by a
-        // claim of the form `<text>: <claim>`.  The previous regex
-        // `^-\s+(.+?):\s*(.+)$` is non-greedy and split on the FIRST ":",
-        // turning `wiki:characters/mara: claims …` into page="wiki",
-        // claim="characters/mara: claims …".  Split on the FIRST ": "
-        // (colon-space) instead so the page keeps any leading namespace.
-        const colonSpace = payload.indexOf(': ');
-        if (colonSpace < 0) {continue;}
-        const page = payload.slice(0, colonSpace).trim();
-        const claim = payload.slice(colonSpace + 2).trim();
-        if (page === '' || claim === '') {continue;}
-        sources.push({ page, claim });
-      }
-      if (descMatch !== null) {
-        ops.push({ type: 'flag_contradiction', target: targetPath, source, description: descMatch[1].trim(), sources, status: 'unresolved' });
-      }
-    }
-
-    const fieldUpdate = extractSectionsByHeading(block, 'Update Field');
-    if (fieldUpdate !== null) {
-      // the previous implementation only parsed the first
-      // `field: value` line via a single regex, silently discarding any
-      // additional field updates.  the field name pattern used
-      // `\w+` which forbids hyphens, so e.g. `first-name` was dropped.
-      // We now match every `field: value` line; the field pattern accepts
-      // word characters and `-`, the value runs to end-of-line.
-      const fieldRegex = /^([\w-]+):\s*(.+)$/gm;
-      let fm: RegExpExecArray | null;
-      while ((fm = fieldRegex.exec(fieldUpdate)) !== null) {
-        const field = fm[1]?.trim() ?? '';
-        const rawValue = (fm[2] ?? '').trim();
-        if (field === '' || rawValue === '') {continue;}
-        let value: unknown = rawValue;
-        if (/^-?\d+(\.\d+)?$/.test(rawValue)) {
-          value = Number(rawValue);
-        } else if (rawValue === 'true') {
-          value = true;
-        } else if (rawValue === 'false') {
-          value = false;
-        }
-        ops.push({ type: 'update_field', target: targetPath, source, field, value });
-      }
-    }
-
-    // Validate that all #### headings are recognized sections
-    const knownSections = [
-      'Add to Current State',
-      'Add to Knowledge Timeline',
-      'Update Relationship',
-      'Update Thread Status',
-      'Add Evidence',
-      'Flag Contradiction',
-      'Update Field',
-    ];
-    // the recognition regex must tolerate the same trailing
-    // HTML comment that `extractSectionsByHeading` accepts.
-    const allSectionHeaders = block.match(/^####\s+(.+?)(?:\s*<!--[\s\S]*?-->)?\s*$/gm);
-    if (allSectionHeaders !== null) {
-      for (const header of allSectionHeaders) {
-        const name = header.replace(/^####\s+/, '').replace(/\s*<!--[\s\S]*?-->\s*$/, '').trim();
-        if (!knownSections.includes(name)) {
-          const headerIndex = _fullMarkdown.indexOf(header);
-          const lineNum = headerIndex >= 0 ? _fullMarkdown.slice(0, headerIndex).split('\n').length : 0;
-          throw new WikiDiffParseError(`Unrecognized section header: "${name}" at line ${String(lineNum)}`);
-        }
-      }
-    }
+    this.validateSectionHeaders(block, fullMarkdown);
 
     return ops;
   }
+
+  /**
+   * Validate that every `####` heading inside the block is one of the
+   * known section names handled by a registered strategy. Tolerates
+   * the same trailing HTML comment that `extractSectionsByHeading`
+   * accepts.
+   */
+  private validateSectionHeaders(block: string, fullMarkdown: string): void {
+    const knownSections = this.operationStrategies.map((s) => s.sectionName);
+    const allSectionHeaders = block.match(/^####\s+(.+?)(?:\s*<!--[\s\S]*?-->)?\s*$/gm);
+    if (allSectionHeaders === null) {return;}
+    for (const header of allSectionHeaders) {
+      const name = header.replace(/^####\s+/, '').replace(/\s*<!--[\s\S]*?-->\s*$/, '').trim();
+      if (!knownSections.includes(name)) {
+        const headerIndex = fullMarkdown.indexOf(header);
+        const lineNum = headerIndex >= 0 ? fullMarkdown.slice(0, headerIndex).split('\n').length : 0;
+        throw new WikiDiffParseError(`Unrecognized section header: "${name}" at line ${String(lineNum)}`);
+      }
+    }
+  }
+
+  /**
+   * Strategies applied in declaration order. Each owns the parsing
+   * logic for a single `####` section type. Centralized here so that
+   * the set of recognized sections lives next to the parser and so
+   * that `validateSectionHeaders` can derive its allow-list from the
+   * same source of truth.
+   */
+  private readonly operationStrategies: readonly OperationStrategy[] = DEFAULT_OPERATION_STRATEGIES;
 }
+
+/**
+ * Shared context passed to every operation strategy when parsing a
+ * Markdown block. Carries everything a strategy needs to construct
+ * fully-formed {@link WikiDiffOperation} objects without coupling
+ * strategies to the parser's internals.
+ */
+interface ParseContext {
+  /** Target page path (e.g. `characters/mara.md`) for the block. */
+  targetPath: string;
+  /** Resolved `Source:` citation for the block, or `''` if absent. */
+  source: string;
+  /** Full original Markdown document, used for error-line reporting. */
+  fullMarkdown: string;
+  /** Index of the block's `###` heading node in the mdast. */
+  headingIndex: number;
+}
+
+/**
+ * Strategy contract for parsing one kind of wiki-diff section.
+ *
+ * Each implementation owns the regex, validation, and op-construction
+ * for a single `####` section type. Strategies are stateless: the
+ * per-block mutable state is passed in via {@link ParseContext}.
+ */
+interface OperationStrategy {
+  /** The `####` heading name this strategy handles (exact match). */
+  readonly sectionName: string;
+  /**
+   * Parse the supplied section text and return the operations it
+   * describes. Returning an empty array is valid (e.g. a section with
+   * only a header and no payload lines).
+   */
+  parse(section: string, context: ParseContext): WikiDiffOperation[];
+}
+
+/**
+ * Parses `#### Add to Current State` bullet lists into
+ * `add_current_state` operations.
+ */
+class AddCurrentStateStrategy implements OperationStrategy {
+  readonly sectionName = 'Add to Current State';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const ops: WikiDiffOperation[] = [];
+    for (const line of section.split('\n')) {
+      const m = /^-\s+(.+)$/.exec(line);
+      if (m !== null) {
+        ops.push({ type: 'add_current_state', target: context.targetPath, source: context.source, content: m[1].trim() });
+      }
+    }
+    return ops;
+  }
+}
+
+/**
+ * Parses `#### Add to Knowledge Timeline` two-column tables into
+ * `add_knowledge_timeline` operations.
+ *
+ * Cells may legitimately contain a `|` character (escaped in the
+ * source as `\|` or appearing as plain text). The previous
+ * `^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$` regex assumed exactly two cells
+ * and would mis-split or drop rows containing internal `|`. We
+ * instead split on `|`, drop the leading/trailing empty cells
+ * produced by the table framing, and join the remainder with `|`
+ * so internal pipes survive.
+ */
+class AddKnowledgeTimelineStrategy implements OperationStrategy {
+  readonly sectionName = 'Add to Knowledge Timeline';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const ops: WikiDiffOperation[] = [];
+    for (const rawLine of section.split('\n')) {
+      const trimmed = rawLine.trim();
+      if (!trimmed.startsWith('|')) {continue;}
+      const cells = trimmed.split('|').slice(1, -1).map((c) => c.trim());
+      if (cells.length < 2) {continue;}
+      const chapter = cells[0] ?? '';
+      const knowledgeText = cells.slice(1).join(' | ');
+      if (chapter !== 'Chapter' && !/^[-]+$/.test(chapter) && !/^[-]+$/.test(knowledgeText)) {
+        ops.push({ type: 'add_knowledge_timeline', target: context.targetPath, source: context.source, chapter, knowledge: knowledgeText });
+      }
+    }
+    return ops;
+  }
+}
+
+/**
+ * Parses `#### Update Relationship` "X and Y are now Z" sentences
+ * into `update_relationship` operations.
+ *
+ * A single regex with non-greedy quantifiers
+ * (`(.+?)\s+and\s+(.+?)\s+are\s+now\s+(.+)`) cannot reliably split
+ * subjects of the form "X and Y and Z are now W": the inner
+ * non-greedy capture would expand to swallow the next " and "
+ * segment because the surrounding anchors tolerate it. Instead, we
+ * split on the longest " are now " suffix, then take the substring
+ * *after the last* " and " in the remaining prefix. This guarantees
+ * that the related entity is exactly the final conjunction operand.
+ */
+class UpdateRelationshipStrategy implements OperationStrategy {
+  readonly sectionName = 'Update Relationship';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const ops: WikiDiffOperation[] = [];
+    const areNowMatch = /^(.*)\s+are\s+now\s+(.+)$/s.exec(section);
+    if (areNowMatch !== null) {
+      const head = areNowMatch[1] ?? '';
+      const tail = (areNowMatch[2] ?? '').trim();
+      const lastAnd = head.lastIndexOf(' and ');
+      if (lastAnd >= 0) {
+        const relatedEntity = head.slice(lastAnd + ' and '.length).trim();
+        ops.push({ type: 'update_relationship', target: context.targetPath, source: context.source, relatedEntity, relationship: tail });
+      }
+    }
+    return ops;
+  }
+}
+
+/**
+ * Parses `#### Update Thread Status` blocks (a `Status:` line and
+ * zero-or-more `New evidence:` lines) into `update_thread_status`
+ * operations. Throws {@link WikiDiffParseError} on unknown statuses.
+ */
+class UpdateThreadStatusStrategy implements OperationStrategy {
+  readonly sectionName = 'Update Thread Status';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const statusMatch = /Status:\s*(\S+)/.exec(section);
+    if (statusMatch === null) {return [];}
+    const evidenceMatches = section.match(/New evidence:\s*(.+)/g);
+    const evidence = evidenceMatches !== null ? evidenceMatches.map((s) => s.replace(/New evidence:\s*/, '').trim()) : undefined;
+    const rawStatus = statusMatch[1].trim();
+    const validStatuses = new Set(['open', 'advanced', 'resolved']);
+    if (!validStatuses.has(rawStatus)) {
+      throw new WikiDiffParseError(`Invalid thread status: "${rawStatus}" — must be one of: open, advanced, resolved`);
+    }
+    const status = rawStatus as 'open' | 'advanced' | 'resolved';
+    return [{ type: 'update_thread_status', target: context.targetPath, source: context.source, status, evidence }];
+  }
+}
+
+/**
+ * Parses `#### Add Evidence` bullet lists into `add_evidence`
+ * operations.
+ */
+class AddEvidenceStrategy implements OperationStrategy {
+  readonly sectionName = 'Add Evidence';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const ops: WikiDiffOperation[] = [];
+    for (const line of section.split('\n')) {
+      const m = /^-\s+(.+)$/.exec(line);
+      if (m !== null) {
+        ops.push({ type: 'add_evidence', target: context.targetPath, source: context.source, evidence: m[1].trim() });
+      }
+    }
+    return ops;
+  }
+}
+
+/**
+ * Parses `#### Flag Contradiction` blocks (a `Description:` line and
+ * bullet-list `page: claim` sources) into `flag_contradiction`
+ * operations.
+ *
+ * The source line may have a page identifier that itself contains
+ * ":" (for example `wiki:characters/mara`) followed by a claim of
+ * the form `<text>: <claim>`. The previous regex
+ * `^-\s+(.+?):\s*(.+)$` is non-greedy and split on the FIRST ":",
+ * turning `wiki:characters/mara: claims …` into page="wiki",
+ * claim="characters/mara: claims …". Split on the FIRST ": "
+ * (colon-space) instead so the page keeps any leading namespace.
+ */
+class FlagContradictionStrategy implements OperationStrategy {
+  readonly sectionName = 'Flag Contradiction';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const descMatch = /Description:\s*(.+)/.exec(section);
+    if (descMatch === null) {return [];}
+    const sources: { page: string; claim: string }[] = [];
+    for (const rawLine of section.split('\n')) {
+      const m = /^-\s+(.+)$/.exec(rawLine);
+      if (m === null) {continue;}
+      const payload = m[1] ?? '';
+      const colonSpace = payload.indexOf(': ');
+      if (colonSpace < 0) {continue;}
+      const page = payload.slice(0, colonSpace).trim();
+      const claim = payload.slice(colonSpace + 2).trim();
+      if (page === '' || claim === '') {continue;}
+      sources.push({ page, claim });
+    }
+    return [{ type: 'flag_contradiction', target: context.targetPath, source: context.source, description: descMatch[1].trim(), sources, status: 'unresolved' }];
+  }
+}
+
+/**
+ * Parses `#### Update Field` `field: value` lines into
+ * `update_field` operations, coercing numeric and boolean literals.
+ *
+ * The field pattern accepts word characters and `-` (so e.g.
+ * `first-name` survives), and the value runs to end-of-line. Every
+ * matching `field: value` line in the section produces an op — the
+ * previous single-match implementation silently dropped subsequent
+ * field updates.
+ */
+class UpdateFieldStrategy implements OperationStrategy {
+  readonly sectionName = 'Update Field';
+
+  parse(section: string, context: ParseContext): WikiDiffOperation[] {
+    const ops: WikiDiffOperation[] = [];
+    // Two constraints are required to keep each field confined to its
+    // own line:
+    //   * the separator after the colon is `[ \t]*` (horizontal
+    //     whitespace), NOT `\s*` — `\s` matches `\n`, which would let
+    //     the separator swallow the line break and let `(.+)` then
+    //     capture the *next* "field: value" line as the current
+    //     field's value (so a stray `name:` with no value would
+    //     capture `age: 30` as its value).
+    //   * the value pattern is `[^\n]+`, NOT `.+` — even with the
+    //     line-boundary fix above, `.+` would still try to match
+    //     across newlines under the `m` flag's end-of-line anchor.
+    //   * a positive `(?=\S)` lookahead requires the value to start
+    //     with a non-whitespace character, so a line like
+    //     `name:    ` (colon followed by only spaces) is correctly
+    //     rejected as having no value at all.
+    const fieldRegex = /^([\w-]+):[ \t]*(?=\S)([^\n]+)$/gm;
+    let fm: RegExpExecArray | null;
+    while ((fm = fieldRegex.exec(section)) !== null) {
+      const field = fm[1]?.trim() ?? '';
+      const rawValue = (fm[2] ?? '').trim();
+      if (field === '' || rawValue === '') {continue;}
+      let value: unknown = rawValue;
+      if (/^-?\d+(\.\d+)?$/.test(rawValue)) {
+        value = Number(rawValue);
+      } else if (rawValue === 'true') {
+        value = true;
+      } else if (rawValue === 'false') {
+        value = false;
+      }
+      ops.push({ type: 'update_field', target: context.targetPath, source: context.source, field, value });
+    }
+    return ops;
+  }
+}
+
+/**
+ * Default set of operation strategies, in the order they appear in
+ * a wiki-diff block. Order is purely for readability of the section
+ * validation list; the parser applies each strategy independently
+ * and does not rely on the ordering for correctness.
+ */
+const DEFAULT_OPERATION_STRATEGIES: readonly OperationStrategy[] = [
+  new AddCurrentStateStrategy(),
+  new AddKnowledgeTimelineStrategy(),
+  new UpdateRelationshipStrategy(),
+  new UpdateThreadStatusStrategy(),
+  new AddEvidenceStrategy(),
+  new FlagContradictionStrategy(),
+  new UpdateFieldStrategy(),
+];
 
 /**
  * Applies parsed wiki-diff operations to wiki pages.

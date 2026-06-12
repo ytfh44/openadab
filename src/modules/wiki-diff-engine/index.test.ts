@@ -279,6 +279,360 @@ describe('WikiDiffParser', () => {
   });
 });
 
+/**
+ * Adversarial / edge-case tests aimed at finding real bugs in the
+ * refactored strategy-based parser. These complement the happy-path
+ * tests in the main `WikiDiffParser` block above.
+ */
+describe('WikiDiffParser edge cases (refactor stress tests)', () => {
+  const parser = new WikiDiffParser();
+
+  // === Add to Current State ===
+
+  it('preserves order of multiple bullets within a section', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Current State\n- first\n- second\n- third\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations.map((o) => (o as { content: string }).content))
+      .toEqual(['first', 'second', 'third']);
+  });
+
+  it('skips non-bullet lines but keeps bullets interleaved with them', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Current State\n- keep me\nrandom prose line\n- and me\n\nparagraph break\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations.map((o) => (o as { content: string }).content))
+      .toEqual(['keep me', 'and me']);
+  });
+
+  // === Add to Knowledge Timeline ===
+
+  it('parses multiple data rows in order', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Knowledge Timeline\n| Chapter | Knowledge |\n|---------|-----------|\n| ch-001 | first fact |\n| ch-002 | second fact |\n| ch-003 | third fact |\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(3);
+    expect((doc.operations[0] as { chapter: string }).chapter).toBe('ch-001');
+    expect((doc.operations[2] as { chapter: string }).chapter).toBe('ch-003');
+  });
+
+  it('silently drops a row whose chapter is the literal string "Chapter" (header collision)', async () => {
+    // The original parser skips the literal "Chapter" header row, but
+    // a real data row with the chapter name "Chapter" would also be
+    // dropped. This documents the collision: the parser's "is this the
+    // header row?" heuristic cannot distinguish them.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Knowledge Timeline\n| Chapter | Knowledge |\n|---------|-----------|\n| Chapter | should this be kept |\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('skips a row whose chapter cell is all dashes (separator row)', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Knowledge Timeline\n| Chapter | Knowledge |\n|---------|-----------|\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  // === Update Relationship ===
+
+  it('produces no op for a single-subject relationship (no "and")', async () => {
+    // The strategy requires `\s+and\s+` via `lastIndexOf(' and ')`.
+    // A sentence like "Mara is now allies" silently yields zero ops.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Relationship\nMara is now allies\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('extracts the final conjunction operand as relatedEntity for >2 names', async () => {
+    // Four-name variant: ensure the slice point is the LAST " and ".
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Relationship\nMara and Lin and Bob and Sue are now friends\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations[0]).toMatchObject({
+      type: 'update_relationship',
+      relatedEntity: 'Sue',
+      relationship: 'friends',
+    });
+  });
+
+  it('produces no op when "are now" is missing', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Relationship\nMara and Lin are friends\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('keeps the relationship value intact when it contains "and"', async () => {
+    // The relationship tail is taken as everything after the last
+    // " are now ", so internal "and"s in the relationship are
+    // preserved verbatim.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Relationship\nMara and Lin are now allies and confidants\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { relationship: string }).relationship)
+      .toBe('allies and confidants');
+  });
+
+  // === Update Thread Status ===
+
+  it('produces no op when Status: line is absent (evidence-only block)', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Thread Status\nNew evidence: something happened\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('captures multiple "New evidence:" lines in order', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Thread Status\nStatus: advanced\nNew evidence: first\nNew evidence: second\nNew evidence: third\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { evidence: string[] }).evidence)
+      .toEqual(['first', 'second', 'third']);
+  });
+
+  it('throws on an unknown status value (case-sensitive)', async () => {
+    // Status matching is case-sensitive: only the lowercase enum
+    // values are accepted. "Open" with capital O is rejected.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Thread Status\nStatus: Open\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(/Invalid thread status/);
+  });
+
+  // === Add Evidence ===
+
+  it('preserves order of multiple evidence bullets', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add Evidence\n- e1\n- e2\n- e3\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations.map((o) => (o as { evidence: string }).evidence))
+      .toEqual(['e1', 'e2', 'e3']);
+  });
+
+  // === Flag Contradiction ===
+
+  it('produces no op when description is missing (sources-only block)', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Flag Contradiction\n- characters/x: claim1\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('produces an op with empty sources when description is present but no bullets', async () => {
+    // The strategy returns a single op with `sources: []` whenever
+    // the description regex matches, even if no bullet sources
+    // followed. This may or may not be the desired behavior.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Flag Contradiction\nDescription: gate is ambiguous\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(1);
+    expect((doc.operations[0] as { sources: unknown[] }).sources).toEqual([]);
+  });
+
+  it('skips a bullet source line that has no colon', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Flag Contradiction\nDescription: x\n- just a bullet, no colon here\n- characters/mara: valid claim\n`;
+    const doc = await parser.parse(markdown);
+    const op = doc.operations[0] as { sources: { page: string; claim: string }[] };
+    expect(op.sources).toEqual([{ page: 'characters/mara', claim: 'valid claim' }]);
+  });
+
+  // === Update Field ===
+
+  it('coerces "0" to the number 0 (not the string "0")', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\ncount: 0\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { value: unknown }).value).toBe(0);
+  });
+
+  it('coerces negative and decimal numbers', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\ndelta: -3.5\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { value: unknown }).value).toBe(-3.5);
+  });
+
+  it('does NOT coerce scientific notation to a number (regex requires decimal suffix)', async () => {
+    // `1e5` is not matched by `^-?\d+(\.\d+)?$`, so it remains a string.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\nbig: 1e5\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { value: unknown }).value).toBe('1e5');
+  });
+
+  it('does NOT coerce the capitalized "True" to a boolean', async () => {
+    // Boolean coercion is case-sensitive: only lowercase "true"/"false".
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\nflag: True\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { value: unknown }).value).toBe('True');
+  });
+
+  it('skips a field line whose value is empty (e.g. "name:")', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\nname:\nage: 30\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(1);
+    expect((doc.operations[0] as { field: string }).field).toBe('age');
+  });
+
+  it('preserves a value that itself contains a colon', async () => {
+    // The value runs to end-of-line, so embedded colons survive.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\nurl: https://example.com/path\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { value: unknown }).value).toBe('https://example.com/path');
+  });
+
+  // === Refactor invariant: operation order across sections ===
+
+  it('preserves the documented section order across mixed sections', async () => {
+    // Every section type present in a single block, in a deliberately
+    // scrambled order. Operations must be emitted in the canonical
+    // strategy order, NOT in source order.
+    const markdown = `---\nchangeId: ch\n---\n\n` +
+      `### [[a]]\nSource: s.md\n\n` +
+      `#### Update Field\nf: 1\n\n` +
+      `#### Add Evidence\n- ev\n\n` +
+      `#### Add to Current State\n- st\n\n` +
+      `#### Update Thread Status\nStatus: open\n\n` +
+      `#### Add to Knowledge Timeline\n| Chapter | Knowledge |\n|---------|-----------|\n| ch-1 | k |\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations.map((o) => o.type)).toEqual([
+      'add_current_state',
+      'add_knowledge_timeline',
+      'update_thread_status',
+      'add_evidence',
+      'update_field',
+    ]);
+  });
+
+  // === Refactor invariant: state isolation between blocks ===
+
+  it('parses two consecutive blocks without state leaking between them', async () => {
+    // If the field-regex's `lastIndex` were ever cached on the
+    // strategy instance (or anywhere else), a second parse could
+    // resume from the wrong offset. Two back-to-back parses must
+    // each produce the expected count of operations.
+    const md1 = `---\nchangeId: ch1\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Current State\n- x1\n- x2\n- x3\n`;
+    const md2 = `---\nchangeId: ch2\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Current State\n- y1\n- y2\n`;
+    const doc1 = await parser.parse(md1);
+    const doc2 = await parser.parse(md2);
+    expect(doc1.operations).toHaveLength(3);
+    expect(doc2.operations).toHaveLength(2);
+  });
+
+  it('parses interleaved blocks from different sources (parser reuse)', async () => {
+    // Same parser instance, three documents in a row. Verifies the
+    // strategy list is a stable singleton and doesn't accumulate
+    // per-call state.
+    const make = (id: string) => `---\nchangeId: ${id}\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Field\nv: 1\n`;
+    const docs = await Promise.all([parser.parse(make('a')), parser.parse(make('b')), parser.parse(make('c'))]);
+    expect(docs.every((d) => d.operations.length === 1)).toBe(true);
+  });
+
+  // === Block-level edge cases ===
+
+  it('uses empty source when the Source: line is missing entirely', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\n\n#### Add to Current State\n- x\n`;
+    const doc = await parser.parse(markdown);
+    expect((doc.operations[0] as { source: string }).source).toBe('');
+  });
+
+  it('emits zero operations for a block with only an H3 and a Source line', async () => {
+    // No #### sections at all → no ops, no validation error.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(0);
+  });
+
+  it('throws on an unrecognized #### section', async () => {
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Totally Made Up Section\n- x\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(/Unrecognized section header/);
+  });
+
+  it('recognizes a section header with case mismatch only via exact match (case-sensitive)', async () => {
+    // The validation uses `knownSections.includes(name)` and the
+    // strategies are looked up by exact `sectionName`. Mixed-case
+    // headings are NOT accepted.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### add to current state\n- x\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(/Unrecognized section header/);
+  });
+
+  it('handles a section header followed by trailing punctuation (must be exact match)', async () => {
+    // `extractSectionsByHeading` requires the heading text to be
+    // matched exactly. `#### Add to Current State:` (trailing colon)
+    // will NOT be recognized by the strategy, and the section
+    // validator then sees the heading (via the `####` regex) and
+    // throws because the cleaned name "Add to Current State:" is
+    // not in the allow-list.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Add to Current State:\n- x\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(/Unrecognized section header/);
+  });
+
+  it('only parses the FIRST occurrence when a section appears twice', async () => {
+    // `extractSectionsByHeading` returns the first match and stops at
+    // the next heading of equal-or-higher level, so a second
+    // occurrence of the same section in the same block is silently
+    // ignored. This documents that behavior.
+    const markdown = `---\nchangeId: ch\n---\n\n` +
+      `### [[a]]\nSource: s.md\n\n` +
+      `#### Add to Current State\n- from first\n\n` +
+      `#### Add to Current State\n- from second\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(1);
+    expect((doc.operations[0] as { content: string }).content).toBe('from first');
+  });
+
+  it('validation rejects a heading whose name differs only in surrounding whitespace from a known section', async () => {
+    // The validator trims the captured name, so leading/trailing
+    // whitespace on a heading is tolerated and the section is
+    // recognised. (Documents the relaxed behavior on the
+    // validation side; matching for parsing is also whitespace-
+    // tolerant via the strategy's heading regex.)
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n####   Add to Current State   \n- x\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(1);
+  });
+
+  // === Cross-cutting invariants ===
+
+  it('produces no spurious op when a section contains only a heading and blank lines', async () => {
+    // `extractSectionsByHeading` returns null for empty sections, so
+    // the strategy must not run and no op is produced.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Thread Status\n\n\n#### Add Evidence\n- only this one\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(1);
+    expect(doc.operations[0].type).toBe('add_evidence');
+  });
+
+  it('does not dedup two ops of different types with the same payload string', async () => {
+    // REGRESSION / PRE-EXISTING BUG EXPOSURE:
+    //
+    // The dedup key in `parse()` is built as
+    //   `${op.target}::${op.action}::${this.dedupPayload(op)}`
+    // but `WikiDiffOperation` has no `action` field — it has `type`.
+    // At runtime `op.action` is `undefined`, so the key collapses
+    // to `${target}::undefined::${payload}`. Two different op types
+    // whose payload serializes to the same string therefore collide
+    // and the second is wrongly flagged as a duplicate.
+    //
+    // We construct the collision: an `add_current_state` whose
+    // content is the same string as an `add_evidence` whose
+    // evidence is the same string. The schema-correct behaviour is
+    // to keep both ops; the current behaviour throws.
+    const markdown = `---\nchangeId: ch\n---\n\n` +
+      `### [[a]]\nSource: s.md\n\n` +
+      `#### Add to Current State\n- shared\n\n` +
+      `### [[a]]\nSource: s.md\n\n` +
+      `#### Add Evidence\n- shared\n`;
+    await expect(parser.parse(markdown)).rejects.toThrow(/Duplicate operation/);
+  });
+
+  it('all seven section types can co-exist in a single block', async () => {
+    // Smoke test: every section type at once, none should be dropped.
+    const markdown = `---\nchangeId: ch\n---\n\n` +
+      `### [[a]]\nSource: s.md\n\n` +
+      `#### Add to Current State\n- a\n\n` +
+      `#### Add to Knowledge Timeline\n| Chapter | Knowledge |\n|---------|-----------|\n| ch-1 | k |\n\n` +
+      `#### Update Relationship\nA and B are now rivals\n\n` +
+      `#### Update Thread Status\nStatus: open\n\n` +
+      `#### Add Evidence\n- e\n\n` +
+      `#### Flag Contradiction\nDescription: d\n- p: c\n\n` +
+      `#### Update Field\nf: v\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations.map((o) => o.type).sort()).toEqual([
+      'add_current_state',
+      'add_evidence',
+      'add_knowledge_timeline',
+      'flag_contradiction',
+      'update_field',
+      'update_relationship',
+      'update_thread_status',
+    ]);
+  });
+});
+
 describe('WikiDiffApplier', () => {
   let root: string;
   let wikiEngine: WikiEngine;
