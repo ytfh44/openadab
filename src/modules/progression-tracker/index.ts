@@ -328,11 +328,32 @@ export class ProgressionTracker {
     const chapters = await this.loadAllEvents();
     const indexDir = join(this.projectRoot, 'adab', 'index');
     await ensureDir(indexDir);
-    await atomicWriteFile(join(indexDir, 'progressions.json'), JSON.stringify({ chapters }, null, 2));
+    const indexPath = join(indexDir, 'progressions.json');
+    await atomicWriteFile(indexPath, JSON.stringify({ chapters }, null, 2));
+    // Re-stat the freshly-written file so the in-memory cache records the
+    // real on-disk mtime.  loadAllEvents had to seed the cache with 0
+    // (or the pre-write mtime) when it ran, so a follow-up read would
+    // otherwise either re-glob the change tree unnecessarily (when the
+    // pre-write mtime was 0) or be flagged as stale for the wrong reason.
+    if (this.eventsCache !== null) {
+      let mtimeMs = 0;
+      try {
+        const s = await stat(indexPath);
+        mtimeMs = s.mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      this.eventsCache = { mtimeMs, chapters: this.eventsCache.chapters };
+    }
   }
 
   /**
    * Get all events for a specific entity across all chapters.
+   *
+   * When the in-memory cache records a `0` mtime (meaning the previous
+   * `loadAllEvents` stat failed) a full rebuild is triggered here as
+   * well, so that callers see a freshly collected view of the change
+   * tree even when the index file's mtime is unknown.
    *
    * @param entity Entity name to filter by.
    * @returns Chronologically ordered array of events.
@@ -340,7 +361,26 @@ export class ProgressionTracker {
   async getProgression(entity: string): Promise<ProgressionEvent[]> {
     // PT-7: re-sort by numeric chapter before returning, even when the
     // on-disk `progressions.json` was written in an arbitrary order.
-    const chapters = await this.loadAllEvents();
+    let chapters = await this.loadAllEvents();
+    // When the prior stat failed (mtime === 0) and the just-loaded chapters
+    // are still empty, force a full rebuild so callers see a freshly
+    // collected view of the change tree even when the index file's mtime
+    // is unknown.  If loadAllEvents already produced non-empty chapters
+    // (the common case after a successful full rebuild), the existing
+    // data is good — no second rebuild is needed.
+    if (this.eventsCache !== null && this.eventsCache.mtimeMs === 0 && chapters.length === 0) {
+      const rebuilt = await this.collectEventsFromChanges();
+      const indexPath = join(this.projectRoot, 'adab', 'index', 'progressions.json');
+      let rebuiltMtimeMs = 0;
+      try {
+        const s = await stat(indexPath);
+        rebuiltMtimeMs = s.mtimeMs;
+      } catch {
+        rebuiltMtimeMs = 0;
+      }
+      this.eventsCache = { mtimeMs: rebuiltMtimeMs, chapters: rebuilt };
+      chapters = rebuilt;
+    }
     const sortedChapters = [...chapters].sort(
       (a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter),
     );
@@ -688,7 +728,11 @@ export class ProgressionTracker {
    *
    * PT-11: the parsed result is memoised in memory, keyed by the mtime of
    * `progressions.json`.  Subsequent calls with an unchanged file return
-   * the cached array without re-globbing the change tree.
+   * the cached array without re-globbing the change tree.  When the index
+   * is missing or unparseable the chapters are rebuilt from the change
+   * tree; the cache is then seeded with a fresh `stat` of the index file
+   * (or `0` when the file is still unavailable) so that subsequent reads
+   * can benefit from the cache instead of forcing another rebuild.
    *
    * @returns Array of chapter-grouped events.
    */
@@ -728,7 +772,14 @@ export class ProgressionTracker {
       }
     }
     const rebuilt = await this.collectEventsFromChanges();
-    this.eventsCache = { mtimeMs: -1, chapters: rebuilt };
+    let rebuiltMtimeMs = 0;
+    try {
+      const s = await stat(indexPath);
+      rebuiltMtimeMs = s.mtimeMs;
+    } catch {
+      rebuiltMtimeMs = 0;
+    }
+    this.eventsCache = { mtimeMs: rebuiltMtimeMs, chapters: rebuilt };
     return rebuilt;
   }
 

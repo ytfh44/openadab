@@ -606,4 +606,116 @@ describe('ProgressionTracker', () => {
       expect(events[0].entity).toBe('Cara');
     });
   });
+
+  // ----- PT-12: cache uses real stat mtime, not -1 sentinel -----
+  // The pre-fix implementation hard-coded `mtimeMs: -1` after every
+  // rebuild, which forced the cache to be considered "stale" on every
+  // subsequent read.  The fix seeds the cache with the actual on-disk
+  // mtime (or 0 when stat fails).  These tests verify both halves of
+  // the contract.
+  describe('PT-12 cache mtime handling', () => {
+    it('generateProgressionsJson seeds the cache with the real file mtime', async () => {
+      const { root, tracker } = setupTracker();
+      const changesDir = join(root, 'adab', 'changes', 'ch-001');
+      mkdirSync(changesDir, { recursive: true });
+      writeFileSync(join(changesDir, 'continuity-report.md'), '## Character Knowledge\n- Mara knows the secret\n');
+      await tracker.generateProgressionsJson();
+      const cache = (tracker as any).eventsCache as { mtimeMs: number; chapters: unknown[] } | null;
+      expect(cache).not.toBeNull();
+      expect(cache!.mtimeMs).toBeGreaterThan(0);
+      // The mtime must NOT be the pre-fix -1 sentinel
+      expect(cache!.mtimeMs).not.toBe(-1);
+    });
+
+    it('a successful getProgression does NOT need to re-glob the change tree', async () => {
+      const { root, tracker } = setupTracker();
+      const changesDir = join(root, 'adab', 'changes', 'ch-001');
+      mkdirSync(changesDir, { recursive: true });
+      writeFileSync(join(changesDir, 'continuity-report.md'), '## Character Knowledge\n- Mara knows the secret\n');
+      await tracker.generateProgressionsJson();
+      // Spy on the internal collector; if the cache works correctly, this
+      // MUST NOT be called again.
+      const collectSpy = vi.spyOn(tracker as any, 'collectEventsFromChanges');
+      await tracker.getProgression('Mara');
+      expect(collectSpy).not.toHaveBeenCalled();
+      collectSpy.mockRestore();
+    });
+
+    it('getProgression rebuilds the cache when the prior stat failed (mtime === 0)', async () => {
+      const { root, tracker } = setupTracker();
+      const changesDir = join(root, 'adab', 'changes', 'ch-001');
+      mkdirSync(changesDir, { recursive: true });
+      writeFileSync(join(changesDir, 'continuity-report.md'), '## Character Knowledge\n- Mara knows the secret\n');
+
+      // Force the cache into the "stat failed" state.
+      (tracker as any).eventsCache = { mtimeMs: 0, chapters: [] };
+
+      const collectSpy = vi.spyOn(tracker as any, 'collectEventsFromChanges');
+      const events = await tracker.getProgression('Mara');
+      // The collector MUST have been invoked because mtime=0 signals
+      // an unverified cache.
+      expect(collectSpy).toHaveBeenCalledTimes(1);
+      expect(events.length).toBeGreaterThan(0);
+      // The rebuilder path stats the index file to re-seed the cache.
+      // The file does not exist in this scenario, so the stat must fail
+      // and the cache must remain at mtimeMs === 0 (NOT -1, NOT a stale
+      // leftover from a previous write).  This is the "stat genuinely
+      // fails" contract for the in-memory cache.
+      const rebuiltCache = (tracker as any).eventsCache as { mtimeMs: number; chapters: unknown[] };
+      expect(rebuiltCache.mtimeMs).toBe(0);
+      expect(rebuiltCache.mtimeMs).not.toBe(-1);
+      expect(rebuiltCache.chapters.length).toBeGreaterThan(0);
+      collectSpy.mockRestore();
+    });
+
+    it('cache mtimeMs is 0 when the stat genuinely fails (e.g., write succeeds but stat still cannot see the file)', async () => {
+      const { root, tracker } = setupTracker();
+      // Create change files so the rebuilder has real work to do, but
+      // do NOT create the `adab/index/progressions.json` file.  This
+      // makes every `stat(indexPath)` call inside the rebuilder path
+      // throw ENOENT, which is the exact scenario the mtime=0
+      // sentinel is designed to handle.
+      const changesDir = join(root, 'adab', 'changes', 'ch-001');
+      mkdirSync(changesDir, { recursive: true });
+      writeFileSync(join(changesDir, 'continuity-report.md'), '## Character Knowledge\n- Mara knows the secret\n');
+
+      // Drive `loadAllEvents` directly so we observe the post-stat
+      // cache state in the fresh-index-file-missing branch.
+      const loadAllEvents = (tracker as any).loadAllEvents.bind(tracker) as () => Promise<unknown[]>;
+      const chapters = await loadAllEvents();
+
+      // The rebuilder path must have produced real chapters from the
+      // change tree, but the cache must record mtimeMs === 0 because
+      // the index file does not exist on disk and stat fails.
+      expect(chapters.length).toBeGreaterThan(0);
+      const cache = (tracker as any).eventsCache as { mtimeMs: number; chapters: unknown[] } | null;
+      expect(cache).not.toBeNull();
+      expect(cache!.mtimeMs).toBe(0);
+      expect(cache!.mtimeMs).not.toBe(-1);
+    });
+
+    it('the seeded cache after a rebuild matches the on-disk mtime (no -1 leakage)', async () => {
+      const { root, tracker } = setupTracker();
+      // No change files exist → generateProgressionsJson will rebuild
+      // an empty chapter list.  The current implementation writes the
+      // index file BEFORE re-stat-ing (see `atomicWriteFile` + the
+      // post-write `stat` in `generateProgressionsJson`), so the cache
+      // is seeded with the real post-write mtime — NOT the pre-fix -1
+      // sentinel and NOT a 0 from a stat-of-missing-file.
+      const tBefore = Date.now();
+      await tracker.generateProgressionsJson();
+      const tAfter = Date.now();
+      const cache = (tracker as any).eventsCache as { mtimeMs: number; chapters: unknown[] } | null;
+      expect(cache).not.toBeNull();
+      // The freshly-written file's mtime is a real epoch-ms number,
+      // not 0 (stat-of-missing-file) and not -1 (pre-fix sentinel).
+      expect(cache!.mtimeMs).toBeGreaterThan(0);
+      expect(cache!.mtimeMs).not.toBe(-1);
+      // The mtime must be the mtime of the file we just wrote, so it
+      // falls in the [tBefore, tAfter] window (with a small clock-skew
+      // tolerance on the upper bound).
+      expect(cache!.mtimeMs).toBeGreaterThanOrEqual(tBefore);
+      expect(cache!.mtimeMs).toBeLessThanOrEqual(tAfter + 5_000);
+    });
+  });
 });
