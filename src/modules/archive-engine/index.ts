@@ -3,10 +3,12 @@
  * archive, copies the final revision to the manuscript, updates the manifest,
  * and appends a log entry.
  */
-import { copyFile, rename, mkdir } from 'node:fs/promises';
-import { join, basename, dirname } from 'node:path';
+import { copyFile, rename, mkdir, readdir, unlink, rmdir } from 'node:fs/promises';
+import { join, basename, dirname, isAbsolute, resolve, sep } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import YAML from 'yaml';
+import { glob } from 'fast-glob';
 
 import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';
@@ -29,6 +31,14 @@ export interface ArchiveReport {
   backupCreated: boolean;
   /** The log entry that was appended. */
   logEntry: LogEntry;
+  /**
+   * Non-fatal warnings collected during the operation.
+   *
+   * The archive itself still succeeds when warnings are present, but callers
+   * should surface them to the user. Always defined; empty when the operation
+   * completed cleanly.
+   */
+  warnings: string[];
 }
 
 /**
@@ -52,17 +62,25 @@ export class ArchiveEngine {
    * Archive a change directory.
    *
    * Steps:
-   * 1. Verify the change manifest status is "synced".
-   * 2. Copy the revision artifact to `manuscript/chapters/ch-XXX.md`.
-   * 3. Move `adab/changes/<change>/` to `adab/changes/archive/<change>/`.
-   * 4. Update the archived manifest status to "archived".
-   * 5. Append an archive log entry.
+   * 1. Verify the change directory name does not escape the project boundary.
+   * 2. Verify the change manifest status is "synced" or "archived" (only synced is allowed).
+   * 3. Copy the revision artifact to `manuscript/chapters/ch-XXX.md`.
+   * 4. Move `adab/changes/<change>/` to `adab/changes/archive/<change>/`.
+   * 5. Update the archived manifest status to "archived".
+   * 6. Append an archive log entry; log write failures are non-fatal.
    *
    * @param changeDir Change directory name (e.g. `draft-ch-012`).
+   * @param force     If `true`, rename an existing archive target to
+   *                  `*.bak-{ts}-{uuid}` and proceed; otherwise an existing
+   *                  target throws `ARCHIVE_DUPLICATE`.
    * @returns Structured archive report.
-   * @throws {AdabError} If the change is not synced, not found, or IO fails.
+   * @throws {AdabError} If the change is not synced, not found, the path
+   *                     escapes the project boundary, or IO fails.
    */
   async archive(changeDir: string, force = false): Promise<ArchiveReport> {
+    this.assertChangeDirSafe(changeDir);
+    const warnings: string[] = [];
+
     const changePath = join(this.projectRoot, 'adab', 'changes', changeDir);
     const manifestPath = join(changePath, '.openadab.yaml');
 
@@ -71,6 +89,12 @@ export class ArchiveEngine {
     }
 
     const manifest = await this.loadManifest(manifestPath);
+    if (manifest.status === 'archived') {
+      throw new AdabError(
+        `Change ${changeDir} is already archived.`,
+        'ARCHIVE_ALREADY_ARCHIVED',
+      );
+    }
     if (manifest.status !== 'synced') {
       throw new AdabError(
         `Change ${changeDir} is not synced. Run \`openadab sync --change ${changeDir}\` first.`,
@@ -102,19 +126,21 @@ export class ArchiveEngine {
     const revisionFileName = await this.resolveRevisionFilename(manifest);
     const revisionPath = join(changePath, revisionFileName);
     let backupCreated = false;
+    let manuscriptCreated = false;
     if (await fileExists(revisionPath)) {
       if (await fileExists(manuscriptPath)) {
-        console.warn(`Overwriting existing ${manuscriptPath}`);
+        warnings.push(`Overwriting existing ${manuscriptPath}`);
         const config = await this.loadProjectConfig();
         if (config.archive?.backupOnOverwrite === true) {
-          const backupPath = `${manuscriptPath}.bak.${String(Date.now())}`;
+          const backupPath = `${manuscriptPath}.bak.${String(Date.now())}-${randomUUID()}`;
           await copyFile(manuscriptPath, backupPath);
           backupCreated = true;
         }
       }
       await copyFile(revisionPath, manuscriptPath);
+      manuscriptCreated = true;
     } else {
-      console.warn(`Revision artifact not found: ${revisionPath}`);
+      warnings.push(`Revision artifact not found: ${revisionPath}`);
     }
 
     // Write the archived manifest BEFORE moving the directory, so that
@@ -128,16 +154,18 @@ export class ArchiveEngine {
     await mkdir(archiveDir, { recursive: true });
     const archivePath = join(archiveDir, changeDir);
 
-    // Move AFTER manifest is written.  If rename fails the manifest in the
-    // original location still says 'archived', which is safe: a subsequent
-    // archive attempt will fail the status check and instruct the user.
+    // AE-1: If an existing archive target is present, move it aside to a
+    // timestamped backup location so the rename can proceed cleanly.  When
+    // force is false the existence check still throws below.
     if (await fileExists(archivePath)) {
       if (!force) {
         throw new AdabError(
           `Archive target already exists: ${archivePath}. Remove it manually or use a different change ID.`,
-          'ARCHIVE_DUPLICATE'
+          'ARCHIVE_DUPLICATE',
         );
       }
+      const backupArchivePath = `${archivePath}.bak-${String(Date.now())}-${randomUUID()}`;
+      await this.moveDirContents(archivePath, backupArchivePath);
     }
     try {
       await rename(changePath, archivePath);
@@ -146,7 +174,7 @@ export class ArchiveEngine {
       manifest.status = 'synced';
       await this.writeManifest(manifestPath, manifest);
       // TOCTOU guard: if the archive directory appeared between our
-      // fileExists check (L121) and rename (L130), it's a duplicate.
+      // fileExists check and rename, it's a duplicate.
       if (err instanceof Error && 'code' in err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'ENOTEMPTY' || code === 'EEXIST') {
@@ -174,14 +202,23 @@ export class ArchiveEngine {
         backupCreated,
       },
     };
-    await this.appendLog(logEntry);
+    try {
+      await this.appendLog(logEntry);
+    } catch (err) {
+      // AE-2: log write failures must NOT abort the archive. The change has
+      // already been moved and the manuscript written; the only thing lost is
+      // the audit-trail line, which we surface as a warning.
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(`Failed to append archive log entry: ${msg}`);
+    }
 
     return {
       changeId: changeDir,
-      manuscriptPath: await fileExists(manuscriptPath) ? manuscriptPath : null,
+      manuscriptPath: manuscriptCreated ? manuscriptPath : null,
       archivePath,
       backupCreated,
       logEntry,
+      warnings,
     };
   }
 
@@ -217,6 +254,10 @@ export class ArchiveEngine {
 
   /**
    * Load project config to check archive settings.
+   *
+   * @throws {AdabError} with code `CONFIG_INVALID` if `config.yaml` exists
+   *                     but cannot be parsed. A missing file is treated as
+   *                     default (no archive overrides).
    */
   private async loadProjectConfig(): Promise<{ archive?: { backupOnOverwrite?: boolean } }> {
     const configPath = join(this.projectRoot, 'adab', 'config.yaml');
@@ -225,24 +266,57 @@ export class ArchiveEngine {
     try {
       return YAML.parse(raw) as { archive?: { backupOnOverwrite?: boolean } };
     } catch (err) {
-      console.warn('[ArchiveEngine] Failed to parse config YAML for archive settings:', err instanceof Error ? err.message : String(err));
-      return {};
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new AdabError(`Failed to parse project config: ${msg}`, 'CONFIG_INVALID', { cause: err });
+    }
+  }
+
+  /**
+   * Validate that a change directory name stays within the project boundary.
+   *
+   * Rejects absolute paths, parent-directory traversal (`..`), and any
+   * separator characters. The check is purely lexical — the resolved path
+   * is also compared to the expected `changes/` parent to defend against
+   * platforms where `..` does not collapse (e.g. Windows with mixed
+   * separators).
+   *
+   * @param changeDir Change directory name supplied by the caller.
+   * @throws {AdabError} with code `PATH_TRAVERSAL` if the name is unsafe.
+   */
+  private assertChangeDirSafe(changeDir: string): void {
+    if (changeDir.length === 0) {
+      throw new AdabError('Change directory name is empty', 'PATH_TRAVERSAL');
+    }
+    if (isAbsolute(changeDir)) {
+      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
+    }
+    if (changeDir.includes('..') || changeDir.includes('/') || changeDir.includes('\\') || changeDir.includes('\0')) {
+      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
+    }
+    const expected = join(this.projectRoot, 'adab', 'changes', changeDir);
+    const resolvedExpected = resolve(expected);
+    const changesRoot = resolve(join(this.projectRoot, 'adab', 'changes')) + sep;
+    if (!resolvedExpected.startsWith(changesRoot)) {
+      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
     }
   }
 
   /**
    * Infer the chapter identifier from the change directory name.
    *
-   * Looks for the `ch-NNN` segment (e.g. `draft-ch-012` → `ch-012`) and returns
-   * the full slug including the `ch-` prefix, preserving any leading zeros.
+   * Looks for the `ch-NNN` segment (e.g. `draft-ch-012` → `ch-012`) and
+   * returns the full slug including the `ch-` prefix, preserving any
+   * leading zeros. The match is case-insensitive so `DRAFT-CH-012` and
+   * `Draft-Ch-012` are normalised to the same chapter identifier.
    *
    * @param changeDir Change directory name (e.g. `draft-ch-012`).
-   * @returns Full chapter slug in the form `ch-NNN` (preserves leading zeros),
-   *   or `null` if no `ch-NNN` segment is found.
+   * @returns Full chapter slug in the form `ch-NNN` (preserves leading
+   *          zeros), or `null` if no `ch-NNN` segment is found.
    */
   private inferChapterId(changeDir: string): string | null {
     const match = /ch-(\d+)/i.exec(changeDir);
-    return match ? `ch-${match[1]}` : null;
+    if (!match) {return null;}
+    return `ch-${match[1]}`;
   }
 
   /**
@@ -276,6 +350,12 @@ export class ArchiveEngine {
   /**
    * Scan `adab/changes/` for another in-progress change targeting the same chapter.
    *
+   * The `archive/` subdirectory is intentionally excluded by the glob
+   * pattern `star-slash-.openadab.yaml` (only matches direct children of
+   * `changes/`, not `changes/archive/`).  Comparison of directory names is
+   * case-insensitive so that `DRAFT-CH-012` and `draft-ch-012` are treated
+   * as the same change for self-exclusion purposes.
+   *
    * @param currentChange The change being archived (excluded from scan).
    * @param chapterId     The inferred chapter identifier.
    * @returns The conflicting change directory name, or `null` if none.
@@ -283,16 +363,16 @@ export class ArchiveEngine {
   private async findConflictingChange(currentChange: string, chapterId: string | null): Promise<string | null> {
     if (!chapterId) {return null;}
     const changesDir = join(this.projectRoot, 'adab', 'changes');
-    const { glob } = await import('fast-glob');
     const manifestPaths = await glob('*/.openadab.yaml', {
       cwd: changesDir,
       onlyFiles: true,
       absolute: true,
     });
 
+    const normalizedCurrent = currentChange.toLowerCase();
     for (const path of manifestPaths) {
       const dirName = basename(dirname(path));
-      if (dirName === currentChange) {continue;}
+      if (dirName.toLowerCase() === normalizedCurrent) {continue;}
       const otherChapter = this.inferChapterId(dirName);
       if (otherChapter !== chapterId) {continue;}
 
@@ -308,6 +388,47 @@ export class ArchiveEngine {
       }
     }
     return null;
+  }
+
+  /**
+   * Move every entry inside `srcDir` into `destDir`, then remove the now
+   * empty source directory.  Used to relocate an existing archive target
+   * before the change directory is renamed into its place.
+   *
+   * @param srcDir  Source directory to drain.
+   * @param destDir Destination directory to receive the entries.
+   */
+  private async moveDirContents(srcDir: string, destDir: string): Promise<void> {
+    await mkdir(destDir, { recursive: true });
+    const entries = await readdir(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const from = join(srcDir, entry.name);
+      const to = join(destDir, entry.name);
+      if (entry.isDirectory()) {
+        await this.moveDirContents(from, to);
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        // Best-effort: unlink and re-create; symlinks are rare in change dirs.
+        try { await unlink(from); } catch { /* ignore */ }
+        continue;
+      }
+      await rename(from, to);
+    }
+    // The source directory should be empty now; remove it.
+    try {
+      await rmdir(srcDir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        // Surface non-empty leftovers as a warning via the error chain.
+        throw new AdabError(
+          `Failed to remove original archive target ${srcDir} after backup: ${err instanceof Error ? err.message : String(err)}`,
+          'ARCHIVE_RENAME_FAILED',
+          { cause: err },
+        );
+      }
+    }
   }
 
   /**
