@@ -335,4 +335,116 @@ describe('ProjectInitializer', () => {
     expect(log).toContain('`init`');
     expect(log).toContain('success');
   });
+
+  it('half-init recovery does not overwrite pre-existing user content (PI-1)', async () => {
+    // User already has wiki/index.md (e.g. a real index they curated), log.md,
+    // and an index JSON. Recovery must NOT clobber them.
+    const adabDir = join(tempDir, 'adab');
+    mkdirSync(adabDir, { recursive: true });
+    mkdirSync(join(adabDir, 'manuscript'), { recursive: true });
+    mkdirSync(join(adabDir, 'wiki'), { recursive: true });
+    mkdirSync(join(adabDir, 'index'), { recursive: true });
+    const userIndex = '---\ntype: index\ncreated: 2020-01-01\n---\n# My Custom Wiki Index\n';
+    writeFileSync(join(adabDir, 'wiki', 'index.md'), userIndex, 'utf-8');
+    const userLog = '<!-- log-entry {"ts":"2020-01-01","op":"init"} -->\n- **2020-01-01** `init` — legacy\n';
+    writeFileSync(join(adabDir, 'log.md'), userLog, 'utf-8');
+    const userMentions = '{"legacy":true}';
+    writeFileSync(join(adabDir, 'index', 'mentions.json'), userMentions, 'utf-8');
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    // User content must survive.
+    expect(readFileSync(join(adabDir, 'wiki', 'index.md'), 'utf-8')).toBe(userIndex);
+    expect(readFileSync(join(adabDir, 'log.md'), 'utf-8')).toBe(userLog);
+    expect(readFileSync(join(adabDir, 'index', 'mentions.json'), 'utf-8')).toBe(userMentions);
+  });
+
+  it('half-init recovery does not overwrite a user-forked schema (PI-1)', async () => {
+    // A schema dir with `forked_from` in schema.yaml is user-owned — the
+    // recovery must NOT copy the built-in version over it.
+    const adabDir = join(tempDir, 'adab');
+    mkdirSync(adabDir, { recursive: true });
+    const schemasDir = join(adabDir, 'schemas');
+    const chapterDir = join(schemasDir, 'chapter-draft');
+    mkdirSync(chapterDir, { recursive: true });
+    mkdirSync(join(chapterDir, 'templates'), { recursive: true });
+    const forkedYaml = 'name: chapter-draft\nforked_from: chapter-draft\nforked_version: 1\nartifacts: []\n';
+    writeFileSync(join(chapterDir, 'schema.yaml'), forkedYaml, 'utf-8');
+    const userTemplate = '# User-edited template\n';
+    writeFileSync(join(chapterDir, 'templates', 'draft.md'), userTemplate, 'utf-8');
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    expect(readFileSync(join(chapterDir, 'schema.yaml'), 'utf-8')).toBe(forkedYaml);
+    expect(readFileSync(join(chapterDir, 'templates', 'draft.md'), 'utf-8')).toBe(userTemplate);
+  });
+
+  it('refuses concurrent init attempts with INIT_LOCKED error (PI-2)', async () => {
+    // Hold the lock manually to simulate a concurrent init running.
+    // The lock is the very first thing init() checks, so no other state
+    // needs to be set up for this test.
+    const lockPath = join(tempDir, '.openadab-init.lock');
+    writeFileSync(lockPath, 'someone-else', 'utf-8');
+    const initializer = new ProjectInitializer(tempDir);
+    await expect(initializer.init()).rejects.toBeInstanceOf(AdabError);
+    await expect(initializer.init()).rejects.toThrow(/in progress/i);
+  });
+
+  it('all three wiki templates share the same timestamp (PI-3)', async () => {
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    const indexMd = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
+    const overviewMd = readFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), 'utf-8');
+    const contradictionsMd = readFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), 'utf-8');
+    const tsRe = /^created:\s*(.+)$/m;
+    const a = indexMd.match(tsRe)?.[1];
+    const b = overviewMd.match(tsRe)?.[1];
+    const c = contradictionsMd.match(tsRe)?.[1];
+    expect(a).toBeDefined();
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+  });
+
+  it('gitignore uses `.last-indexed` per the spec wording (PI-4)', async () => {
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    const gitignore = readFileSync(join(tempDir, '.gitignore'), 'utf-8');
+    expect(gitignore).toContain('adab/index/.last-indexed');
+    // The legacy split filenames must NOT appear in the generated block.
+    expect(gitignore).not.toContain('.last-mention-indexed');
+    expect(gitignore).not.toContain('.last-progression-indexed');
+  });
+
+  it('rejects unknown --schema values with SCHEMA_NOT_FOUND (PI-6)', async () => {
+    const initializer = new ProjectInitializer(tempDir);
+    await expect(initializer.init({ schema: 'no-such-schema-xyz' })).rejects.toThrow(/no-such-schema-xyz/);
+  });
+
+  it('logs a warning to adab/log.md when host adapter generation fails (PI-8)', async () => {
+    // Force adapter.generate to throw — init should still succeed and record
+    // the failure into adab/log.md rather than just console.warn it.
+    // Clear any prior spy stubs that earlier tests left on CommandDefLoader
+    // so the failure originates from the adapter, not from the loader.
+    vi.restoreAllMocks();
+    vi.spyOn(hostAdapters.GenericAdapter.prototype, 'generate').mockImplementation(() => {
+      throw new Error('adapter boom');
+    });
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init({ host: 'generic' });
+    const log = readFileSync(join(tempDir, 'adab', 'log.md'), 'utf-8');
+    expect(log).toContain('adapter');
+    expect(log.toLowerCase()).toContain('warning');
+  });
+
+  it('reports duplicate gitignore lines instead of silently skipping (PI-7)', async () => {
+    // Pre-seed a .gitignore that already contains one of the canonical lines.
+    writeFileSync(join(tempDir, '.gitignore'), 'adab/log.md\n', 'utf-8');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const initializer = new ProjectInitializer(tempDir);
+    await initializer.init();
+    const gitignore = readFileSync(join(tempDir, '.gitignore'), 'utf-8');
+    const occurrences = gitignore.split('\n').filter((l) => l.trim() === 'adab/log.md');
+    expect(occurrences).toHaveLength(1);
+    // Duplicate detection also surfaces a warning so the user can audit.
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
 });
