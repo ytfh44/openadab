@@ -5,11 +5,10 @@
 import { join } from 'node:path';
 
 import YAML from 'yaml';
-import { z } from 'zod';
 
 import { ChangeManifestSchema, type ChangeManifest, type ArtifactStatus } from '../../schemas/change-manifest.js';
 import type { SchemaDef } from '../../schemas/schema-def.js';
-import { ChangeStatusError, ConfigValidationError } from '../../utils/errors.js';
+import { ChangeStatusError, ConfigValidationError, TargetNotFoundError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, ensureDir } from '../../utils/fs.js';
 
 
@@ -41,16 +40,20 @@ export class ManifestManager {
    */
   createManifest(changeId: string, schema: SchemaDef, chapter?: string): ChangeManifest {
     const artifactStatuses: Record<string, ArtifactStatus> = {};
+    const firstNoDepIndex = schema.artifacts.findIndex((a) => a.requires.length === 0);
 
-    for (const art of schema.artifacts) {
+    schema.artifacts.forEach((art, idx) => {
       if (art.requires.length === 0) {
-        artifactStatuses[art.id] = 'ready';
+        // Per spec: only the first dependency-free artifact is `ready`; every
+        // other dependency-free artifact is `blocked` so the user is forced
+        // to consume the canonical entry point first.
+        artifactStatuses[art.id] = idx === firstNoDepIndex ? 'ready' : 'blocked';
       } else {
         artifactStatuses[art.id] = 'blocked';
       }
-    }
+    });
 
-    const firstReadyId = schema.artifacts.find((a) => a.requires.length === 0)?.id;
+    const firstReadyId = firstNoDepIndex >= 0 ? schema.artifacts[firstNoDepIndex]!.id : undefined;
     const inferredChapter = chapter ?? this.extractChapter(changeId);
 
     const manifest: ChangeManifest = {
@@ -93,29 +96,11 @@ export class ManifestManager {
       const issues = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
       throw new ConfigValidationError(`Manifest validation failed: ${issues}`);
     }
-    this.warnUnknownFields(parsed as Record<string, unknown>, ChangeManifestSchema, 'manifest');
+    // Unknown-field warnings are emitted by the schema refine (see
+    // `ChangeManifestSchema` in `src/schemas/change-manifest.ts`), which
+    // also recurses into records and arrays. A second recursive walk in
+    // the manager would print each unknown key twice, so it is omitted.
     return result.data;
-  }
-
-  /**
-   * Warn about keys present in the raw object that are not defined in the zod schema.
-   *
-   * @param obj    Raw parsed object.
-   * @param schema Zod object schema to inspect.
-   * @param prefix Dot-path prefix for nested keys.
-   */
-  private warnUnknownFields(obj: Record<string, unknown>, schema: z.ZodType<unknown>, prefix = ''): void {
-    if (schema instanceof z.ZodObject) {
-      const shape = schema.shape as Record<string, z.ZodType<unknown>>;
-      for (const key of Object.keys(obj)) {
-        if (!(key in shape)) {
-          // eslint-disable-next-line no-console
-          console.warn(`[ManifestManager] Unknown manifest field: ${prefix ? `${prefix}.` : ''}${key}`);
-        } else if (obj[key] !== null && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
-          this.warnUnknownFields(obj[key] as Record<string, unknown>, shape[key], `${prefix ? `${prefix}.` : ''}${key}`);
-        }
-      }
-    }
   }
 
   /**
@@ -123,47 +108,87 @@ export class ManifestManager {
    *
    * Also updates `currentArtifact` to the given artifact ID.
    *
+   * If `schema` is provided, after the explicit status mutation a
+   * bidirectional cascade re-derives every other artifact's status from
+   * its dependency state, promoting newly-unblocked artifacts to `ready`
+   * and re-blocking artifacts whose dependencies are no longer satisfied.
+   * `done` artifacts are never auto-reverted.
+   *
    * @param changeDir  Absolute path to the change directory.
    * @param artifactId Artifact identifier.
    * @param status     New status value.
+   * @param schema     Optional schema def; required for cascade and for
+   *                   validating the artifact exists in the schema.
    * @throws {ConfigValidationError} If the manifest cannot be read or written.
+   * @throws {ChangeStatusError} If the requested transition is illegal.
+   * @throws {TargetNotFoundError} If `schema` is provided and `artifactId` is unknown.
    */
   async updateArtifactStatus(changeDir: string, artifactId: string, status: ArtifactStatus, schema?: SchemaDef): Promise<void> {
     const manifest = await this.readManifest(changeDir);
 
     // Validate artifactId exists in schema if schema is provided
     if (schema && !schema.artifacts.some((a) => a.id === artifactId)) {
-      throw new Error(`Artifact '${artifactId}' not found in schema '${schema.name}'. Valid artifacts: ${schema.artifacts.map((a) => a.id).join(', ')}`);
+      throw new TargetNotFoundError(`Artifact '${artifactId}' not found in schema '${schema.name}'. Valid artifacts: ${schema.artifacts.map((a) => a.id).join(', ')}`);
+    }
+
+    // No-op short circuit: when the requested status equals the current
+    // status there is nothing to validate, cascade, or persist, so return
+    // early to avoid unnecessary disk writes and mtime churn.
+    const prevStatus = manifest.artifacts[artifactId];
+    if (status === prevStatus) {
+      return;
     }
 
     // Validate artifact status transition
-    const prevStatus = manifest.artifacts[artifactId];
-    if (status !== prevStatus) {
-      if (status === 'done' && prevStatus !== 'ready') {
-        throw new ChangeStatusError(
-          `Invalid artifact status transition for '${artifactId}': ${prevStatus} → ${status}. Artifact must be 'ready' before it can be set to 'done'.`
-        );
-      }
-      if (status === 'ready' && prevStatus !== 'blocked' && prevStatus !== 'done') {
-        throw new ChangeStatusError(
-          `Invalid artifact status transition for '${artifactId}': ${prevStatus} → ${status}. Artifact can only transition to 'ready' from 'blocked' or 'done'.`
-        );
-      }
+    if (status === 'done' && prevStatus !== 'ready') {
+      throw new ChangeStatusError(
+        `Invalid artifact status transition for '${artifactId}': ${prevStatus} → ${status}. Artifact must be 'ready' before it can be set to 'done'.`
+      );
+    }
+    if (status === 'ready' && prevStatus !== 'blocked' && prevStatus !== 'done') {
+      throw new ChangeStatusError(
+        `Invalid artifact status transition for '${artifactId}': ${prevStatus} → ${status}. Artifact can only transition to 'ready' from 'blocked' or 'done'.`
+      );
     }
 
     manifest.artifacts[artifactId] = status;
     manifest.currentArtifact = artifactId;
 
+    // The cascade mutates `manifest` directly via `applyCascade` (bypassing
+    // the public status-transition check) so it can freely promote a
+    // `blocked` artifact to `ready` when its dependencies become satisfied.
     if (schema) {
-      for (const [id, currentStatus] of Object.entries(manifest.artifacts)) {
-        const newStatus = this.recomputeArtifactStatus(id, currentStatus, manifest, schema);
-        if (manifest.artifacts[id] !== newStatus) {
-          manifest.artifacts[id] = newStatus;
-        }
-      }
+      this.applyCascade(manifest, schema);
     }
 
     await this.writeManifest(changeDir, manifest);
+  }
+
+  /**
+   * Apply the bidirectional cascade to every artifact in `manifest` and
+   * mutate the manifest in place.
+   *
+   * For each non-`done` artifact, the new status is fully derived from the
+   * current dependency state in `manifest`: if all dependencies are `done`
+   * (or there are none) the artifact is `ready`; otherwise it is `blocked`.
+   * `done` artifacts are preserved as-is and never auto-reverted.
+   *
+   * This is the cascade primitive invoked after a public status mutation.
+   * It is intentionally separate from the public status-transition check
+   * (`updateArtifactStatus`) so that the cascade can freely move an
+   * artifact from `blocked` to `ready` (or back) without tripping the
+   * `blocked → ready` ban enforced for user-initiated transitions.
+   *
+   * @param manifest Live manifest object to mutate in place.
+   * @param schema   Schema definition (provides dependency lookup).
+   */
+  private applyCascade(manifest: ChangeManifest, schema: SchemaDef): void {
+    for (const [id, currentStatus] of Object.entries(manifest.artifacts)) {
+      const newStatus = this.recomputeArtifactStatus(id, currentStatus, manifest, schema);
+      if (manifest.artifacts[id] !== newStatus) {
+        manifest.artifacts[id] = newStatus;
+      }
+    }
   }
 
   /**
@@ -268,33 +293,32 @@ export class ManifestManager {
    * Handle artifact file deletion by reverting the artifact's status.
    *
    * Per spec § Manifest reflects artifact deletion: when an artifact file is
-   * deleted, its status reverts to `ready` (if its own dependencies are still
-   * met) or `blocked` (if dependencies are missing).
-   *
-   * NOTE: When schema is not provided, the artifact status defaults to
-   * `blocked` (conservative). Pass the schema to enable accurate
-   * blocked-vs-ready determination via dependency inspection.
+   * deleted, its status reverts to `ready` (if its own dependencies are
+   * still met) or `blocked` (if dependencies are missing). The schema is
+   * required because the manifest does not persist dependency information;
+   * without it the handler cannot honor the "deps satisfied → ready"
+   * branch and would have to default to the conservative `blocked`
+   * outcome, which violates the spec.
    *
    * @param changeDir  Absolute path to the change directory.
    * @param artifactId Artifact identifier whose file was deleted.
-   * @param schema     Optional schema def for full dependency checking.
+   * @param schema     Active schema def; required to inspect dependencies.
    * @throws {ConfigValidationError} If the manifest cannot be read or written.
    */
-  async handleArtifactDeletion(changeDir: string, artifactId: string, schema?: SchemaDef): Promise<void> {
+  async handleArtifactDeletion(changeDir: string, artifactId: string, schema: SchemaDef): Promise<void> {
     const manifest = await this.readManifest(changeDir);
 
-    let targetStatus: ArtifactStatus = 'blocked';
-
-    if (schema) {
-      const art = schema.artifacts.find((a) => a.id === artifactId);
-      if (art && art.requires.length > 0) {
-        const depsDone = art.requires.every(
-          (depId) => manifest.artifacts[depId] === 'done'
-        );
-        targetStatus = depsDone ? 'ready' : 'blocked';
-      } else {
-        targetStatus = 'ready';
-      }
+    const art = schema.artifacts.find((a) => a.id === artifactId);
+    let targetStatus: ArtifactStatus;
+    if (art && art.requires.length > 0) {
+      const depsDone = art.requires.every(
+        (depId) => manifest.artifacts[depId] === 'done',
+      );
+      targetStatus = depsDone ? 'ready' : 'blocked';
+    } else {
+      // Unknown artifact, or artifact with no dependencies: ready is the
+      // honest default because no work is required to (re-)produce it.
+      targetStatus = 'ready';
     }
 
     manifest.artifacts[artifactId] = targetStatus;
@@ -332,6 +356,15 @@ export class ManifestManager {
    */
   private extractChapter(changeId: string): string | undefined {
     const match = /ch-(\d+)/i.exec(changeId);
-    return match ? `ch-${match[1]}` : undefined;
+    if (!match) {
+      return undefined;
+    }
+    // Defensive: a successful regex match with `\d+` always yields at least one
+    // digit, but check explicitly so a future regex tweak cannot synthesize
+    // a bare `ch-` slug from a `ch-` substring that has no numeric suffix.
+    if (match[1]!.length === 0) {
+      return undefined;
+    }
+    return `ch-${match[1]}`;
   }
 }

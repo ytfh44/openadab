@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { z } from 'zod';
 
 
 import type { ArtifactStatus } from '../../schemas/change-manifest.js';
@@ -331,7 +332,7 @@ describe('ManifestManager', () => {
      * Contract: when a dependency is rolled back from `done` to `ready`, any
      * downstream artifact that was previously unblocked must be re-blocked.
      *
-     * This is the core bug-7 regression: the old cascade was unidirectional
+     * This is the core regression: the old cascade was unidirectional
      * (only `blocked → ready`), so a `ready` artifact whose dep was rolled
      * back would remain `ready` incorrectly.
      */
@@ -431,6 +432,215 @@ describe('ManifestManager', () => {
       expect(read.artifacts.B).toBe('blocked');
       // C requires B=done; B is now blocked → C must remain blocked.
       expect(read.artifacts.C).toBe('blocked');
+    });
+
+    /**
+     * Contract: the cascade MUST be able to promote a `blocked` artifact to
+     * `ready` when its last missing dependency just became `done`. This is
+     * the canonical blocked→ready direction that the public status check
+     * forbids for user-driven transitions but the cascade requires.
+     *
+     * Regression: if the cascade re-routes through the
+     * public status validator, this promotion will throw ChangeStatusError
+     * and the artifact will remain `blocked` forever.
+     */
+    it('promotes a blocked artifact to ready when its dependency is set to done', async () => {
+      const changeDir = join(tempDir, 'cascade-promote');
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+      ]);
+      // Stage: A=ready (no deps, default), B=blocked.
+      await seedManifest(changeDir, schema, { A: 'ready', B: 'blocked' });
+
+      // Setting A to done should unblock B via the cascade.
+      await manager.updateArtifactStatus(changeDir, 'A', 'done', schema);
+
+      const read = await manager.readManifest(changeDir);
+      expect(read.artifacts.A).toBe('done');
+      // B was blocked; A is now done → B must be promoted to ready.
+      expect(read.artifacts.B).toBe('ready');
+    });
+  });
+
+  describe('extractChapter — defensive checks for malformed changeId', () => {
+    /**
+     * Contract: a changeId that contains the literal `ch-` substring but no
+     * digits (e.g. `ch-abc`, `ch-`) must not synthesize a bogus `ch-` slug.
+     * The chapter must be `undefined` so downstream consumers do not
+     * accidentally treat a malformed identifier as a real chapter number.
+     */
+    it('returns undefined for "ch-abc" (ch- prefix with no digits)', () => {
+      const schema = makeSchema([{ id: 'a', generates: 'a.md', requires: [] }]);
+      const manifest = manager.createManifest('ch-abc', schema);
+      expect(manifest.chapter).toBeUndefined();
+    });
+
+    it('returns undefined for "ch-" (prefix with no digits and no suffix)', () => {
+      const schema = makeSchema([{ id: 'a', generates: 'a.md', requires: [] }]);
+      const manifest = manager.createManifest('ch-', schema);
+      expect(manifest.chapter).toBeUndefined();
+    });
+
+    it('returns undefined for "draft-ch-" (ch- at end with no digits)', () => {
+      const schema = makeSchema([{ id: 'a', generates: 'a.md', requires: [] }]);
+      const manifest = manager.createManifest('draft-ch-', schema);
+      expect(manifest.chapter).toBeUndefined();
+    });
+
+    it('returns undefined for "chapter" (ch prefix but no hyphen-digits)', () => {
+      const schema = makeSchema([{ id: 'a', generates: 'a.md', requires: [] }]);
+      const manifest = manager.createManifest('chapter', schema);
+      expect(manifest.chapter).toBeUndefined();
+    });
+  });
+
+  describe('warnUnknownFields — recursive traversal', () => {
+    /**
+     * Contract: `warnUnknownFields` must report unknown fields nested inside
+     * `z.record(...)` values and inside arrays of records. The current
+     * implementation only recurses through `z.ZodObject` and silently
+     * misses anything under records or arrays, which masks real schema
+     * drift in the persisted `metadata` and `artifacts` fields.
+     */
+    it('detects unknown keys inside a record value (metadata.extra)', async () => {
+      const changeDir = join(tempDir, 'unknown-record');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(
+        join(changeDir, '.openadab.yaml'),
+        [
+          'changeId: c-record',
+          'schema: chapter-draft',
+          'version: 1',
+          'created: "2026-06-06T10:00:00Z"',
+          'status: in_progress',
+          'artifacts: {}',
+          'metadata:',
+          '  author: alice',
+          '  mysteryKey: "should-warn"',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const read = await manager.readManifest(changeDir);
+      expect(read.changeId).toBe('c-record');
+      const warned = consoleWarnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(warned).toContain('mysteryKey');
+    });
+  });
+
+  describe('updateArtifactStatus — no-op short circuit', () => {
+    /**
+     * Contract: when the requested status equals the current status, the
+     * call must be a no-op: no write to disk, no cascade, no side effects.
+     * The current implementation always writes the manifest, which both
+     * mutates the file's mtime unnecessarily and re-runs the cascade.
+     */
+    it('does not re-write the manifest when the status is unchanged', async () => {
+      const changeDir = join(tempDir, 'noop-short-circuit');
+      mkdirSync(changeDir, { recursive: true });
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+      ]);
+      const manifest = manager.createManifest('noop', schema);
+      await manager.writeManifest(changeDir, manifest);
+
+      const manifestPath = join(changeDir, '.openadab.yaml');
+      const mtimeBefore = readFileSync(manifestPath, 'utf-8');
+
+      // Calling with the same status A is already in ('ready' by default) must not write.
+      await new Promise((r) => setTimeout(r, 5));
+      await manager.updateArtifactStatus(changeDir, 'A', 'ready', schema);
+
+      const mtimeAfter = readFileSync(manifestPath, 'utf-8');
+      // File contents should be byte-identical when the status is unchanged.
+      expect(mtimeAfter).toBe(mtimeBefore);
+    });
+  });
+
+  describe('handleArtifactDeletion — schema-driven status reversion', () => {
+    /**
+     * Contract: when an artifact file is deleted, the spec requires its
+     * status to revert to `ready` if dependencies are met, `blocked` if
+     * not. The current implementation defaults to `blocked` whenever
+     * schema is missing, violating the "deps satisfied → ready" branch.
+     * The fix is to make schema a required parameter so the deletion
+     * handler can always inspect dependencies accurately.
+     */
+    it('reverts an artifact to ready when its dependencies are satisfied', async () => {
+      const changeDir = join(tempDir, 'del-ready');
+      mkdirSync(changeDir, { recursive: true });
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+      ]);
+      // Stage: A=done, B=done; then delete B.
+      const manifest = manager.createManifest('del-ready', schema);
+      manifest.artifacts.A = 'done';
+      manifest.artifacts.B = 'done';
+      await manager.writeManifest(changeDir, manifest);
+
+      await manager.handleArtifactDeletion(changeDir, 'B', schema);
+
+      const read = await manager.readManifest(changeDir);
+      // B's dep A is still done → B must revert to ready, not blocked.
+      expect(read.artifacts.B).toBe('ready');
+    });
+
+    it('reverts an artifact to blocked when its dependencies are missing', async () => {
+      const changeDir = join(tempDir, 'del-blocked');
+      mkdirSync(changeDir, { recursive: true });
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+      ]);
+      // Stage: A=ready (deps not met), B=done.
+      const manifest = manager.createManifest('del-blocked', schema);
+      manifest.artifacts.A = 'ready';
+      manifest.artifacts.B = 'done';
+      await manager.writeManifest(changeDir, manifest);
+
+      await manager.handleArtifactDeletion(changeDir, 'B', schema);
+
+      const read = await manager.readManifest(changeDir);
+      // B's dep A is not done → B must revert to blocked.
+      expect(read.artifacts.B).toBe('blocked');
+    });
+  });
+
+  describe('unknown-field warnings — single source of truth', () => {
+    /**
+     * Contract: each unknown top-level field must produce exactly ONE
+     * warning, not two. The schema refine warning and the manager's
+     * recursive warnUnknownFields call previously both fired, leading
+     * to duplicated messages in logs. The fix collapses the manager's
+     * recursive warning so only the schema refine remains.
+     */
+    it('emits exactly one Unknown-manifest-field warning per unknown key', async () => {
+      const changeDir = join(tempDir, 'single-warning');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(
+        join(changeDir, '.openadab.yaml'),
+        [
+          'changeId: c-single',
+          'schema: chapter-draft',
+          'version: 1',
+          'created: "2026-06-06T10:00:00Z"',
+          'status: in_progress',
+          'artifacts: {}',
+          'onlyOneUnknown: "x"',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      await manager.readManifest(changeDir);
+      const unknownFieldCalls = consoleWarnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes('Unknown manifest field') && String(c[0]).includes('onlyOneUnknown'),
+      );
+      expect(unknownFieldCalls).toHaveLength(1);
     });
   });
 });
