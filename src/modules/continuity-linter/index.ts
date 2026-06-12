@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 import type { ProjectConfig } from '../../schemas/types.js';
 import { safeReadFile } from '../../utils/fs.js';
-import { extractFrontmatter } from '../../utils/markdown.js';
+import { extractFrontmatter, extractSectionsByHeading } from '../../utils/markdown.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 /**
@@ -130,6 +130,9 @@ export class ContinuityLinter {
         passed: true,
         issues: [
           {
+            character: 'string',
+            knownAt: 'chapter-id',
+            actedOnAt: 'chapter-id',
             description: 'string',
           },
         ],
@@ -214,8 +217,8 @@ export class ContinuityLinter {
         const wikiPage = await this.wikiEngine.readPage(page);
         const name = typeof wikiPage.frontmatter.name === 'string' ? wikiPage.frontmatter.name : '';
         if (name === '') {continue;}
-        const timelineMatch = /## Knowledge Timeline[\s\S]*?(?=\n## |$)/.exec(wikiPage.body);
-        const knowledgeTimeline = timelineMatch ? timelineMatch[0].trim() : '';
+        const timelineRaw = extractSectionsByHeading(wikiPage.body, 'Knowledge Timeline');
+        const knowledgeTimeline = timelineRaw !== null ? timelineRaw.trim() : '';
         if (knowledgeTimeline) {
           sections.push(`Character: ${name}\n\nKnowledge Timeline:\n${knowledgeTimeline}`);
         } else {
@@ -241,31 +244,47 @@ export class ContinuityLinter {
    */
   private async buildTimelinePrompt(_changeDir: string): Promise<string | null> {
     const timelinePages = await this.wikiEngine.listPages('timeline');
-    let absoluteTimeline = '';
+    const sections: string[] = [];
     for (const page of timelinePages) {
       try {
         const wikiPage = await this.wikiEngine.readPage(page);
-        absoluteTimeline += `${wikiPage.body  }\n`;
+        const displayName = typeof wikiPage.frontmatter.name === 'string' ? wikiPage.frontmatter.name : page;
+        sections.push(`### ${displayName}\n${wikiPage.body}`);
       } catch (err) {
         console.warn('[ContinuityLinter] Skipped unreadable page in timeline check:', err instanceof Error ? err.message : String(err));
       }
     }
 
-    if (!absoluteTimeline.trim()) {
+    if (sections.length === 0) {
       return null;
     }
 
-    return `## Timeline Contradiction Check\n\nAbsolute Timeline:\n${absoluteTimeline.trim()}\n\nInstruction: Verify events occur in logical temporal order. Flag events that reference future events without justification.\n`;
+    return `## Timeline Contradiction Check\n\nAbsolute Timeline:\n${sections.join('\n\n')}\n\nInstruction: Verify events occur in logical temporal order. Flag events that reference future events without justification.\n`;
   }
 
   /**
    * Build the POV discipline check prompt.
    *
+   * Per spec, the check is always generated: when a POV character is declared
+   * the prompt embeds the declared name, and when none is declared it embeds
+   * a note explaining that and still produces the full head-hopping check.
+   * The function therefore always returns a non-null prompt section.
+   *
+   * If the declared POV value is malformed (non-string), the upper layer is
+   * expected to catch the error and treat it as "no POV declared" so the
+   * spec-mandated fallback section is still emitted.
+   *
    * @param changeDir Change directory name.
    * @returns Prompt section.
    */
-  private async buildPovDisciplinePrompt(changeDir: string): Promise<string | null> {
-    const pov = await this.extractPov(changeDir);
+  private async buildPovDisciplinePrompt(changeDir: string): Promise<string> {
+    let pov: string | null;
+    try {
+      pov = await this.extractPov(changeDir);
+    } catch (err) {
+      console.warn('[ContinuityLinter] POV extraction failed, falling back to no-POV note:', err instanceof Error ? err.message : String(err));
+      pov = null;
+    }
     if (pov === null) {
       return `## POV Discipline Check\n\nNo POV character declared in scene-plan or brief.\n\nInstruction: Verify the narrative stays within the declared POV — no head-hopping. Detect paragraphs that reveal non-POV character internal states.\n`;
     }
@@ -391,8 +410,14 @@ export class ContinuityLinter {
   /**
    * Extract the POV character name from scene-plan or brief frontmatter.
    *
+   * Walks the candidate files in order and returns the first frontmatter
+   * `pov` value that is a non-empty string.  If a candidate file declares
+   * `pov` as a non-string value (e.g. an array, number, or object), an
+   * explicit error is thrown so the upper layer can fall back to the
+   * "no POV declared" prompt section.
+   *
    * @param changeDir Change directory name.
-   * @returns POV character name, or `null`.
+   * @returns POV character name, or `null` when no candidate declares one.
    */
   private async extractPov(changeDir: string): Promise<string | null> {
     const changePath = join(this.projectRoot, 'adab', 'changes', changeDir);
@@ -401,9 +426,11 @@ export class ContinuityLinter {
       const raw = await safeReadFile(join(changePath, file));
       if (raw === null) {continue;}
       const { data } = extractFrontmatter(raw);
-      if (data.pov !== undefined && data.pov !== null) {
-        return typeof data.pov === 'string' ? data.pov : JSON.stringify(data.pov);
+      if (data.pov === undefined || data.pov === null) {continue;}
+      if (typeof data.pov !== 'string') {
+        throw new Error(`POV frontmatter in "${file}" must be a string, got ${typeof data.pov}`);
       }
+      return data.pov;
     }
     return null;
   }
