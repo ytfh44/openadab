@@ -3,14 +3,14 @@
  * computes per-artifact status (blocked / ready / done), and provides
  * topological ordering, next-step suggestions, and blocking-issue analysis.
  */
-import { join } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 
 import type { SchemaDef, ArtifactDef } from '../../schemas/schema-def.js';
 import type { ArtifactStatus, ValidationResult } from '../../schemas/types.js';
+import { SchemaValidationError, CycleDetectedError, AdabError } from '../../utils/errors.js';
 import { safeReadFile, fileExists } from '../../utils/fs.js';
 import { extractFrontmatter } from '../../utils/markdown.js';
 import { detectCycle } from '../schema-engine/index.js';
-import { CycleDetectedError } from '../../utils/errors.js';
 
 export type ArtifactStatusMap = Record<string, ArtifactStatus>;
 
@@ -37,6 +37,11 @@ export interface ArtifactGraphStatus {
   }[];
   nextStep: NextStep[];
   blockingIssues: BlockingIssue[];
+  /**
+   * Issues for artifacts whose file exists but failed validation.
+   * Distinct from `blockingIssues`, which is for missing-dependency problems.
+   */
+  validationIssues: BlockingIssue[];
 }
 
 /**
@@ -55,6 +60,30 @@ export interface MechanicalValidatorLike {
 }
 
 /**
+ * Internal result of {@link ArtifactGraph._computeStatus} — bundles the
+ * status map and the per-artifact reason for any "ready because validation
+ * failed" entries so the public methods can present them consistently.
+ */
+interface ComputeStatusResult {
+  status: ArtifactStatusMap;
+  validationIssues: BlockingIssue[];
+}
+
+const REGEX_ESCAPE_RE = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Escape every regex metacharacter in `s` so the string can be embedded
+ * inside a `RegExp` as a literal pattern.  Used when interpolating
+ * schema-context keys into a generated regex.
+ *
+ * @param s Arbitrary string.
+ * @returns Regex-safe version of the input.
+ */
+function escapeRegex(s: string): string {
+  return s.replace(REGEX_ESCAPE_RE, '\\$&');
+}
+
+/**
  * Directed acyclic graph of artifacts derived from a {@link SchemaDef}.
  */
 export class ArtifactGraph {
@@ -69,20 +98,67 @@ export class ArtifactGraph {
   }
 
   /**
-   * Compute a topological ordering of all artifact IDs using Kahn's algorithm.
+   * Compute a topological ordering of all artifact IDs using Kahn's
+   * algorithm with an O(N+E) reverse-adjacency index (AG-5).
+   *
+   * Before sorting, this method validates the graph: any artifact whose
+   * `requires` (or any `apply.requires` entry) targets an ID not
+   * declared in the schema is a hard schema error and is reported via
+   * {@link SchemaValidationError} (AG-1).  This catches malformed schemas
+   * up-front instead of silently dropping the bad edges during the
+   * in-degree pass.
    *
    * @returns Array of artifact IDs in dependency order.
+   * @throws {SchemaValidationError} If a `requires` reference is unknown.
+   * @throws {CycleDetectedError} If the graph contains a cycle.
    */
   topologicalSort(): string[] {
-    const inDegree = new Map<string, number>();
+    // AG-1: validate every requires edge (artifacts + apply.requires)
+    // before we start Kahn's algorithm.  The duplicate-id set is the
+    // canonical "known id" set; the earlier definition of the graph
+    // used the raw artifacts array, which would have silently dropped
+    // refs to ids that appeared in the schema but were duplicated.
+    const knownIds = new Set<string>();
     for (const art of this.schemaDef.artifacts) {
-      inDegree.set(art.id, 0);
+      if (!knownIds.has(art.id)) {
+        knownIds.add(art.id);
+      }
     }
     for (const art of this.schemaDef.artifacts) {
       for (const dep of art.requires) {
-        if (inDegree.has(dep)) {
-          inDegree.set(art.id, (inDegree.get(art.id) ?? 0) + 1);
+        if (!knownIds.has(dep)) {
+          throw new SchemaValidationError(
+            `Artifact '${art.id}' requires unknown artifact ID: ${dep}`
+          );
         }
+      }
+    }
+    if (this.schemaDef.apply !== undefined) {
+      for (const dep of this.schemaDef.apply.requires) {
+        if (!knownIds.has(dep)) {
+          throw new SchemaValidationError(
+            `apply.requires references unknown artifact ID: ${dep}`
+          );
+        }
+      }
+    }
+
+    const inDegree = new Map<string, number>();
+    for (const id of knownIds) {
+      inDegree.set(id, 0);
+    }
+    // AG-5: build a reverse adjacency (dep -> list of dependents) once,
+    // so the "decrement in-degree" pass inside Kahn's algorithm is O(1)
+    // per edge instead of scanning all artifacts.
+    const dependents = new Map<string, string[]>();
+    for (const id of knownIds) {
+      dependents.set(id, []);
+    }
+    for (const art of this.schemaDef.artifacts) {
+      if (!knownIds.has(art.id)) {continue;}
+      for (const dep of art.requires) {
+        inDegree.set(art.id, (inDegree.get(art.id) ?? 0) + 1);
+        dependents.get(dep)!.push(art.id);
       }
     }
 
@@ -96,25 +172,28 @@ export class ArtifactGraph {
       const id = queue.shift();
       if (id === undefined) { break; }
       result.push(id);
-      for (const art of this.schemaDef.artifacts) {
-        if (art.requires.includes(id)) {
-          const newDeg = (inDegree.get(art.id) ?? 0) - 1;
-          inDegree.set(art.id, newDeg);
-          if (newDeg === 0) {queue.push(art.id);}
-        }
+      for (const dependent of dependents.get(id) ?? []) {
+        const newDeg = (inDegree.get(dependent) ?? 0) - 1;
+        inDegree.set(dependent, newDeg);
+        if (newDeg === 0) {queue.push(dependent);}
       }
     }
 
-    if (result.length !== this.schemaDef.artifacts.length) {
-      // Use DFS to find the actual cycle path for better error reporting
-      const cycle = detectCycle(this.schemaDef.artifacts, this.schemaDef.apply?.requires);
+    // AG-2: compare against the actual node count we attempted to sort
+    // (inDegree.size / knownIds.size), not the raw artifacts.length,
+    // which can differ when the schema contains duplicate ids.
+    if (result.length !== knownIds.size) {
+      const cycle = detectCycle(this.schemaDef.artifacts, this.schemaDef.apply?.requires, knownIds);
       if (cycle !== null) {
+        // AG-10: when detectCycle returns a usable path, surface it.
         throw new CycleDetectedError(
-          `Cycle detected in artifact dependencies: ${cycle.join(' → ')} (${result.length} of ${this.schemaDef.artifacts.length} artifacts processed)`,
+          `Cycle detected in artifact dependencies: ${cycle.join(' → ')} (${result.length} of ${knownIds.size} artifacts processed)`,
         );
       }
+      // AG-10: when detectCycle returns null we still log the partial
+      // progress count so operators have a breadcrumb for debugging.
       throw new CycleDetectedError(
-        `Cycle detected in artifact dependencies: ${result.length} of ${this.schemaDef.artifacts.length} artifacts processed`,
+        `Cycle detected in artifact dependencies (${result.length} of ${knownIds.size} artifacts processed; cycle path could not be reconstructed)`,
       );
     }
 
@@ -122,7 +201,7 @@ export class ArtifactGraph {
   }
 
   /**
-   * Determine the status of every artifact in the given change directory.
+   * Compute status for every artifact in the given change directory.
    *
    * Rules:
    * - File exists and passes mechanical validation (if validator provided) → **done**
@@ -134,7 +213,22 @@ export class ArtifactGraph {
    * @returns Map from artifact ID to status.
    */
   async getStatus(changeDir: string): Promise<ArtifactStatusMap> {
+    const result = await this._computeStatus(changeDir);
+    return result.status;
+  }
+
+  /**
+   * Internal helper that computes the status map and a parallel list of
+   * validation issues.  Public methods that need both (e.g.
+   * {@link getBlockingIssues}, {@link toJson}) call this once and share
+   * the result, avoiding redundant disk I/O (AG-6).
+   *
+   * @param changeDir Absolute path to the change directory.
+   * @returns Combined status map and validation issues.
+   */
+  private async _computeStatus(changeDir: string): Promise<ComputeStatusResult> {
     const status: ArtifactStatusMap = {};
+    const validationIssues: BlockingIssue[] = [];
     const sorted = this.topologicalSort();
 
     for (const id of sorted) {
@@ -145,18 +239,29 @@ export class ArtifactGraph {
 
       if (exists) {
         const valid = await this.isValid(filePath, id, changeDir);
-        status[id] = valid ? 'done' : 'ready';
+        if (valid) {
+          status[id] = 'done';
+        } else {
+          // AG-8: capture why this artifact is "ready" (validation
+          // failure) so callers can report it through validationIssues.
+          status[id] = 'ready';
+          validationIssues.push({
+            artifactId: id,
+            reason: `Validation failed for '${id}' — needs rewrite`,
+            missingDeps: [],
+          });
+        }
       } else {
         const depsDone = art.requires.every((dep) => status[dep] === 'done');
         status[id] = depsDone ? 'ready' : 'blocked';
       }
     }
 
-    return status;
+    return { status, validationIssues };
   }
 
   async getReadyArtifacts(changeDir: string): Promise<string[]> {
-    const status = await this.getStatus(changeDir);
+    const { status } = await this._computeStatus(changeDir);
     return Object.entries(status)
       .filter(([, s]) => s === 'ready')
       .map(([id]) => id);
@@ -173,7 +278,7 @@ export class ArtifactGraph {
    * @returns Array of next steps.
    */
   async getNextStep(changeDir: string): Promise<NextStep[]> {
-    const status = await this.getStatus(changeDir);
+    const { status } = await this._computeStatus(changeDir);
     const ready = Object.entries(status)
       .filter(([, s]) => s === 'ready')
       .map(([id]) => id);
@@ -196,7 +301,11 @@ export class ArtifactGraph {
       }
       if (this.schemaDef.context) {
         for (const [key, value] of Object.entries(this.schemaDef.context)) {
-          target = target.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+          // AG-3: escape regex metacharacters in the user-supplied key,
+          // and pass the value through a function so that special
+          // replacement patterns (e.g. `$&`, `$1`) are inserted literally.
+          const re = new RegExp(`\\{\\{${escapeRegex(key)}\\}\\}`, 'g');
+          target = target.replace(re, () => String(value));
         }
       }
       return [{ action: 'apply', target }];
@@ -205,8 +314,19 @@ export class ArtifactGraph {
     return [];
   }
 
+  /**
+   * Report issues that prevent the change from progressing.
+   *
+   * Two kinds of issues are returned:
+   * 1. Blocking issues — artifacts blocked by missing/unfinished deps.
+   * 2. Validation issues — artifacts whose file exists but failed
+   *    mechanical validation (AG-8).
+   *
+   * @param changeDir Absolute path to the change directory.
+   * @returns Combined list of issues, blocking first then validation.
+   */
   async getBlockingIssues(changeDir: string): Promise<BlockingIssue[]> {
-    const status = await this.getStatus(changeDir);
+    const { status, validationIssues } = await this._computeStatus(changeDir);
     const issues: BlockingIssue[] = [];
 
     for (const art of this.schemaDef.artifacts) {
@@ -221,16 +341,33 @@ export class ArtifactGraph {
       }
     }
 
+    // AG-8: append validation issues so the caller can present them.
+    issues.push(...validationIssues);
     return issues;
   }
 
+  /**
+   * Build a JSON-friendly status summary for the change directory.
+   *
+   * @param changeDir Absolute path to the change directory.
+   * @returns Structured status payload.
+   */
   async toJson(changeDir: string): Promise<ArtifactGraphStatus> {
-    const status = await this.getStatus(changeDir);
+    const { status, validationIssues } = await this._computeStatus(changeDir);
     const nextStep = await this.getNextStep(changeDir);
     const blockingIssues = await this.getBlockingIssues(changeDir);
 
+    // AG-7: pop() returns '' for a path with no segments (e.g. "/").
+    // Fall back to a sensible name derived from the absolute path.
+    let changeName = changeDir.split(/[\\/]/).pop() ?? '';
+    if (changeName === '') {
+      changeName = isAbsolute(changeDir)
+        ? basename(resolve(changeDir))
+        : changeDir;
+    }
+
     return {
-      changeName: changeDir.split(/[\\/]/).pop() ?? changeDir,
+      changeName,
       schemaName: this.schemaDef.name,
       artifacts: this.schemaDef.artifacts.map((art) => ({
         id: art.id,
@@ -240,6 +377,7 @@ export class ArtifactGraph {
       })),
       nextStep,
       blockingIssues,
+      validationIssues,
     };
   }
 
@@ -261,14 +399,28 @@ export class ArtifactGraph {
     const art = this.artifactMap.get(artifactId);
     if (art?.validation?.mechanical?.includes('frontmatterPresent')) {
       const { data } = extractFrontmatter(content);
-      if (Object.keys(data).length === 0) {
+      // AG-4: gray-matter returns a synthetic `{ content: '' }` object
+      // for plain content with no actual frontmatter, so the empty-key
+      // heuristic misfires.  Detect that case via the `_synthetic`
+      // sentinel injected by gray-matter (or our own fallback) and treat
+      // it as "no frontmatter".
+      const isSynthetic = (data as Record<string, unknown>)['_synthetic'] === true;
+      if (isSynthetic || Object.keys(data).length === 0) {
         return false;
       }
     }
 
     if (this.validator) {
-      const result = await this.validator.validateArtifact(changeDir, artifactId);
-      if (!result.passed) {
+      // AG-9: wrap the validator call so a thrown error counts as
+      // "invalid" instead of crashing the whole status computation.
+      try {
+        const result = await this.validator.validateArtifact(changeDir, artifactId);
+        if (!result.passed) {
+          return false;
+        }
+      } catch (err) {
+        const message = err instanceof AdabError ? err.message : err instanceof Error ? err.message : String(err);
+        console.warn(`[ArtifactGraph] Validator for '${artifactId}' threw: ${message}`);
         return false;
       }
     }
