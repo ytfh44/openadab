@@ -11,6 +11,7 @@ import {
   UnresolvedVariableError,
   TemplateNotFoundError,
   MissingSourceError,
+  UsageError,
 } from './errors.js';
 
 describe('AdabError', () => {
@@ -106,5 +107,53 @@ describe('MissingSourceError', () => {
     expect(err.code).toBe('MISSING_SOURCE');
     expect(err.name).toBe('MissingSourceError');
     expect(err).toBeInstanceOf(AdabError);
+  });
+});
+
+describe('UsageError', () => {
+  it('has the USAGE_ERROR code and UsageError name', () => {
+    const err = new UsageError('bad input');
+    expect(err.code).toBe('USAGE_ERROR');
+    expect(err.name).toBe('UsageError');
+    expect(err.message).toBe('bad input');
+    expect(err).toBeInstanceOf(AdabError);
+    expect(err).toBeInstanceOf(Error);
+  });
+
+  it('is recognised as a usage error by the handleError exit-code rule', () => {
+    // Mirrors the rule in cli/index.ts: USAGE_ERROR -> exit code 2.
+    const err = new UsageError('x');
+    expect(err.code === 'USAGE_ERROR').toBe(true);
+  });
+
+  it('preserves the cause chain when provided', () => {
+    const cause = new Error('underlying');
+    const err = new UsageError('bad arg', { cause });
+    expect(err.cause).toBe(cause);
+  });
+});
+
+describe('AdabError.toJSON serialisation', () => {
+  it('JSON.stringify of a base AdabError includes name, code, and message', () => {
+    const err = new AdabError('boom', 'TEST_CODE');
+    const parsed = JSON.parse(JSON.stringify(err)) as Record<string, unknown>;
+    expect(parsed.name).toBe('AdabError');
+    expect(parsed.code).toBe('TEST_CODE');
+    expect(parsed.message).toBe('boom');
+  });
+
+  it('JSON.stringify of a subclass preserves the subclass name (not the base)', () => {
+    const err = new ConfigValidationError('bad config');
+    const parsed = JSON.parse(JSON.stringify(err)) as Record<string, unknown>;
+    expect(parsed.name).toBe('ConfigValidationError');
+    expect(parsed.code).toBe('CONFIG_VALIDATION_ERROR');
+    expect(parsed.message).toBe('bad config');
+  });
+
+  it('JSON.stringify of a UsageError includes the USAGE_ERROR code so JSON consumers can branch on it', () => {
+    const err = new UsageError('invalid flag');
+    const parsed = JSON.parse(JSON.stringify(err)) as Record<string, unknown>;
+    expect(parsed.name).toBe('UsageError');
+    expect(parsed.code).toBe('USAGE_ERROR');
   });
 });
