@@ -37,4 +37,30 @@ describe('estimateTokens', () => {
     const text = '词'.repeat(1000);
     expect(estimateTokens(text, 'zh')).toBe(Math.ceil(1000 / 1.5));
   });
+
+  it('returns 0 for an empty string regardless of language (regression: empty + non-default language)', () => {
+    // Regression: the early-return for empty text must NOT be gated on
+    // the default-language branch, otherwise callers that explicitly
+    // pass `zh` would get a non-zero number for an empty payload.
+    expect(estimateTokens('', 'zh')).toBe(0);
+    expect(estimateTokens('', 'en')).toBe(0);
+  });
+
+  it('counts astral-plane characters (emoji, SMP) as a single user-perceived character', () => {
+    // '𝕏' is a single codepoint U+1D54F, occupying two UTF-16 code
+    // units. The old `text.length` heuristic would have counted it as
+    // 2, double-counting astral characters. The fix uses code-point
+    // counting, so emoji and CJK extension B-G all count as 1.
+    expect(estimateTokens('𝕏', 'en')).toBe(1);
+    expect(estimateTokens('𝕏𝕏', 'en')).toBe(1);
+    expect(estimateTokens('𝕏'.repeat(8), 'en')).toBe(2);
+  });
+
+  it('counts Chinese text by codepoint, not by UTF-16 code units', () => {
+    // A regular CJK ideograph is one UTF-16 code unit, so this test
+    // serves as a regression guard: any future change that switches
+    // back to `text.length` would still pass here (because CJK is
+    // BMP), but the emoji test above would fail.
+    expect(estimateTokens('中文', 'zh')).toBe(2);
+  });
 });

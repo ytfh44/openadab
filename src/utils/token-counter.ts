@@ -13,6 +13,13 @@ export type TokenLanguage = 'en' | 'zh';
  * Chinese characters average ~1.5 tokens each. The English divisor of 4 is
  * the standard heuristic for whitespace-delimited text.
  *
+ * Character counting uses the iterator protocol via
+ * `Array.from(text).length`, which gives the number of Unicode code
+ * points (UTF-16 surrogate pairs count as one).  This matches the
+ * user-perceived character count for emoji, CJK extension B–G, and
+ * other supplementary-plane characters, which a naive `text.length`
+ * would over-count by a factor of 2.
+ *
  * @param text     The input text.
  * @param language Optional language code; defaults to `'en'`.
  * @returns Estimated token count (≥ 0).
@@ -23,5 +30,5 @@ export function estimateTokens(text: string, language: TokenLanguage = 'en'): nu
   }
 
   const divisor = language === 'zh' ? 1.5 : 4;
-  return Math.ceil(text.length / divisor);
+  return Math.ceil(Array.from(text).length / divisor);
 }
