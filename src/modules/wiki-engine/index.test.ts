@@ -116,48 +116,36 @@ describe('WikiEngine', () => {
       expect(page.frontmatter._synthetic).toBeUndefined();
       expect(page.frontmatter.type).toBe('character');
     });
-  });
 
-  describe('readPage — frontmatter fallback', () => {
-    it('falls back to synthetic frontmatter when page has no frontmatter markers at all', async () => {
+    // type === '' or null triggers synthetic fallback
+    it('synthetic fallback when frontmatter has empty type string', async () => {
       const dir = join(tempDir, 'adab', 'wiki', 'misc');
       mkdirSync(dir, { recursive: true });
-      const content = '# A Plain Page\nSome text without any frontmatter.';
-      writeFileSync(join(dir, 'plain-page.md'), content, 'utf-8');
-      const page = await engine.readPage('misc/plain-page.md');
-      expect(page.frontmatter.type).toBe('unknown');
+      const content = '---\ntype: ""\n---\n# Empty Type\n';
+      writeFileSync(join(dir, 'empty-type.md'), content, 'utf-8');
+      const page = await engine.readPage('misc/empty-type.md');
       expect(page.frontmatter._synthetic).toBe(true);
-      expect(page.body.trim()).toBe('# A Plain Page\nSome text without any frontmatter.');
+      expect(page.frontmatter.type).toBe('unknown');
     });
 
-    it('falls back to synthetic frontmatter when page has only empty frontmatter delimiters', async () => {
+    it('synthetic fallback when frontmatter type is explicitly null', async () => {
       const dir = join(tempDir, 'adab', 'wiki', 'misc');
       mkdirSync(dir, { recursive: true });
-      const content = '---\n---\n# Empty Frontmatter\nJust text.';
-      writeFileSync(join(dir, 'empty-fm.md'), content, 'utf-8');
-      const page = await engine.readPage('misc/empty-fm.md');
-      expect(page.frontmatter.type).toBe('unknown');
+      const content = '---\ntype:\n---\n# Null Type\n';
+      writeFileSync(join(dir, 'null-type.md'), content, 'utf-8');
+      const page = await engine.readPage('misc/null-type.md');
       expect(page.frontmatter._synthetic).toBe(true);
+      expect(page.frontmatter.type).toBe('unknown');
     });
 
-    it('uses fallbackType option when provided', async () => {
+    it('synthetic fallback for type === "" honors fallbackType option', async () => {
       const dir = join(tempDir, 'adab', 'wiki', 'misc');
       mkdirSync(dir, { recursive: true });
-      const content = '# No Type Page\n';
-      writeFileSync(join(dir, 'no-type.md'), content, 'utf-8');
-      const page = await engine.readPage('misc/no-type.md', { fallbackType: 'other' });
+      const content = '---\ntype: ""\n---\n# Empty Type\n';
+      writeFileSync(join(dir, 'empty-type.md'), content, 'utf-8');
+      const page = await engine.readPage('misc/empty-type.md', { fallbackType: 'other' });
+      expect(page.frontmatter._synthetic).toBe(true);
       expect(page.frontmatter.type).toBe('other');
-      expect(page.frontmatter._synthetic).toBe(true);
-    });
-
-    it('normal page with valid frontmatter does not have _synthetic', async () => {
-      const dir = join(tempDir, 'adab', 'wiki', 'characters');
-      mkdirSync(dir, { recursive: true });
-      const content = `---\ntype: character\nname: Mara\nstatus: canon\n---\n# Mara\n`;
-      writeFileSync(join(dir, 'mara.md'), content, 'utf-8');
-      const page = await engine.readPage('characters/mara.md');
-      expect(page.frontmatter._synthetic).toBeUndefined();
-      expect(page.frontmatter.type).toBe('character');
     });
   });
 
@@ -184,6 +172,70 @@ describe('WikiEngine', () => {
       const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
       expect(raw).toContain('first_seen: ch-001');
       expect(raw).toContain('tags:');
+    });
+
+    // unknown frontmatter fields are preserved (passthrough)
+    it('preserves unknown scalar custom frontmatter fields on first write', async () => {
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon', custom_field: 'secret-value' },
+        '# Mara'
+      );
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      expect(raw).toContain('custom_field: secret-value');
+    });
+
+    it('preserves unknown array custom frontmatter fields on first write', async () => {
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon', affiliations: ['house-a', 'house-b'] },
+        '# Mara'
+      );
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      expect(raw).toContain('affiliations:');
+      expect(raw).toContain('house-a');
+      expect(raw).toContain('house-b');
+    });
+
+    it('preserves custom fields across a subsequent update', async () => {
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'canon', custom_field: 'first' },
+        '# Mara'
+      );
+      await engine.writePage(
+        'characters/mara.md',
+        { type: 'character', name: 'Mara', status: 'advanced' },
+        '# Mara updated'
+      );
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+      expect(raw).toContain('custom_field: first');
+      expect(raw).toContain('status: advanced');
+    });
+
+    // empty or null type must be rejected by validation
+    it('throws AdabError when type is empty string in frontmatter', async () => {
+      await expect(
+        engine.writePage('characters/mara.md', { type: '', name: 'Mara', status: 'canon' }, '# Mara')
+      ).rejects.toBeInstanceOf(AdabError);
+    });
+
+    it('throws AdabError when type is null in frontmatter', async () => {
+      await expect(
+        engine.writePage('characters/mara.md', { type: null, name: 'Mara', status: 'canon' } as unknown as Record<string, unknown>, '# Mara')
+      ).rejects.toBeInstanceOf(AdabError);
+    });
+
+    // concurrent writes all eventually reach the index
+    it('concurrent writes are all eventually indexed', async () => {
+      const p1 = engine.writePage('characters/a.md', { type: 'character', name: 'A', status: 'canon' }, '# A');
+      const p2 = engine.writePage('characters/b.md', { type: 'character', name: 'B', status: 'canon' }, '# B');
+      await Promise.all([p1, p2]);
+      // Allow any pending re-regen triggered by the dirty flag to finish
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const index = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
+      expect(index).toContain('[[characters/a]]');
+      expect(index).toContain('[[characters/b]]');
     });
   });
 
@@ -253,16 +305,24 @@ describe('WikiEngine', () => {
   });
 
   describe('generateIndex', () => {
-    it('generates index.md grouped by type', async () => {
+    it('generates wikilinks using lowercase page path, not frontmatter name', async () => {
       await engine.writePage('characters/mara.md', { type: 'character', name: 'Mara', status: 'canon' }, '# Mara\nA courtier.');
       await engine.writePage('locations/east-gate.md', { type: 'location', name: 'East Gate', location_type: 'gate', status: 'canon' }, '# East Gate\nA gate.');
       await engine.generateIndex();
       const index = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
       expect(index).toContain('# Wiki Index');
-      expect(index).toContain('## Character');
-      expect(index).toContain('## Location');
-      expect(index).toContain('[[character/Mara]]');
-      expect(index).toContain('[[location/East Gate]]');
+      expect(index).toContain('[[characters/mara]]');
+      expect(index).toContain('[[locations/east-gate]]');
+      // Must NOT use the original case frontmatter name in the link target
+      expect(index).not.toContain('[[character/Mara]]');
+      expect(index).not.toContain('[[location/East Gate]]');
+    });
+
+    it('wikilink path matches page path even when frontmatter name contains spaces or capitals', async () => {
+      await engine.writePage('characters/jane-doe.md', { type: 'character', name: 'Jane Doe', status: 'canon' }, '# Jane');
+      await engine.generateIndex();
+      const index = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
+      expect(index).toContain('[[characters/jane-doe]]');
     });
 
     it('includes summary from first heading', async () => {
@@ -270,6 +330,44 @@ describe('WikiEngine', () => {
       await engine.generateIndex();
       const index = readFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), 'utf-8');
       expect(index).toContain('Mara the Courtier');
+    });
+
+    // empty/unknown type renders as "Uncategorized"
+    it('typeLabel returns "Uncategorized" for empty type', () => {
+      const label = (engine as unknown as { typeLabel(t: string): string }).typeLabel('');
+      expect(label).toBe('Uncategorized');
+    });
+
+    it('typeLabel returns "Uncategorized" for whitespace-only type', () => {
+      const label = (engine as unknown as { typeLabel(t: string): string }).typeLabel('   ');
+      expect(label).toBe('Uncategorized');
+    });
+
+    it('typeLabel still returns plural labels for known types', () => {
+      const label = (engine as unknown as { typeLabel(t: string): string }).typeLabel('character');
+      expect(label).toBe('Characters');
+    });
+
+    // extractSummary must not throw on empty body
+    it('generateIndex does not throw when a page has an empty body', async () => {
+      const dir = join(tempDir, 'adab', 'wiki', 'characters');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'empty.md'),
+        '---\ntype: character\nname: Empty\nstatus: canon\n---\n',
+        'utf-8',
+      );
+      await expect(engine.generateIndex()).resolves.not.toThrow();
+    });
+
+    it('extractSummary returns empty string for empty body', () => {
+      const summary = (engine as unknown as { extractSummary(b: string): string }).extractSummary('');
+      expect(summary).toBe('');
+    });
+
+    it('extractSummary returns empty string for whitespace-only body', () => {
+      const summary = (engine as unknown as { extractSummary(b: string): string }).extractSummary('   \n\n  \n');
+      expect(summary).toBe('');
     });
   });
 
@@ -313,6 +411,16 @@ describe('WikiEngine', () => {
       const graph: WikilinkGraph = JSON.parse(raw);
       expect(graph['characters/mara'].broken).toBe(true);
     });
+
+    // redundant replace removed; behavior is correct after refactor
+    it('broken detection works for links with explicit .md extension', async () => {
+      await engine.writePage('characters/mara.md', { type: 'character', name: 'Mara', status: 'canon' }, '# Mara\nSee [[locations/missing.md]].');
+      await engine.generateWikilinks();
+      const raw = readFileSync(join(tempDir, 'adab', 'index', 'wikilinks.json'), 'utf-8');
+      const graph: WikilinkGraph = JSON.parse(raw);
+      expect(graph['characters/mara'].broken).toBe(true);
+      expect(graph['characters/mara'].links).toContain('locations/missing');
+    });
   });
 
   describe('updateContradictions', () => {
@@ -341,6 +449,49 @@ describe('WikiEngine', () => {
       const { fileExists } = await import('../../utils/fs.js');
       const exists = await fileExists(path);
       expect(exists).toBe(false);
+    });
+
+    // sectionRegex with g flag must update all matching sections, not just the first
+    it('updates all matching unresolved sections, not just the first', async () => {
+      const sameDescription = 'Mara knows the secret';
+      const firstDiff = [
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: sameDescription,
+          sources: [{ page: 'ch-001', claim: 'does not know' }],
+          status: 'unresolved' as const,
+        },
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: sameDescription,
+          sources: [{ page: 'ch-002', claim: 'does not know' }],
+          status: 'unresolved' as const,
+        },
+      ];
+      await engine.updateContradictions(firstDiff);
+
+      const resolveDiff = [
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: sameDescription,
+          sources: [{ page: 'ch-002', claim: 'now knows' }],
+          status: 'explained' as const,
+        },
+      ];
+      await engine.updateContradictions(resolveDiff);
+
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), 'utf-8');
+      // No "Status: unresolved" lines should remain for that description
+      const matches = raw.match(/Status: unresolved/g);
+      expect(matches).toBeNull();
+      // At least one explained status should be present
+      expect(raw).toContain('Status: explained');
     });
   });
 
@@ -372,24 +523,73 @@ describe('WikiEngine', () => {
       expect(contradictionsIssues[0]?.severity).toBe('warning');
     });
 
-    it('returns an empty array when all three system files exist with valid frontmatter', async () => {
-      writeFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), '---\ntype: index\n---\n# Index', 'utf-8');
-      writeFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), '---\ntype: overview\n---\n# Overview', 'utf-8');
-      writeFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), '---\ntype: contradictions\n---\n# Contradictions', 'utf-8');
+    it('returns an empty array when all three system files exist as pure markdown (no frontmatter)', async () => {
+      // system files written by generateIndex/generateOverview have
+      // no frontmatter markers. The synthetic-frontmatter fallback must treat
+      // them as valid, so checkSystemPages returns no issues.
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), '# Wiki Index\n', 'utf-8');
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), '# Story Overview\n', 'utf-8');
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), '# Contradictions\n', 'utf-8');
       const issues = await engine.checkSystemPages();
       expect(issues).toEqual([]);
     });
 
-    it('returns synthetic frontmatter and no issues when index.md has no type field', async () => {
-      writeFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), '---\nname: NoType\n---\n# Index', 'utf-8');
+    // system files written by the engine have no frontmatter;
+    // checkSystemPages must treat them as valid via synthetic fallback.
+    it('treats engine-generated index.md (no frontmatter) as valid', async () => {
+      // Mimic what generateIndex writes: pure markdown with no frontmatter markers
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), '# Wiki Index\n', 'utf-8');
       writeFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), '---\ntype: overview\n---\n# Overview', 'utf-8');
       writeFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), '---\ntype: contradictions\n---\n# Contradictions', 'utf-8');
-      const page = await engine.readPage('index.md');
-      expect(page.frontmatter._synthetic).toBe(true);
-      expect(page.frontmatter.type).toBe('unknown');
       const issues = await engine.checkSystemPages();
       const indexIssues = issues.filter((i) => i.file === 'index.md');
       expect(indexIssues).toEqual([]);
+    });
+
+    it('treats engine-generated overview.md (no frontmatter) as valid', async () => {
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'index.md'), '---\ntype: index\n---\n# Index', 'utf-8');
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), '# Story Overview\n', 'utf-8');
+      writeFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), '---\ntype: contradictions\n---\n# Contradictions', 'utf-8');
+      const issues = await engine.checkSystemPages();
+      const overviewIssues = issues.filter((i) => i.file === 'overview.md');
+      expect(overviewIssues).toEqual([]);
+    });
+  });
+
+  describe('validateFrontmatter', () => {
+    it('throws AdabError when writePage is called with unknown type', async () => {
+      await expect(
+        engine.writePage('misc/mystery.md', { type: 'mystery', name: 'Mystery' } as unknown as Record<string, unknown>, '# Mystery')
+      ).rejects.toBeInstanceOf(AdabError);
+    });
+
+    it('accepts all currently allowed types (character, location, thread, faction, timeline, style, motif, other)', async () => {
+      const allowed = ['character', 'location', 'thread', 'faction', 'timeline', 'style', 'motif', 'other'] as const;
+      for (const t of allowed) {
+        // Build a minimal valid frontmatter for the given type
+        const fm: Record<string, unknown> = { type: t };
+        if (t === 'character') {
+          fm.name = 'X';
+          fm.status = 'canon';
+        } else if (t === 'location') {
+          fm.name = 'X';
+          fm.location_type = 'city';
+        } else if (t === 'thread') {
+          fm.name = 'X';
+          fm.status = 'open';
+        } else {
+          fm.name = 'X';
+        }
+        await expect(
+          engine.writePage(`misc/${String(t)}-page.md`, fm, `# ${String(t)}`),
+        ).resolves.not.toThrow();
+      }
+    });
+
+    it('rejects type "unknown" (not a valid wiki page type)', async () => {
+      await expect(
+        engine.writePage('misc/foo.md', { type: 'unknown', name: 'Foo' } as unknown as Record<string, unknown>, '# Foo')
+      ).rejects.toBeInstanceOf(AdabError);
     });
   });
 });
