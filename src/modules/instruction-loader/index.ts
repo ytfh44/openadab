@@ -3,20 +3,31 @@
  * artifact, including template text, rules, context pack, and optionally
  * inlined dependency content.
  */
-import { join } from 'node:path';
+import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 
 import type { SchemaDef, ArtifactDef } from '../../schemas/schema-def.js';
 import type { ContextPack, ProjectConfig } from '../../schemas/types.js';
-import { TargetNotFoundError } from '../../utils/errors.js';
+import { TargetNotFoundError, UnresolvedVariableError } from '../../utils/errors.js';
 import { safeReadFile } from '../../utils/fs.js';
+import { PathTraversalError } from '../../utils/path.js';
 import type { ContextPacker } from '../context-packer/index.js';
 import { interpolateVariables, interpolateConfigVariables } from '../schema-engine/index.js';
+
+/**
+ * Prefix used in `requiredReads` to mark a dependency that is declared in
+ * the artifact's `requires` list but has no matching artifact definition
+ * in the schema. The string `unknown:<id>` is unambiguous to consumers
+ * because a real filesystem path would never contain the literal
+ * `unknown:` segment (artifact output paths are relative to the change
+ * directory and never include a top-level `unknown:` directory).
+ */
+const UNKNOWN_DEP_PREFIX = 'unknown:';
 
 /**
  * Instruction payload returned by {@link InstructionLoader.loadInstructions}.
  */
 export interface InstructionPayload {
-  /** The fully assembled instruction text. */
+  /** The fully assembled instruction text (instruction + template + rules + warnings). */
   instruction: string;
   /** The raw template text (after variable interpolation). */
   template: string;
@@ -24,16 +35,52 @@ export interface InstructionPayload {
   outputPath: string;
   /** Per-artifact rules from config. */
   rules: string[];
-  /** Required dependency artifact IDs. */
+  /** Required dependency artifact file paths. Missing deps are marked as `unknown:<id>`. */
   requiredReads: string[];
   /** Context pack with file lists and reasons. */
   contextPack: ContextPack;
   /** Inlined dependency content (only when inline mode is enabled). */
   dependencyContent?: Record<string, string>;
+  /**
+   * Structured warnings collected during assembly. Mirrors the
+   * human-readable warning lines that also appear concatenated inside
+   * `instruction`, but is the authoritative, machine-parseable form.
+   * The two views are kept in sync by `loadInstructions`.
+   */
+  warnings: string[];
   /** Change identifier. */
   change: string;
   /** Artifact identifier. */
   artifact: string;
+}
+
+/**
+ * Build a uniform human-readable "missing dependency" warning string.
+ *
+ * Two distinct cases are merged into one shape so the warning text is
+ * identical wherever the loader reports a missing dependency (the
+ * instruction body, the `warnings` array, and the inlined `dependencyContent`
+ * map).
+ *
+ *   - The dependency's artifact definition is missing from the schema
+ *     (caller-supplied `depArt` is `undefined`): the warning falls back
+ *     to `${depId}.md` since we have no other name to suggest.
+ *   - The artifact definition is present but the generated file is not
+ *     on disk: the warning uses `depArt.generates` verbatim so the
+ *     command the user should run next is unambiguous.
+ *
+ * The output is consistently wrapped in backticks around the filename so
+ * it renders as inline code in Markdown.
+ *
+ * @param depId  The dependency identifier declared in `artifact.requires`.
+ * @param depArt The matching artifact definition, or `undefined` when
+ *               the schema does not declare one.
+ * @returns A single-line warning, ready to be appended to the
+ *          instruction body or the `warnings` array.
+ */
+function formatMissingDepWarning(depId: string, depArt: ArtifactDef | undefined): string {
+  const filename = depArt ? depArt.generates : `${depId}.md`;
+  return `Warning: dependency '${depId}' is missing. Write \`${filename}\` first.`;
 }
 
 /**
@@ -55,6 +102,8 @@ export class InstructionLoader {
    * @param changeContext Optional change-specific context for template variable interpolation
    *                      (e.g. `{ chapter: '012', changeId: 'ch-012' }`).
    * @param projectRoot   Absolute path to the project root.
+   * @throws {PathTraversalError} When `changeDir` (after resolution against
+   *         the changes root) escapes `<projectRoot>/adab/changes/`.
    */
   constructor(
     schemaDef: SchemaDef,
@@ -64,16 +113,29 @@ export class InstructionLoader {
     changeContext?: Record<string, string>,
     projectRoot?: string,
   ) {
+    const resolvedRoot = projectRoot ?? contextPacker.projectRootPath;
+    const changesRoot = join(resolvedRoot, 'adab', 'changes');
+    const resolvedChange = resolve(changesRoot, changeDir);
+    const rel = relative(changesRoot, resolvedChange);
+    if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) {
+      throw new PathTraversalError(String(changeDir), changesRoot);
+    }
     this.schemaDef = schemaDef;
     this.projectConfig = projectConfig;
     this.contextPacker = contextPacker;
     this.changeDir = changeDir;
     this.changeContext = changeContext ?? {};
-    this.projectRoot = projectRoot ?? contextPacker.projectRootPath;
+    this.projectRoot = resolvedRoot;
   }
 
   /**
    * Load the full instruction payload for an artifact.
+   *
+   * Assembles the instruction body from the artifact's `instruction`
+   * (or `instructionFile`), the rendered template, the per-artifact
+   * rules, and any missing-dependency warnings. Both a concatenated
+   * `instruction` string and a structured `warnings` array are returned
+   * and kept in sync.
    *
    * @param artifactId Artifact identifier.
    * @param inlineDeps Whether to inline dependency file contents.
@@ -86,10 +148,16 @@ export class InstructionLoader {
     const contextPack = await this.contextPacker.packContext(this.changeDir, artifactId);
     const dependencyContent = await this.loadDependencyContent(artifactId, inlineDeps ?? false);
 
-let instructionText = artifact.instruction ?? '';
+    let instructionText = artifact.instruction ?? '';
     if (artifact.instructionFile !== undefined) {
       // Per spec: instructionFile overrides the inline instruction field.
+      // The precedence is documented here so callers and tests can rely on
+      // a single source of truth: when both are set, the on-disk file
+      // wins and a console warning flags the conflict. We do not throw,
+      // because some authors use `instruction` as a fallback while they
+      // are still authoring the on-disk instructions file.
       if (instructionText) {
+        // eslint-disable-next-line no-console
         console.warn(`[InstructionLoader] Artifact '${artifactId}' has both 'instruction' and 'instructionFile' — using instructionFile content`);
       }
       const schemaDir = join(this.projectRoot, 'adab', 'schemas', this.schemaDef.name);
@@ -108,33 +176,36 @@ let instructionText = artifact.instruction ?? '';
       instructionParts.push(template);
     }
     if (rules.length > 0) {
-      instructionParts.push(`Rules:\n${  rules.map((r) => `- ${r}`).join('\n')}`);
+      instructionParts.push(`Rules:\n${rules.map((r) => `- ${r}`).join('\n')}`);
     }
 
     const artifactMap = new Map(this.schemaDef.artifacts.map((a) => [a.id, a]));
     const changePath = join(this.projectRoot, 'adab', 'changes', this.changeDir);
-    const missingDepWarnings: string[] = [];
+    const warnings: string[] = [];
     for (const depId of artifact.requires) {
       const depArt = artifactMap.get(depId);
       if (!depArt) {
-        missingDepWarnings.push(`Warning: dependency '${depId}' is missing. Write \`${depId}.md\` first.`);
-      } else {
-        const depPath = join(changePath, depArt.generates);
-        const depRaw = await safeReadFile(depPath);
-        if (depRaw === null) {
-          missingDepWarnings.push(`Warning: dependency '${depId}' is missing. Write \`${depArt.generates}\` first.`);
-        }
+        warnings.push(formatMissingDepWarning(depId, undefined));
+        continue;
+      }
+      const depPath = join(changePath, depArt.generates);
+      const depRaw = await safeReadFile(depPath);
+      if (depRaw === null) {
+        warnings.push(formatMissingDepWarning(depId, depArt));
       }
     }
-    if (missingDepWarnings.length > 0) {
-      instructionParts.push(...missingDepWarnings);
+    if (warnings.length > 0) {
+      instructionParts.push(...warnings);
     }
 
     const outputPath = join(this.projectRoot, 'adab', 'changes', this.changeDir, artifact.generates);
 
     const requiredReads = artifact.requires.map((depId) => {
       const depArt = artifactMap.get(depId);
-      return depArt ? join(this.projectRoot, 'adab', 'changes', this.changeDir, depArt.generates) : depId;
+      if (!depArt) {
+        return `${UNKNOWN_DEP_PREFIX}${depId}`;
+      }
+      return join(this.projectRoot, 'adab', 'changes', this.changeDir, depArt.generates);
     });
 
     return {
@@ -145,6 +216,7 @@ let instructionText = artifact.instruction ?? '';
       requiredReads,
       contextPack,
       dependencyContent: inlineDeps === true ? dependencyContent : undefined,
+      warnings,
       change: this.changeDir,
       artifact: artifactId,
     };
@@ -156,8 +228,22 @@ let instructionText = artifact.instruction ?? '';
    * Reads the artifact's `template` file, resolves `{{variable}}` and
    * `{{config.*}}` placeholders, and returns the resulting text.
    *
+   * If a placeholder cannot be resolved, the underlying interpolation
+   * throws an {@link UnresolvedVariableError}; this method does not
+   * catch and mask the error — the caller is expected to surface the
+   * failure to the user rather than proceed with a partially
+   * interpolated template that would silently mislead downstream
+   * processing.
+   *
+   * When the same key appears in both the schema's `context` block and
+   * the change-specific `changeContext`, a warning is emitted so authors
+   * are aware of the override. The `changeContext` value always wins
+   * (later assignment in the merged object).
+   *
    * @param artifactId Artifact identifier.
    * @returns Interpolated template text.
+   * @throws {UnresolvedVariableError} If any referenced variable or
+   *         `{{config.*}}` path is missing.
    */
   async loadTemplate(artifactId: string): Promise<string> {
     const artifact = this.resolveArtifact(artifactId);
@@ -171,28 +257,32 @@ let instructionText = artifact.instruction ?? '';
       return '';
     }
 
-    let text = raw;
+    const schemaContext = this.schemaDef.context ?? {};
     const mergedContext: Record<string, string> = {
-      ...(this.schemaDef.context ?? {}),
+      ...(schemaContext as Record<string, string>),
       ...this.changeContext,
     };
-    if (Object.keys(mergedContext).length > 0) {
-      try {
-        text = interpolateVariables(text, mergedContext);
-      } catch (err) {
-        // Replace remaining unresolved variables with a marker
-        text = text.replace(/\{\{(\w+)\}\}/g, '[unresolved: $1]');
-        console.warn('[InstructionLoader] Failed to interpolate schema variables:', err instanceof Error ? err.message : String(err));
+    for (const key of Object.keys(this.changeContext)) {
+      if (Object.prototype.hasOwnProperty.call(schemaContext, key)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[InstructionLoader] changeContext overrides schemaContext key '${key}'; the changeContext value will be used.`
+        );
       }
     }
+    let text = raw;
     try {
-      text = interpolateConfigVariables(text, this.projectConfig);
+      text = interpolateVariables(text, mergedContext);
     } catch (err) {
-      // Replace remaining unresolved variables with a marker
-      text = text.replace(/\{\{(\w+)\}\}/g, '[unresolved: $1]');
-      console.warn('[InstructionLoader] Failed to interpolate config variables:', err instanceof Error ? err.message : String(err));
+      if (err instanceof UnresolvedVariableError) {
+        throw err;
+      }
+      throw new UnresolvedVariableError(
+        `Failed to interpolate schema variables: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err }
+      );
     }
-    return text;
+    return interpolateConfigVariables(text, this.projectConfig);
   }
 
   /**
@@ -210,8 +300,15 @@ let instructionText = artifact.instruction ?? '';
    * Load dependency artifact contents for inlining.
    *
    * When `inline` is true, reads the content of all dependency artifacts
-   * and returns them as a map.  Missing files produce a warning but do not
-   * throw, allowing forward planning.
+   * and returns them as a map. Missing files produce a warning string
+   * instead of an entry, allowing forward planning.
+   *
+   * The artifact ID itself is guaranteed to be resolvable by the time
+   * this method runs: `loadInstructions` resolves the artifact first
+   * and only then calls this method. The previous version wrapped the
+   * resolve call in a defensive try/catch that could never trigger
+   * (dead code); it has been removed so any future regression in the
+   * resolution contract surfaces as a real error.
    *
    * @param artifactId Artifact identifier.
    * @param inline     Whether to read file contents.
@@ -221,25 +318,19 @@ let instructionText = artifact.instruction ?? '';
     if (!inline) {
       return {};
     }
-    let artifact: ReturnType<typeof this.resolveArtifact>;
-    try {
-      artifact = this.resolveArtifact(artifactId);
-    } catch {
-      // Return warning for missing main artifact instead of throwing
-      return { [artifactId]: `Warning: artifact '${artifactId}' is missing.` };
-    }
+    const artifact = this.resolveArtifact(artifactId);
     const result: Record<string, string> = {};
     const changePath = join(this.projectRoot, 'adab', 'changes', this.changeDir);
     for (const depId of artifact.requires) {
       const depArt = this.schemaDef.artifacts.find((a) => a.id === depId);
       if (!depArt) {
-        result[depId] = `Warning: dependency '${depId}' is missing. Write ${depId}.md first.`;
+        result[depId] = formatMissingDepWarning(depId, undefined);
         continue;
       }
       const depPath = join(changePath, depArt.generates);
       const raw = await safeReadFile(depPath);
       if (raw === null) {
-        result[depId] = `Warning: dependency '${depId}' is missing. Write \`${depArt.generates}\` first.`;
+        result[depId] = formatMissingDepWarning(depId, depArt);
       } else {
         result[depId] = raw;
       }
