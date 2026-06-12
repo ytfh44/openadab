@@ -265,3 +265,69 @@ describe('config get round-trip (L2 integration smoke)', () => {
     expect(config.project.title).toBe('My Title');
   });
 });
+
+// =============================================================================
+// S2: `config set` must redact sensitive values before writing to adab/log.md
+// =============================================================================
+describe('config set redacts secrets in adab/log.md (S2)', () => {
+  let projectRoot: string;
+
+  beforeEach(async () => {
+    projectRoot = await createMinimalProject(await mkdtemp(join(tmpdir(), 'openadab-config-redact-')));
+  });
+
+  async function readLogRaw(): Promise<string> {
+    const { readFile } = await import('node:fs/promises');
+    return readFile(join(projectRoot, 'adab', 'log.md'), 'utf-8');
+  }
+
+  it('redacts secrets.apiKey to *** in adab/log.md', async () => {
+    await runCliInDir(projectRoot, ['config', 'set', 'secrets.apiKey', 'sk-supersecret-xxx']);
+    const raw = await readLogRaw();
+    expect(raw).toContain('secrets.apiKey');
+    expect(raw).toContain('***');
+    expect(raw).not.toContain('sk-supersecret-xxx');
+  });
+
+  it('redacts api.token to *** in adab/log.md', async () => {
+    await runCliInDir(projectRoot, ['config', 'set', 'api.token', 'bearer-tok-12345']);
+    const raw = await readLogRaw();
+    expect(raw).toContain('api.token');
+    expect(raw).toContain('***');
+    expect(raw).not.toContain('bearer-tok-12345');
+  });
+
+  it('does NOT redact a non-sensitive value (project.pov remains visible)', async () => {
+    await runCliInDir(projectRoot, ['config', 'set', 'project.pov', 'first-person']);
+    const raw = await readLogRaw();
+    expect(raw).toContain('first-person');
+  });
+
+  it('redacts deeply nested secret paths (a.b.secrets.password)', async () => {
+    await runCliInDir(projectRoot, ['config', 'set', 'a.b.secrets.password', 'p4ssw0rd!']);
+    const raw = await readLogRaw();
+    expect(raw).toContain('***');
+    expect(raw).not.toContain('p4ssw0rd!');
+  });
+
+  it('redacts object value stored under a sensitive path (json --json)', async () => {
+    await runCliInDir(projectRoot, [
+      'config',
+      'set',
+      'secrets.openai',
+      JSON.stringify({ apiKey: 'sk-xyz', token: 'tk-abc' }),
+      '--json',
+    ]);
+    const raw = await readLogRaw();
+    expect(raw).toContain('***');
+    expect(raw).not.toContain('sk-xyz');
+    expect(raw).not.toContain('tk-abc');
+  });
+
+  it('redacts case-insensitively (Secrets.AWS_TOKEN)', async () => {
+    await runCliInDir(projectRoot, ['config', 'set', 'Secrets.AWS_TOKEN', 'aws-secret-value']);
+    const raw = await readLogRaw();
+    expect(raw).toContain('***');
+    expect(raw).not.toContain('aws-secret-value');
+  });
+});
