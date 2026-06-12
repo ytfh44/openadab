@@ -2,8 +2,9 @@ import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
+import { TargetNotFoundError } from '../../utils/errors.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 import { MentionIndexer } from './index.js';
@@ -249,5 +250,419 @@ describe('MentionIndexer', () => {
     const reg = (indexer as any).entityRegistry;
     expect(reg.has('')).toBe(false);
     expect(reg.size).toBe(0);
+  });
+
+  // ===== buildEntityRegistry accepts whitespace-only names =====
+  it('rejects whitespace-only entity name (tab/newline mix)', async () => {
+    const { indexer } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: '\t\n  ', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const reg = (indexer as any).entityRegistry;
+    expect(reg.size).toBe(0);
+  });
+
+  it('accepts name with internal whitespace as long as it has non-whitespace', async () => {
+    const { indexer } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: '  Mara  ', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const reg = (indexer as any).entityRegistry;
+    // Internal whitespace doesn't affect validity
+    expect(reg.size).toBe(1);
+  });
+
+  it('skips page where name is not a string', async () => {
+    const { indexer } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: 42, type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const reg = (indexer as any).entityRegistry;
+    expect(reg.size).toBe(0);
+  });
+
+  // ===== incrementalIndex logic decoupling =====
+  it('new entity discovered in incrementalIndex gets full scan of all files', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file1 = join(manDir, 'ch-001.md');
+    const file2 = join(manDir, 'ch-002.md');
+    writeFileSync(file1, 'Alice was here.');
+    writeFileSync(file2, 'Alice was there too.');
+
+    await indexer.indexAll();
+
+    // Now register a new entity
+    const { indexer: indexer2 } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+      { path: 'characters/bob.md', frontmatter: { name: 'Bob', type: 'character' }, body: '' },
+    ]);
+    // Copy the manuscript files into the new indexer's root
+    const manDir2 = join(indexer2['projectRoot'], 'adab', 'manuscript');
+    mkdirSync(manDir2, { recursive: true });
+    writeFileSync(join(manDir2, 'ch-001.md'), 'Alice was here. Bob smiled.');
+    writeFileSync(join(manDir2, 'ch-002.md'), 'Alice was there too.');
+
+    // Seed mentions.json with only Alice (no Bob yet)
+    const idxDir = join(indexer2['projectRoot'], 'adab', 'index');
+    mkdirSync(idxDir, { recursive: true });
+    writeFileSync(join(idxDir, '.last-mention-indexed'), String(Date.now() - 10000));
+    writeFileSync(join(idxDir, 'mentions.json'), JSON.stringify({
+      Alice: { type: 'character', aliases: ['Alice'], appearances: [] },
+    }));
+
+    await indexer2.incrementalIndex();
+
+    const reg = (indexer2 as any).entityRegistry;
+    const bob = reg.get('Bob');
+    expect(bob).toBeDefined();
+    // Bob should be found in ch-001 (not modified, so via full-scan path)
+    const bobInCh001 = bob.appearances.find((a: any) => a.file === join(manDir2, 'ch-001.md'));
+    expect(bobInCh001).toBeDefined();
+  });
+
+  it('incrementalIndex with no new entities and no modified files returns early', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.indexAll();
+
+    // Don't touch the file
+    const idxDir = join(root, 'adab', 'index');
+    const mentionsPath = join(idxDir, 'mentions.json');
+    const original = readFileSync(mentionsPath, 'utf-8');
+
+    await indexer.incrementalIndex();
+
+    // Should not have been re-written
+    const after = readFileSync(mentionsPath, 'utf-8');
+    expect(after).toBe(original);
+  });
+
+  // ===== buildRegexPattern CJK detection per segment =====
+  it('handles mixed CJK+ASCII alias with per-segment word boundaries', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: '流浪者', type: 'character', aliases: ['流浪者 Alice'] }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    // Should match "流浪者" even when adjacent to non-word chars
+    writeFileSync(file, '「流浪者」 smiled. Also 「流浪者Alice」 appeared.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('流浪者')).toBe(true);
+  });
+
+  it('pure CJK alias has no word boundary', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: '流浪者', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, '流浪者在街上走。');
+    const results = await indexer.scanFile(file);
+    expect(results.has('流浪者')).toBe(true);
+  });
+
+  it('ASCII part of mixed alias still requires word boundary', async () => {
+    // Entity name is "Hero" — the ONLY way the entity can be matched is
+    // through the mixed alias, so this test isolates the word-boundary
+    // behaviour of the ASCII segment without being shadowed by the
+    // canonical name.
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Hero', type: 'character', aliases: ['流浪者 Alice'] }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    // "Alicebob" must not satisfy the trailing \b around "Alice"
+    writeFileSync(file, '流浪者Alicebob walked.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('Hero')).toBe(false);
+  });
+
+  // ===== buildRegexPattern escape comprehensiveness =====
+  it('escapes forward slash in alias', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'A/B', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'A/B walked here.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('A/B')).toBe(true);
+  });
+
+  it('escapes hyphen in alias character class', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'a-b', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'a-b walked here.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('a-b')).toBe(true);
+  });
+
+  it('escapes literal backslash in alias', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'foo\\bar', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'foo\\bar walked here.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('foo\\bar')).toBe(true);
+  });
+
+  // ===== alias conflict resolution =====
+  it('when two entities share an alias, both get the mention', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: 'Alice', type: 'character', aliases: ['the stranger'] }, body: '' },
+      { path: 'b.md', frontmatter: { name: 'Beth', type: 'character', aliases: ['the stranger'] }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'the stranger appeared at the door.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('Alice')).toBe(true);
+    expect(results.has('Beth')).toBe(true);
+  });
+
+  it('conflict resolution records same line for both entities', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: 'A', type: 'character', aliases: ['X'] }, body: '' },
+      { path: 'b.md', frontmatter: { name: 'B', type: 'character', aliases: ['X'] }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'X appears here.\nX appears again.');
+    const results = await indexer.scanFile(file);
+    expect(results.get('A')?.length).toBe(2);
+    expect(results.get('B')?.length).toBe(2);
+  });
+
+  it('distinct aliases do not bleed into other entities', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+      { path: 'b.md', frontmatter: { name: 'Beth', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, 'Alice walked.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('Beth')).toBe(false);
+  });
+
+  // ===== extractContext length cap =====
+  it('context is limited to 100 characters total', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    const longBefore = 'a'.repeat(200);
+    const longAfter = 'b'.repeat(200);
+    writeFileSync(file, `${longBefore} Mara ${longAfter}`);
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(100);
+  });
+
+  it('context is limited even when match is at start of paragraph', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, `Mara ${'x'.repeat(500)}`);
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(100);
+  });
+
+  it('context respects paragraph boundaries', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    writeFileSync(file, `Para1 ${'a'.repeat(200)}.\n\nMara smiled.\n\nPara3 ${'b'.repeat(200)}.`);
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).not.toContain('Para1');
+    expect(ctx).not.toContain('Para3');
+    expect(ctx).toContain('Mara');
+  });
+
+  // ===== zod validation of existing mentions.json =====
+  it('corrupted mentions.json triggers full rebuild', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    // Seed an obviously broken mentions.json
+    const idxDir = join(root, 'adab', 'index');
+    mkdirSync(idxDir, { recursive: true });
+    writeFileSync(join(idxDir, '.last-mention-indexed'), String(Date.now() - 10000));
+    writeFileSync(join(idxDir, 'mentions.json'), '{not valid json');
+
+    await indexer.incrementalIndex();
+
+    // After the rebuild, Alice should be present with appearances
+    const reg = (indexer as any).entityRegistry;
+    const alice = reg.get('Alice');
+    expect(alice).toBeDefined();
+    expect(alice.appearances.length).toBeGreaterThan(0);
+  });
+
+  it('mentions.json with wrong shape triggers full rebuild', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    const idxDir = join(root, 'adab', 'index');
+    mkdirSync(idxDir, { recursive: true });
+    writeFileSync(join(idxDir, '.last-mention-indexed'), String(Date.now() - 10000));
+    // 'appearances' is supposed to be an array, not a string
+    writeFileSync(join(idxDir, 'mentions.json'), JSON.stringify({
+      Alice: { type: 'character', aliases: ['Alice'], appearances: 'not-an-array' },
+    }));
+
+    await indexer.incrementalIndex();
+
+    const reg = (indexer as any).entityRegistry;
+    const alice = reg.get('Alice');
+    expect(alice).toBeDefined();
+    expect(alice.appearances.length).toBeGreaterThan(0);
+  });
+
+  it('valid mentions.json is preserved across incremental re-index', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.indexAll();
+
+    // No file changes; incremental should keep existing data
+    await indexer.incrementalIndex();
+
+    const reg = (indexer as any).entityRegistry;
+    const alice = reg.get('Alice');
+    expect(alice.appearances.length).toBeGreaterThan(0);
+  });
+
+  // ===== scanFile raw===null explicit handling =====
+  it('scanFile throws TargetNotFoundError when file does not exist', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const missing = join(root, 'this-file-does-not-exist.md');
+    await expect(indexer.scanFile(missing)).rejects.toBeInstanceOf(TargetNotFoundError);
+  });
+
+  it('scanFile on empty file returns empty result (does not throw)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'empty.md');
+    writeFileSync(file, '');
+    const results = await indexer.scanFile(file);
+    expect(results.size).toBe(0);
+  });
+
+  it('scanFile on file with no matches returns empty result (does not throw)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    writeFileSync(file, 'No entities here.');
+    const results = await indexer.scanFile(file);
+    expect(results.size).toBe(0);
+  });
+
+  // ===== generateContextMap alias safety =====
+  it('generateContextMap does not push undefined when aliases is empty', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.buildEntityRegistry();
+    // Manually inject a registry entry with an empty aliases array, simulating
+    // a registry built from a corrupt or external mentions.json file
+    const reg = (indexer as any).entityRegistry;
+    reg.set('Anon', {
+      type: 'character',
+      aliases: [],
+      appearances: [{ file, line: 99, context: 'x' }],
+    });
+
+    await indexer.generateContextMap();
+
+    const mapPath = join(root, 'adab', 'index', 'context-map.json');
+    const map = JSON.parse(readFileSync(mapPath, 'utf-8'));
+    const entries = map[file] ?? [];
+    expect(entries).not.toContain(undefined);
+    expect(entries.every((v: unknown) => typeof v === 'string' && v.length > 0)).toBe(true);
+  });
+
+  it('generateContextMap writes a valid map file even with bad entries', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.buildEntityRegistry();
+    const reg = (indexer as any).entityRegistry;
+    reg.set('Anon', { type: 'character', aliases: [], appearances: [{ file, line: 1, context: 'x' }] });
+
+    await expect(indexer.generateContextMap()).resolves.toBeUndefined();
+  });
+
+  it('normal entity still appears in context-map', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.buildEntityRegistry();
+    const reg = (indexer as any).entityRegistry;
+    reg.get('Alice').appearances = [{ file, line: 1, context: 'Alice walked.' }];
+
+    await indexer.generateContextMap();
+    const mapPath = join(root, 'adab', 'index', 'context-map.json');
+    const map = JSON.parse(readFileSync(mapPath, 'utf-8'));
+    expect(map[file]).toContain('Alice');
   });
 });
