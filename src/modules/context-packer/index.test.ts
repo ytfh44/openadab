@@ -429,4 +429,230 @@ describe('ContextPacker', () => {
       expect(adabError.message).toMatch(/init/i);
     }
   });
+
+  // CP1: getActiveThreads must filter by frontmatter status / active flag
+  it('getActiveThreads keeps only threads with status=open or active=true in frontmatter', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-cp-cp1-'));
+    const { ContextPacker } = await import('./index.js');
+    const wikiEngine = {
+      readPage: vi.fn().mockImplementation(async (page: string) => {
+        if (page === 'threads/open-thread.md') {
+          return { frontmatter: { name: 'OpenThread', type: 'thread', status: 'open' }, body: '' };
+        }
+        if (page === 'threads/active-thread.md') {
+          return { frontmatter: { name: 'ActiveThread', type: 'thread', active: true }, body: '' };
+        }
+        if (page === 'threads/resolved-thread.md') {
+          return { frontmatter: { name: 'ResolvedThread', type: 'thread', status: 'resolved' }, body: '' };
+        }
+        if (page === 'threads/closed-thread.md') {
+          return { frontmatter: { name: 'ClosedThread', type: 'thread', status: 'closed' }, body: '' };
+        }
+        return { frontmatter: { name: 'Unknown', type: 'thread' }, body: '' };
+      }),
+      listPages: vi.fn().mockResolvedValue([
+        'threads/open-thread.md',
+        'threads/active-thread.md',
+        'threads/resolved-thread.md',
+        'threads/closed-thread.md',
+      ]),
+      generateWikilinks: vi.fn().mockResolvedValue(undefined),
+      generateIndex: vi.fn().mockResolvedValue(undefined),
+    } as unknown as WikiEngine;
+
+    const mentionIndexer = {} as unknown as MentionIndexer;
+    const progressionTracker = {} as unknown as ProgressionTracker;
+    const { ConfigLoader } = await import('../project-config/index.js');
+    const configLoader = new ConfigLoader(root);
+    // Create minimal config to allow resolution
+    mkdirSync(join(root, 'adab'), { recursive: true });
+    writeFileSync(join(root, 'adab', 'config.yaml'), JSON.stringify({
+      schema: 'chapter-draft',
+      version: 1,
+      project: { language: 'zh-CN' },
+      context: { maxTokens: 18000, alwaysInclude: [], tokenHeuristic: 'chars-per-token' },
+    }));
+
+    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+    await configLoader.load();
+
+    // Write a continuity report that mentions all four thread names
+    const changeDir = join(root, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(
+      join(changeDir, 'continuity-report.md'),
+      '# Continuity\nOpenThread and ActiveThread and ResolvedThread and ClosedThread are all in this report.\n'
+    );
+
+    const active = await packer.getActiveThreads('ch-001');
+    expect(active).toContain('threads/open-thread.md');
+    expect(active).toContain('threads/active-thread.md');
+    expect(active).not.toContain('threads/resolved-thread.md');
+    expect(active).not.toContain('threads/closed-thread.md');
+  });
+
+  // CP2: checkStaleIndex must consider wiki/changes/raw directories, not just manuscript
+  it('checkStaleIndex considers wiki directory modifications', async () => {
+    const { root, packer } = await setupPacker();
+    const changeDir = join(root, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(join(changeDir, 'brief.md'), '---\nstatus: done\n---\n\nbrief');
+    writeFileSync(join(changeDir, 'draft.md'), '---\nstatus: ready\n---\n\ndraft');
+
+    // Write an old .last-mention-indexed
+    const miPath = join(root, 'adab', 'index', '.last-mention-indexed');
+    mkdirSync(join(root, 'adab', 'index'), { recursive: true });
+    writeFileSync(miPath, '1000000'); // very old (1970)
+
+    // Create a wiki file with a newer mtime
+    const wikiDir = join(root, 'adab', 'wiki');
+    mkdirSync(wikiDir, { recursive: true });
+    writeFileSync(join(wikiDir, 'note.md'), 'a wiki note');
+
+    const pack = await packer.packContext('ch-001', 'draft');
+    expect(pack.reasons.__stale_index_warning).toBeDefined();
+    expect(pack.reasons.__stale_index_warning).toContain('stale');
+  });
+
+  it('checkStaleIndex considers changes directory modifications', async () => {
+    const { root, packer } = await setupPacker();
+    const miPath = join(root, 'adab', 'index', '.last-mention-indexed');
+    mkdirSync(join(root, 'adab', 'index'), { recursive: true });
+    writeFileSync(miPath, '1000000'); // very old
+
+    // Only changes directory has a new file
+    const changesDir = join(root, 'adab', 'changes', 'ch-001');
+    mkdirSync(changesDir, { recursive: true });
+    writeFileSync(join(changesDir, 'brief.md'), '---\nstatus: done\n---\n\nbrief');
+
+    const pack = await packer.packContext('ch-001', 'draft');
+    expect(pack.reasons.__stale_index_warning).toBeDefined();
+    expect(pack.reasons.__stale_index_warning).toContain('stale');
+  });
+
+  it('checkStaleIndex considers raw directory modifications', async () => {
+    const { root, packer } = await setupPacker();
+    const miPath = join(root, 'adab', 'index', '.last-mention-indexed');
+    mkdirSync(join(root, 'adab', 'index'), { recursive: true });
+    writeFileSync(miPath, '1000000'); // very old
+
+    // Only raw directory has a new file
+    const rawDir = join(root, 'adab', 'raw');
+    mkdirSync(rawDir, { recursive: true });
+    writeFileSync(join(rawDir, 'note.md'), 'a raw note');
+
+    const pack = await packer.packContext('ch-001', 'draft');
+    expect(pack.reasons.__stale_index_warning).toBeDefined();
+    expect(pack.reasons.__stale_index_warning).toContain('stale');
+  });
+
+  // CP3: POV character candidate should have priority 85
+  it('POV character candidate has priority 85', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-cp-cp3-'));
+    mkdirSync(join(root, 'adab'), { recursive: true });
+    writeFileSync(join(root, 'adab', 'config.yaml'), JSON.stringify({
+      schema: 'chapter-draft',
+      version: 1,
+      project: { language: 'zh-CN' },
+      context: { maxTokens: 18000, alwaysInclude: [], tokenHeuristic: 'chars-per-token' },
+    }));
+    const schemaDir = join(root, 'adab', 'schemas', 'chapter-draft');
+    mkdirSync(schemaDir, { recursive: true });
+    writeFileSync(join(schemaDir, 'schema.yaml'), JSON.stringify({
+      name: 'chapter-draft',
+      version: 1,
+      artifacts: [
+        { id: 'draft', generates: 'draft.md', requires: ['brief'] },
+        { id: 'brief', generates: 'brief.md', requires: [] },
+        { id: 'scene-plan', generates: 'scene-plan.md', requires: [] },
+      ],
+    }));
+
+    const wikiEngine = {
+      readPage: vi.fn().mockImplementation(async (page: string) => {
+        if (page === 'characters/alice.md') {
+          return { frontmatter: { name: 'Alice', type: 'character' }, body: '' };
+        }
+        return { frontmatter: { name: '?', type: 'character' }, body: '' };
+      }),
+      listPages: vi.fn().mockImplementation(async (type?: string) => {
+        if (type === 'character') return ['characters/alice.md'];
+        if (type === 'thread') return [];
+        return [];
+      }),
+      generateWikilinks: vi.fn().mockResolvedValue(undefined),
+      generateIndex: vi.fn().mockResolvedValue(undefined),
+    } as unknown as WikiEngine;
+    const mentionIndexer = {} as unknown as MentionIndexer;
+    const progressionTracker = {} as unknown as ProgressionTracker;
+    const { ConfigLoader } = await import('../project-config/index.js');
+    const configLoader = new ConfigLoader(root);
+    await configLoader.load();
+
+    // Create scene-plan with pov: Alice
+    const changeDir = join(root, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(join(changeDir, 'scene-plan.md'), '---\npov: Alice\n---\n\nscene');
+
+    // The POV character wiki page must exist on disk for the candidate to
+    // be added (buildCandidates only adds the POV candidate when fileExists
+    // returns true for the resolved page).
+    const alicePageDir = join(root, 'adab', 'wiki', 'characters');
+    mkdirSync(alicePageDir, { recursive: true });
+    writeFileSync(join(alicePageDir, 'alice.md'), '---\ntype: character\nname: Alice\nstatus: canon\n---\n\nAlice body');
+
+    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+    const candidates = await packer.buildCandidates('ch-001', 'draft');
+    const pov = candidates.find((c) => c.reason === 'POV character');
+    expect(pov).toBeDefined();
+    expect(pov?.priority).toBe(85);
+  });
+
+  // CP4: previous chapter candidate should have priority 50
+  it('previous chapter candidate has priority 50 with reason mentioning last written', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-cp-cp4-'));
+    mkdirSync(join(root, 'adab'), { recursive: true });
+    writeFileSync(join(root, 'adab', 'config.yaml'), JSON.stringify({
+      schema: 'chapter-draft',
+      version: 1,
+      project: { language: 'zh-CN' },
+      context: { maxTokens: 18000, alwaysInclude: [], tokenHeuristic: 'chars-per-token' },
+    }));
+    const schemaDir = join(root, 'adab', 'schemas', 'chapter-draft');
+    mkdirSync(schemaDir, { recursive: true });
+    writeFileSync(join(schemaDir, 'schema.yaml'), JSON.stringify({
+      name: 'chapter-draft',
+      version: 1,
+      artifacts: [
+        { id: 'draft', generates: 'draft.md', requires: [] },
+      ],
+    }));
+
+    const wikiEngine = {
+      readPage: vi.fn().mockResolvedValue({ frontmatter: { name: 'Alice', type: 'character' }, body: '' }),
+      listPages: vi.fn().mockResolvedValue([]),
+      generateWikilinks: vi.fn().mockResolvedValue(undefined),
+      generateIndex: vi.fn().mockResolvedValue(undefined),
+    } as unknown as WikiEngine;
+    const mentionIndexer = {} as unknown as MentionIndexer;
+    const progressionTracker = {} as unknown as ProgressionTracker;
+    const { ConfigLoader } = await import('../project-config/index.js');
+    const configLoader = new ConfigLoader(root);
+    await configLoader.load();
+
+    // Create previous chapter ch-001.md so ch-002 can use it
+    const chaptersDir = join(root, 'adab', 'manuscript', 'chapters');
+    mkdirSync(chaptersDir, { recursive: true });
+    writeFileSync(join(chaptersDir, 'ch-001.md'), 'chapter one');
+
+    const changeDir = join(root, 'adab', 'changes', 'ch-002');
+    mkdirSync(changeDir, { recursive: true });
+
+    const packer = new ContextPacker(root, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+    const candidates = await packer.buildCandidates('ch-002', 'draft');
+    const prev = candidates.find((c) => c.reason.startsWith('previous chapter'));
+    expect(prev).toBeDefined();
+    expect(prev?.priority).toBe(50);
+    expect(prev?.reason).toMatch(/last written: ch-001/);
+  });
 });

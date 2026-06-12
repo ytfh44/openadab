@@ -58,6 +58,15 @@ export class ContextPacker {
   private readonly configLoader: ConfigLoader;
 
   /**
+   * In-memory cache for resolved schemas keyed by change directory (or the
+   * sentinel `'__active__'` for the global active schema).  Cleared on every
+   * {@link packContext} entry so that the next call always reflects the
+   * current on-disk state and stale entries from a previous invocation
+   * never leak across pack calls.
+   */
+  private readonly schemaCache: Map<string, SchemaDef | undefined> = new Map();
+
+  /**
    * @param projectRoot        Absolute path to the project root.
    * @param wikiEngine         Wiki engine for reading pages.
    * @param mentionIndexer     Mention indexer for entity lookups.
@@ -88,6 +97,9 @@ export class ContextPacker {
    *          excluded file lists plus selection reasons.
    */
   async packContext(changeDir: string, artifactId: string): Promise<ContextPack> {
+    // Each top-level pack call starts with a clean schema cache so that a
+    // previous call's resolutions never influence this call's output.
+    this.schemaCache.clear();
     const staleWarning = await this.checkStaleIndex();
     const candidates = await this.buildCandidates(changeDir, artifactId);
     const budget = await this.resolveBudget(artifactId, changeDir);
@@ -127,6 +139,11 @@ export class ContextPacker {
       throw e;
     }
     for (const rel of alwaysInclude) {
+      if (rel.trim() === '') {
+        // eslint-disable-next-line no-console
+        console.warn(`[ContextPacker] Skipping empty alwaysInclude entry: ${JSON.stringify(rel)}`);
+        continue;
+      }
       const abs = join(this.projectRoot, rel);
       if (await fileExists(abs)) {
         candidates.push({
@@ -135,6 +152,9 @@ export class ContextPacker {
           tokens: await this.estimateTokens(abs),
           reason: 'config.alwaysInclude',
         });
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(`[ContextPacker] alwaysInclude path not found: ${rel}`);
       }
     }
 
@@ -189,7 +209,7 @@ export class ContextPacker {
       if (await fileExists(abs)) {
         candidates.push({
           path: abs,
-          priority: 60,
+          priority: 85,
           tokens: await this.estimateTokens(abs),
           reason: 'POV character',
         });
@@ -204,7 +224,7 @@ export class ContextPacker {
         const chapterLabel = match ? match[0] : adjacent;
         candidates.push({
           path: abs,
-          priority: 55,
+          priority: 50,
           tokens: await this.estimateTokens(abs),
           reason: `previous chapter (last written: ${chapterLabel.toLowerCase()})`,
         });
@@ -324,7 +344,17 @@ export class ContextPacker {
       try {
         const wikiPage = await this.wikiEngine.readPage(page);
         const name = typeof wikiPage.frontmatter.name === 'string' ? wikiPage.frontmatter.name : '';
-        if (name !== '' && raw.includes(name)) {
+        if (name === '' || !raw.includes(name)) {
+          continue;
+        }
+        // Per spec: a thread is active only when its frontmatter declares
+        // `status: open` or `active: true`.  Any other status (resolved,
+        // advanced, closed, missing, etc.) is treated as inactive and is
+        // therefore excluded from the candidate set.
+        const status = typeof wikiPage.frontmatter.status === 'string' ? wikiPage.frontmatter.status : '';
+        const activeFlag = wikiPage.frontmatter.active;
+        const isActive = status === 'open' || activeFlag === true;
+        if (isActive) {
           active.push(page);
         }
       } catch (err) {
@@ -410,6 +440,16 @@ export class ContextPacker {
    * @returns A {@link ContextPack}.
    */
   greedyPack(candidates: Candidate[], budget: number): ContextPack {
+    // Per spec: warn the caller about pathological budgets before packing,
+    // since the caller's downstream CLI will silently truncate context.
+    if (budget < 0) {
+      // eslint-disable-next-line no-console
+      console.warn(`[ContextPacker] token budget is ${String(budget)} (negative). No context will fit.`);
+    } else if (budget === 0 && candidates.length > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(`[ContextPacker] token budget is 0. no context will fit; all ${String(candidates.length)} candidate(s) will be excluded.`);
+    }
+
     const deduped = new Map<string, Candidate>();
     for (const c of candidates) {
       const existing = deduped.get(c.path);
@@ -425,6 +465,11 @@ export class ContextPacker {
     const reasons: Record<string, string> = {};
     let remaining = budget;
 
+    // Track priority >= 80 usage so we can warn when these forced inclusions
+    // exceed the configured budget (per spec: they remain in mustRead
+    // "regardless of budget", but the caller still needs to know).
+    let highPriorityTokens = 0;
+
     for (const c of sorted) {
       // Config-defined alwaysInclude files bypass the budget check entirely.
       if (c.reason === 'config.alwaysInclude') {
@@ -435,6 +480,7 @@ export class ContextPacker {
         // Priority >= 80 SHALL remain in mustRead regardless of budget (per spec).
         mustRead.push(c.path);
         remaining -= c.tokens;
+        highPriorityTokens += c.tokens;
         reasons[c.path] = c.reason;
       } else if (c.tokens <= remaining) {
         mustRead.push(c.path);
@@ -447,6 +493,12 @@ export class ContextPacker {
         excluded.push(c.path);
         reasons[c.path] = `budget exceeded, priority ${String(c.priority)} vs threshold 60`;
       }
+    }
+
+    // Per spec: warn when forced high-priority inclusions blow the budget.
+    if (highPriorityTokens > budget) {
+      // eslint-disable-next-line no-console
+      console.warn(`[ContextPacker] Priority >=80 total tokens (${String(highPriorityTokens)}) exceeds token budget (${String(budget)}). High-priority files were kept in mustRead regardless.`);
     }
 
     // Prevent remaining from going negative (defensive guard).
@@ -500,11 +552,19 @@ export class ContextPacker {
    * Resolve the schema definition for a change by reading its manifest.
    *
    * Falls back to the active config schema when the change manifest is unavailable.
+   * Results are memoized in {@link schemaCache} for the lifetime of one
+   * {@link packContext} call so that repeated lookups (e.g. artifact deps,
+   * scene-plan, continuity-report) share a single load.
    *
    * @param changeDir Change directory name (optional).
    * @returns Loaded SchemaDef, or undefined if unresolvable.
    */
   private async resolveChangeSchema(changeDir?: string): Promise<SchemaDef | undefined> {
+    const cacheKey = changeDir ?? '__active__';
+    if (this.schemaCache.has(cacheKey)) {
+      return this.schemaCache.get(cacheKey);
+    }
+    let resolved: SchemaDef | undefined;
     // Try change manifest first (per-change schema fidelity).
     if (changeDir) {
       try {
@@ -513,7 +573,9 @@ export class ContextPacker {
         const manifest = await manifestManager.readManifest(changePath);
         const schemaDir = join(this.projectRoot, 'adab', 'schemas', manifest.schema);
         const loader = new SchemaLoader(schemaDir);
-        return await loader.load();
+        resolved = await loader.load();
+        this.schemaCache.set(cacheKey, resolved);
+        return resolved;
       } catch {
         // Manifest unavailable; fall back to active config schema.
       }
@@ -523,11 +585,13 @@ export class ContextPacker {
       const schemaName = this.configLoader.getActiveSchema();
       const schemaDir = join(this.projectRoot, 'adab', 'schemas', schemaName);
       const loader = new SchemaLoader(schemaDir);
-      return await loader.load();
+      resolved = await loader.load();
     } catch (err) {
       console.warn('[ContextPacker] Failed to load schema:', err instanceof Error ? err.message : String(err));
-      return undefined;
+      resolved = undefined;
     }
+    this.schemaCache.set(cacheKey, resolved);
+    return resolved;
   }
 
   /**
@@ -574,7 +638,10 @@ export class ContextPacker {
 
    /**
     * Check whether the mention index is stale by comparing `.last-mention-indexed`
-    * against the most recent manuscript modification time.
+    * against the most recent modification time across ALL source directories
+    * (`manuscript`, `wiki`, `changes`, `raw`).  Per spec, all four contribute
+    * to staleness — a brand-new wiki edit or a freshly-written change document
+    * must trigger the warning just as a manuscript edit would.
     *
     * @returns Warning string if stale, otherwise `null`.
     */
@@ -589,23 +656,36 @@ export class ContextPacker {
       return 'Mention index timestamp is corrupt. Rebuild recommended.';
     }
 
-    const manuscriptDir = join(this.projectRoot, 'adab', 'manuscript');
+    // Per spec: scan manuscript, wiki, changes, and raw directories and use
+    // the global max mtime across all of them.  A missing subdirectory is
+    // treated as "no contribution" rather than an error.
+    const watchDirs = [
+      join(this.projectRoot, 'adab', 'manuscript'),
+      join(this.projectRoot, 'adab', 'wiki'),
+      join(this.projectRoot, 'adab', 'changes'),
+      join(this.projectRoot, 'adab', 'raw'),
+    ];
     const { glob } = await import('fast-glob');
-    const files = await glob('**/*.md', { cwd: manuscriptDir, onlyFiles: true, absolute: true });
     let maxMtime = 0;
-    for (const file of files) {
-      try {
-        const s = await stat(file);
-        if (s.mtimeMs > maxMtime) {
-          maxMtime = s.mtimeMs;
+    for (const dir of watchDirs) {
+      if (!(await fileExists(dir))) {
+        continue;
+      }
+      const files = await glob('**/*.md', { cwd: dir, onlyFiles: true, absolute: true });
+      for (const file of files) {
+        try {
+          const s = await stat(file);
+          if (s.mtimeMs > maxMtime) {
+            maxMtime = s.mtimeMs;
+          }
+        } catch (err) {
+          console.warn(`[ContextPacker] Skipped unreadable file during stale index check (${file}):`, err instanceof Error ? err.message : String(err));
         }
-      } catch (err) {
-        console.warn('[ContextPacker] Skipped unreadable manuscript file during stale index check:', err instanceof Error ? err.message : String(err));
       }
     }
 
     if (maxMtime > lastIndexed) {
-      return `Mention index is stale (last indexed ${new Date(lastIndexed).toISOString()}, manuscript updated ${new Date(maxMtime).toISOString()}). Run \`openadab sync\` to refresh.`;
+      return `Mention index is stale (last indexed ${new Date(lastIndexed).toISOString()}, sources updated ${new Date(maxMtime).toISOString()}). Run \`openadab sync\` to refresh.`;
     }
     return null;
   }
@@ -636,7 +716,12 @@ export class ContextPacker {
 
     const related = new Set<string>();
     for (const page of sourcePages) {
-      const key = page.replace(/\.md$/, '');
+      // Per spec: the wikilinks graph keys are always POSIX-style
+      // (forward slashes), but sourcePages may originate from
+      // `path.join` results on Windows which produce backslash
+      // separators.  Normalize before lookup so cross-platform
+      // tests exercise the same code path.
+      const key = page.replace(/\.md$/, '').replace(/\\/g, '/');
       const entry = graph[key];
       if (entry !== undefined) {
         for (const link of entry.links) {
