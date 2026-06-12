@@ -655,4 +655,101 @@ describe('ContextPacker', () => {
     expect(prev?.priority).toBe(50);
     expect(prev?.reason).toMatch(/last written: ch-001/);
   });
+
+  // ===== CP-DEDUP: candidate de-duplication by path =====
+  // The pre-fix greedyPack passed `candidates` straight through, so two
+  // sources that pointed at the same file (with different priorities)
+  // would both be included — leading to double-counted tokens, double
+  // reads of mustRead, and confused reasons.  The fix deduplicates by
+  // path and keeps the highest priority.
+  describe('CP-DEDUP candidate deduplication', () => {
+    function makeCand(path: string, priority: number, tokens = 100, reason = 'test'): Candidate {
+      return { path, priority, tokens, reason };
+    }
+
+    it('removes candidates with the same path; keeps the highest priority', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        makeCand('/x/a.md', 30, 50, 'low'),
+        makeCand('/x/a.md', 90, 50, 'high'),
+        makeCand('/x/b.md', 40, 50, 'b-only'),
+      ];
+      // Invoke greedyPack via reflection since it's a private method
+      const packed = (packer as any).greedyPack(candidates, 10000);
+      const aEntry = packed.reasons['/x/a.md'];
+      expect(aEntry).toBe('high');
+      // /x/a.md must appear exactly once across the three buckets
+      const occurrences = packed.mustRead.filter((p: string) => p === '/x/a.md').length
+        + packed.optionalRead.filter((p: string) => p === '/x/a.md').length
+        + packed.excluded.filter((p: string) => p === '/x/a.md').length;
+      expect(occurrences).toBe(1);
+    });
+
+    it('keeps the higher-priority reason string verbatim', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        makeCand('/y/c.md', 20, 10, 'from related entity'),
+        makeCand('/y/c.md', 85, 10, 'always-include but high prio'),
+      ];
+      const packed = (packer as any).greedyPack(candidates, 10000);
+      expect(packed.reasons['/y/c.md']).toBe('always-include but high prio');
+    });
+
+    it('does not blow up when two candidates share a path with the same priority', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        makeCand('/z/d.md', 50, 10, 'a'),
+        makeCand('/z/d.md', 50, 10, 'b'),
+      ];
+      const packed = (packer as any).greedyPack(candidates, 10000);
+      expect(packed.mustRead.length).toBeLessThanOrEqual(1);
+    });
+  });
+
+  // ===== CP-BUDGET-REASON: clear text for the two distinct exclusion causes =====
+  describe('CP-BUDGET-REASON exclusion reasons', () => {
+    function makeCand(path: string, priority: number, tokens = 100, reason = 'test'): Candidate {
+      return { path, priority, tokens, reason };
+    }
+
+    it('excluded reason mentions "forced inclusion of priority >=80" when high-priority tokens blow the budget', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        makeCand('/forced-1.md', 90, 600, 'forced A'),
+        makeCand('/forced-2.md', 85, 600, 'forced B'),
+        // low-priority filler that will be excluded
+        makeCand('/low.md', 30, 50, 'low'),
+      ];
+      const packed = (packer as any).greedyPack(candidates, 500);
+      const lowReason = packed.reasons['/low.md'] ?? '';
+      expect(lowReason).toContain('forced inclusion of priority >=80');
+      expect(lowReason).toContain('1200'); // 600 + 600 = 1200 tokens
+    });
+
+    it('excluded reason uses the standard "priority vs threshold" text when budget is exhausted by normal items', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        // priority < 60 and tokens fit, so it lands in mustRead and consumes 240 of the 250-token budget
+        makeCand('/must-1.md', 50, 240, 'm1'),
+        // priority < 60, tokens 50 > remaining 10, hits the standard budget-exceeded branch
+        makeCand('/low.md', 30, 50, 'low'),
+      ];
+      const packed = (packer as any).greedyPack(candidates, 250);
+      const lowReason = packed.reasons['/low.md'] ?? '';
+      expect(lowReason).toMatch(/budget exceeded.*priority 30.*threshold 60/);
+    });
+
+    it('priority-60 items are demoted to optionalRead (not excluded) when budget is tight', async () => {
+      const { packer } = await setupPacker();
+      const candidates: Candidate[] = [
+        // higher priority and tokens 60 <= 100 → mustRead, consuming 60 of the 100-token budget
+        makeCand('/m.md', 70, 60, 'm'),
+        // priority 60, tokens 50 > remaining 40 → does not fit, but priority >= 60 demotes to optionalRead
+        makeCand('/opt.md', 60, 50, 'opt'),
+      ];
+      const packed = (packer as any).greedyPack(candidates, 100);
+      expect(packed.optionalRead).toContain('/opt.md');
+      expect(packed.excluded).not.toContain('/opt.md');
+    });
+  });
 });

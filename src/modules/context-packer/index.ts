@@ -250,7 +250,14 @@ export class ContextPacker {
       }
     }
 
-    return candidates;
+    const deduped = new Map<string, Candidate>();
+    for (const c of candidates) {
+      const existing = deduped.get(c.path);
+      if (!existing || c.priority > existing.priority) {
+        deduped.set(c.path, c);
+      }
+    }
+    return Array.from(deduped.values());
   }
 
   /**
@@ -491,7 +498,11 @@ export class ContextPacker {
         reasons[c.path] = c.reason;
       } else {
         excluded.push(c.path);
-        reasons[c.path] = `budget exceeded, priority ${String(c.priority)} vs threshold 60`;
+        if (highPriorityTokens > budget) {
+          reasons[c.path] = `excluded: forced inclusion of priority >=80 (${String(highPriorityTokens)} tokens) exhausted budget`;
+        } else {
+          reasons[c.path] = `budget exceeded, priority ${String(c.priority)} vs threshold 60`;
+        }
       }
     }
 
