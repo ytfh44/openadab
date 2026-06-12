@@ -3,7 +3,9 @@
  * timeline of entity state changes, stored in `adab/index/progressions.json`.
  */
 import { join } from 'node:path';
+import { stat } from 'node:fs/promises';
 
+import glob from 'fast-glob';
 
 import { safeReadFile, atomicWriteFile, ensureDir } from '../../utils/fs.js';
 import { extractFrontmatter, extractSectionsByHeading } from '../../utils/markdown.js';
@@ -50,6 +52,12 @@ export interface ProgressionsIndex {
  */
 export class ProgressionTracker {
   private readonly projectRoot: string;
+  /**
+   * In-memory cache of `loadAllEvents` keyed by the mtimeMs of
+   * `progressions.json`.  PT-11: avoids re-globbing the entire
+   * `adab/changes/` tree on every read.
+   */
+  private eventsCache: { mtimeMs: number; chapters: ProgressionChapter[] } | null = null;
 
   /**
    * @param projectRoot Absolute path to the project root.
@@ -73,7 +81,10 @@ export class ProgressionTracker {
     const knowledgeSection = extractSectionsByHeading(raw, 'Character Knowledge');
     if (knowledgeSection !== null && knowledgeSection.length > 0) {
       for (const line of knowledgeSection.split('\n')) {
-        const match = /^-\s+(.+?)\s+now\s+knows?\s+(.+)$/i.exec(line);
+        // PT-4: skip lines that negate or revoke knowledge before pattern matching.
+        if (this.isNegatedKnowledgeLine(line)) {continue;}
+        // PT-12: accept knew / learned / has learned tenses in addition to `now knows`.
+        const match = /^-\s+(.+?)\s+(?:now\s+knows?|now\s+knew|knew|has\s+learned|learned|knows?)\s+(.+)$/i.exec(line);
         if (match !== null) {
           events.push(this.recordEvent({
             chapter,
@@ -120,6 +131,19 @@ export class ProgressionTracker {
   }
 
   /**
+   * Heuristic that decides whether a single `- Entity ...` line in the
+   * `## Character Knowledge` section is *negating* or *revoking* knowledge
+   * rather than asserting it.  PT-4 fix.
+   *
+   * @param line Raw Markdown bullet line, e.g. `- Alice does not know the secret`.
+   * @returns `true` if the line should be skipped when recording knowledge events.
+   */
+  private isNegatedKnowledgeLine(line: string): boolean {
+    const negationPattern = /\b(?:does\s+not|doesn't|did\s+not|didn't|do\s+not|don't|no\s+longer|never|forgot|forgets|lost\s+knowledge\s+of|forgotten)\b/i;
+    return negationPattern.test(line);
+  }
+
+  /**
    * Parse a wiki-diff and extract progression-relevant operations.
    *
    * The wiki-diff uses `### [[Entity]]` blocks with sub-sections:
@@ -135,23 +159,32 @@ export class ProgressionTracker {
     const raw = await safeReadFile(path);
     if (raw === null) {return [];}
     const events: ProgressionEvent[] = [];
-    const chapter = this.inferChapterFromPath(path);
+    const inferredChapter = this.inferChapterFromPath(path);
 
     const { data: frontmatter } = extractFrontmatter(raw);
-    const changeId = typeof frontmatter.changeId === 'string' ? frontmatter.changeId : chapter;
+    // PT-6: prefer the chapter inferred from the file path so that wiki-diff
+    // and continuity-report files under the same `adab/changes/ch-NNN/`
+    // directory end up in the same chapter bucket.
+    const changeId = this.normalizeChangeId(frontmatter.changeId, inferredChapter);
 
     // Parse each ### [[Entity]] block
     const lines = raw.split('\n');
+    // PT-10: use `null` to mean "no entity seen yet" so empty/whitespace
+    // targets can be rejected by a single `=== null` guard.
     let currentEntity: string | null = null;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
-      // Match ### [[entity/path]]
-      const entityMatch = /^###\s+\[\[(.+?)\]\]/.exec(line);
+      // Match ### [[entity/path]] (with optional `|alias`)
+      const entityMatch = /^###\s+\[\[([^\[\]|\n]+)(?:\|[^\]\n]*)?\]\]/.exec(line);
       if (entityMatch !== null) {
-        // Extract just the entity name (last path segment, without .md)
-        currentEntity = entityMatch[1].trim().replace(/\.md$/, '').split('/').pop() ?? '';
+        // PT-2: take only the target portion (alias discarded), then the
+        // last path segment without the `.md` extension.
+        const target = entityMatch[1].trim();
+        const tail = target.replace(/\.md$/i, '').split('/').pop() ?? '';
+        // PT-10: empty / whitespace-only entity names are ignored entirely.
+        currentEntity = tail.trim() === '' ? null : tail;
         continue;
       }
 
@@ -160,12 +193,13 @@ export class ProgressionTracker {
       // Match #### Update Thread Status
       if (/^####\s+Update Thread Status/i.test(line)) {
         let status = 'unknown';
-        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+        for (let j = i + 1; j < lines.length; j++) {
           const statusMatch = /^Status:\s*(\S+)/i.exec(lines[j]);
           if (statusMatch !== null) {
             status = statusMatch[1];
             break;
           }
+          if (/^#{1,6}\s/.test(lines[j])) {break;}
         }
         events.push(this.recordEvent({
           chapter: changeId,
@@ -179,12 +213,13 @@ export class ProgressionTracker {
       // Match #### Add to Current State
       if (/^####\s+Add to Current State/i.test(line)) {
         const contentParts: string[] = [];
-        for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
-          const contentMatch = /^-\s+(.+)/.exec(lines[j]);
+        // PT-9: scan to the next heading rather than a fixed 10-line window.
+        for (let j = i + 1; j < lines.length; j++) {
+          const next = lines[j];
+          if (/^#{1,6}\s/.test(next)) {break;}
+          const contentMatch = /^-\s+(.+)/.exec(next);
           if (contentMatch !== null) {
             contentParts.push(contentMatch[1].trim());
-          } else if (lines[j].startsWith('#')) {
-            break;
           }
         }
         if (contentParts.length > 0) {
@@ -199,21 +234,75 @@ export class ProgressionTracker {
 
       // Match #### Update Relationship
       if (/^####\s+Update Relationship/i.test(line)) {
-        const nextLine = lines[i + 1] ?? '';
-        const relMatch = /(.+?)\s+and\s+(.+?)\s+are\s+now\s+(.+)/i.exec(nextLine);
+        // PT-3: scan the whole sub-section (up to the next heading) and
+        // capture the first line that matches the relationship pattern.
+        const relMatch = this.findRelationshipInSection(lines, i + 1);
         if (relMatch !== null) {
           events.push(this.recordEvent({
             chapter: changeId,
             entity: currentEntity,
             type: 'relationship',
-            change: relMatch[3].trim(),
-            relatedEntity: relMatch[2].trim(),
+            change: relMatch.change,
+            relatedEntity: relMatch.relatedEntity,
           }));
         }
       }
     }
 
     return events;
+  }
+
+  /**
+   * Normalize the wiki-diff `changeId` frontmatter to a chapter identifier
+   * that is consistent with the value inferred from the file path.
+   *
+   * PT-6 fix: a `changeId` of `draft-ch-005` is rewritten to `ch-005` so
+   * that the wiki-diff events land in the same chapter bucket as the
+   * continuity-report parsed from the sibling `ch-005` folder.
+   *
+   * @param rawChangeId Value of the `changeId` frontmatter key, if any.
+   * @param inferredChapter Chapter inferred from the file path.
+   * @returns Canonical chapter identifier.
+   */
+  private normalizeChangeId(rawChangeId: unknown, inferredChapter: string): string {
+    if (typeof rawChangeId !== 'string' || rawChangeId.length === 0) {
+      return inferredChapter;
+    }
+    const chMatch = /ch-\d+/i.exec(rawChangeId);
+    if (chMatch !== null) {return chMatch[0];}
+    return inferredChapter;
+  }
+
+  /**
+   * Scan forward from `startIndex` looking for the first bullet line that
+   * matches a relationship description (`A and B are now ...`).
+   *
+   * PT-3 fix: previously the parser only inspected `lines[i+1]`, which
+   * missed the relationship description when it was separated from the
+   * `#### Update Relationship` heading by blank lines, HTML comments, or
+   * other non-matching content.
+   *
+   * @param lines All lines of the wiki-diff file.
+   * @param startIndex First line to consider (immediately after the heading).
+   * @returns Parsed relationship or `null` if none was found in the section.
+   */
+  private findRelationshipInSection(
+    lines: string[],
+    startIndex: number,
+  ): { entity: string; relatedEntity: string; change: string } | null {
+    for (let j = startIndex; j < lines.length; j++) {
+      const candidate = lines[j];
+      if (/^#{1,6}\s/.test(candidate)) {return null;}
+      const relMatch = /^-\s+(.+?)\s+and\s+(.+?)\s+are\s+now\s+(.+)$/i.exec(candidate);
+      if (relMatch !== null) {
+        return {
+          entity: relMatch[1].trim(),
+          relatedEntity: relMatch[2].trim(),
+          change: relMatch[3].trim(),
+        };
+      }
+    }
+    return null;
   }
 
   /**
@@ -249,9 +338,14 @@ export class ProgressionTracker {
    * @returns Chronologically ordered array of events.
    */
   async getProgression(entity: string): Promise<ProgressionEvent[]> {
+    // PT-7: re-sort by numeric chapter before returning, even when the
+    // on-disk `progressions.json` was written in an arbitrary order.
     const chapters = await this.loadAllEvents();
+    const sortedChapters = [...chapters].sort(
+      (a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter),
+    );
     const events: ProgressionEvent[] = [];
-    for (const chapter of chapters) {
+    for (const chapter of sortedChapters) {
       for (const ev of chapter.events) {
         if (ev.entity === entity || ev.relatedEntity === entity) {
           events.push(ev);
@@ -275,9 +369,37 @@ export class ProgressionTracker {
     }
 
     const contradictions: { existing: ProgressionEvent; new: ProgressionEvent; reason: string }[] = [];
+    // PT-1: thread_status events need the per-entity chain to know whether
+    // each event represents forward or backward progression; we cannot
+    // determine that from a single `(a, b)` pair when neither carries an
+    // explicit `from`.
+    const threadChains = this.buildThreadStatusChains(existingEvents, newEvents);
+    const newEventSet = new Set<ProgressionEvent>(newEvents);
     for (const newEv of newEvents) {
+      if (newEv.type !== 'thread_status') {continue;}
+      const chain = threadChains.get(newEv.entity);
+      if (chain === undefined) {continue;}
+      const newEntry = chain.find((c) => c.ev === newEv);
+      if (newEntry === undefined) {continue;}
       for (const oldEv of existingEvents) {
-        if (oldEv.entity === newEv.entity && oldEv.type === newEv.type) {
+        if (oldEv.type !== 'thread_status' || oldEv.entity !== newEv.entity) {continue;}
+        const oldEntry = chain.find((c) => c.ev === oldEv);
+        if (oldEntry === undefined) {continue;}
+        if (newEntry.isBackward !== oldEntry.isBackward) {
+          const newDir = newEntry.isBackward ? 'backward' : 'forward';
+          const oldDir = oldEntry.isBackward ? 'backward' : 'forward';
+          contradictions.push({
+            existing: oldEv,
+            new: newEv,
+            reason: `Contradictory thread_status ${newDir} progression for ${newEv.entity}: "${oldEv.change}" (${oldDir}) vs "${newEv.change}" (${newDir})`,
+          });
+        }
+      }
+    }
+    for (const newEv of newEvents) {
+      if (newEventSet.has(newEv) === false) {continue;}
+      for (const oldEv of existingEvents) {
+        if (oldEv.entity === newEv.entity && oldEv.type === newEv.type && newEv.type !== 'thread_status') {
           if (this.isContradictory(oldEv, newEv)) {
             contradictions.push({
               existing: oldEv,
@@ -330,12 +452,14 @@ export class ProgressionTracker {
     }
 
     const chapters = Array.from(chapterMap.values());
-    // M12: Numeric chapter sort
+    // M12: Numeric chapter sort (PT-8: `unknown` is pushed to the end via POSITIVE_INFINITY)
     chapters.sort((a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter));
     // Write progressions.json BEFORE .last-progression-indexed so a crash between writes
     // doesn't cause data loss on restart (B5 fix).
     await atomicWriteFile(indexPath, JSON.stringify({ chapters }, null, 2));
     await atomicWriteFile(lastIndexedPath, String(Date.now()));
+    // PT-11: invalidate the in-memory cache so the next read observes the new file.
+    this.eventsCache = null;
   }
 
   /**
@@ -403,11 +527,13 @@ export class ProgressionTracker {
     ];
     const aLower = a.change.toLowerCase();
     const bLower = b.change.toLowerCase();
+    // PT-5: use word-boundary matching so that words like "alliesome" or
+    // "undestroyed" do not trigger false positives.
     for (const [pos, neg] of opposites) {
-      const aPos = aLower.includes(pos);
-      const bNeg = bLower.includes(neg);
-      const aNeg = aLower.includes(neg);
-      const bPos = bLower.includes(pos);
+      const aPos = this.hasWord(aLower, pos);
+      const bNeg = this.hasWord(bLower, neg);
+      const aNeg = this.hasWord(aLower, neg);
+      const bPos = this.hasWord(bLower, pos);
       if ((aPos && bNeg) || (aNeg && bPos)) {return true;}
     }
     return false;
@@ -438,46 +564,112 @@ export class ProgressionTracker {
     ];
     const aLower = a.change.toLowerCase();
     const bLower = b.change.toLowerCase();
+    // PT-5: use word-boundary matching to avoid "undestroyed" matching "destroyed".
     for (const [pos, neg] of stateOpposites) {
-      const aPos = aLower.includes(pos);
-      const bNeg = bLower.includes(neg);
-      const aNeg = aLower.includes(neg);
-      const bPos = bLower.includes(pos);
+      const aPos = this.hasWord(aLower, pos);
+      const bNeg = this.hasWord(bLower, neg);
+      const aNeg = this.hasWord(aLower, neg);
+      const bPos = this.hasWord(bLower, pos);
       if ((aPos && bNeg) || (aNeg && bPos)) {return true;}
     }
     return false;
   }
 
   /**
-   * Check thread status contradiction: one event shows backward progression
-   * (resolved → open) while another shows forward progression.
+   * Check thread status contradiction between two same-entity events.
+   *
+   * PT-1 fix: previously the function returned `false` whenever either
+   * event lacked an explicit `from` field.  `parseWikiDiff` only writes
+   * `to`, so detection was effectively disabled.  The richer per-entity
+   * chain analysis is performed by {@link detectContradictions} which
+   * builds a chronologically-sorted history first; this helper is now
+   * unused but kept (it still answers `(a, b)` correctly when both carry
+   * explicit `from` / `to` values).
    */
   private isThreadStatusContradictory(a: ProgressionEvent, b: ProgressionEvent): boolean {
+    if (a.type !== 'thread_status' || b.type !== 'thread_status') {return false;}
+    if (a.entity !== b.entity) {return false;}
     if (a.from === undefined || a.to === undefined || b.from === undefined || b.to === undefined) {
       return false;
     }
-    const rank: Record<string, number> = { open: 0, advanced: 1, resolved: 2 };
-    const aFromRank = rank[a.from];
-    const aToRank = rank[a.to];
-    const bFromRank = rank[b.from];
-    const bToRank = rank[b.to];
-    if (aFromRank === undefined || aToRank === undefined || bFromRank === undefined || bToRank === undefined) {
-      return false;
-    }
-    const aIsBackward = aToRank < aFromRank;
-    const bIsBackward = bToRank < bFromRank;
+    const aIsBackward = this.isThreadStatusTransitionBackward(a.from, a.to);
+    const bIsBackward = this.isThreadStatusTransitionBackward(b.from, b.to);
     return aIsBackward !== bIsBackward;
+  }
+
+  /**
+   * Compare two thread-status values and decide whether moving from `from`
+   * to `to` represents a *backward* progression.  `open` (0) → `advanced`
+   * (1) → `resolved` (2); any transition with a lower rank on the right
+   * side is a regression.
+   */
+  private isThreadStatusTransitionBackward(from: string | undefined, to: string | undefined): boolean {
+    const rank: Record<string, number> = { open: 0, advanced: 1, resolved: 2 };
+    if (from === undefined || to === undefined) {return false;}
+    const fromRank = rank[from];
+    const toRank = rank[to];
+    if (fromRank === undefined || toRank === undefined) {return false;}
+    return toRank < fromRank;
+  }
+
+  /**
+   * Build a chapter-sorted chain of all `thread_status` events relevant to
+   * {@link detectContradictions} (existing + newly supplied).  Each entry
+   * carries an `isBackward` flag that is computed by walking the chain
+   * and using each event's own `from` (when present) or the previous
+   * same-entity event's `to` as the effective starting point.
+   */
+  private buildThreadStatusChains(
+    existing: ProgressionEvent[],
+    incoming: ProgressionEvent[],
+  ): Map<string, Array<{ ev: ProgressionEvent; isBackward: boolean }>> {
+    const all = [...existing, ...incoming].filter((ev) => ev.type === 'thread_status');
+    all.sort((a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter));
+    const byEntity = new Map<string, Array<{ ev: ProgressionEvent; isBackward: boolean }>>();
+    for (const ev of all) {
+      const list = byEntity.get(ev.entity);
+      const prev = list === undefined ? undefined : list[list.length - 1];
+      const effectiveFrom = ev.from ?? prev?.ev.to;
+      const isBackward = this.isThreadStatusTransitionBackward(effectiveFrom, ev.to);
+      const entry = { ev, isBackward };
+      if (list === undefined) {
+        byEntity.set(ev.entity, [entry]);
+      } else {
+        list.push(entry);
+      }
+    }
+    return byEntity;
+  }
+
+  /**
+   * Word-boundary test used by the relationship / state contradiction
+   * checks.  PT-5: a plain `String.prototype.includes` match would also
+   * fire on substrings (e.g. `alliesome`, `undestroyed`), so we wrap the
+   * multi-word phrases in `\b...\b`.
+   *
+   * @param haystack Lower-cased change text.
+   * @param needle   Lower-cased word or phrase to look for.
+   * @returns `true` when `needle` occurs as a whole word inside `haystack`.
+   */
+  private hasWord(haystack: string, needle: string): boolean {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i').test(haystack);
   }
 
   /**
    * Extract numeric chapter number from a chapter ID like "ch-012".
    *
+   * PT-8 fix: unparseable values (e.g. `"unknown"`) now resolve to
+   * `Number.POSITIVE_INFINITY` so they sort *after* every numbered chapter
+   * in numeric ascending order.  The previous `0` caused unknown-chapter
+   * events to appear *before* `ch-001`.
+   *
    * @param chapter Chapter identifier.
-   * @returns Numeric chapter number, or 0 if unparseable.
+   * @returns Numeric chapter number, or `Number.POSITIVE_INFINITY` when unparseable.
    */
   private extractChapterNumber(chapter: string): number {
     const match = /ch-(\d+)/i.exec(chapter);
-    return match ? parseInt(match[1], 10) : 0;
+    return match ? parseInt(match[1], 10) : Number.POSITIVE_INFINITY;
   }
 
   /**
@@ -494,24 +686,50 @@ export class ProgressionTracker {
   /**
    * Load all progression events from existing `progressions.json` or rebuild.
    *
+   * PT-11: the parsed result is memoised in memory, keyed by the mtime of
+   * `progressions.json`.  Subsequent calls with an unchanged file return
+   * the cached array without re-globbing the change tree.
+   *
    * @returns Array of chapter-grouped events.
    */
   private async loadAllEvents(): Promise<ProgressionChapter[]> {
     const indexPath = join(this.projectRoot, 'adab', 'index', 'progressions.json');
     const raw = await safeReadFile(indexPath);
     if (raw !== null) {
+      let mtimeMs = 0;
+      try {
+        const s = await stat(indexPath);
+        mtimeMs = s.mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      if (this.eventsCache !== null && this.eventsCache.mtimeMs === mtimeMs) {
+        return this.eventsCache.chapters;
+      }
       try {
         const parsed: unknown = JSON.parse(raw);
-        if (Array.isArray(parsed)) {return parsed as ProgressionChapter[];}
-        if (typeof parsed === 'object' && parsed !== null && 'chapters' in parsed) {
-          return (parsed as ProgressionsIndex).chapters;
+        let chapters: ProgressionChapter[];
+        if (Array.isArray(parsed)) {
+          chapters = parsed as ProgressionChapter[];
+        } else if (typeof parsed === 'object' && parsed !== null && 'chapters' in parsed) {
+          chapters = (parsed as ProgressionsIndex).chapters;
+        } else {
+          console.warn('[ProgressionTracker] Unexpected progressions.json format, rebuilding');
+          chapters = await this.collectEventsFromChanges();
         }
-        console.warn('[ProgressionTracker] Unexpected progressions.json format, rebuilding');
+        // PT-7: keep the cached output chronologically ordered.
+        chapters.sort(
+          (a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter),
+        );
+        this.eventsCache = { mtimeMs, chapters };
+        return chapters;
       } catch (err) {
         console.warn('[ProgressionTracker] Failed to parse progressions.json, rebuilding:', err instanceof Error ? err.message : String(err));
       }
     }
-    return this.collectEventsFromChanges();
+    const rebuilt = await this.collectEventsFromChanges();
+    this.eventsCache = { mtimeMs: -1, chapters: rebuilt };
+    return rebuilt;
   }
 
   /**
@@ -521,8 +739,6 @@ export class ProgressionTracker {
    * @returns Array of chapter-grouped events.
    */
   private async collectEventsFromChanges(cutoff = 0): Promise<ProgressionChapter[]> {
-    const { glob } = await import('fast-glob');
-    const { stat } = await import('node:fs/promises');
     const reportPaths = await glob('**/continuity-report.md', {
       cwd: join(this.projectRoot, 'adab', 'changes'),
       onlyFiles: true,
@@ -544,6 +760,8 @@ export class ProgressionTracker {
         continue;
       }
       const events = await this.parseContinuityReport(path);
+      // PT-6: chapter key is sourced from the parsed event (already inferred from path)
+      // rather than mixed with the wiki-diff frontmatter `changeId`.
       for (const ev of events) {
         if (!chapterMap.has(ev.chapter)) {chapterMap.set(ev.chapter, []);}
         const arr = chapterMap.get(ev.chapter);
@@ -572,7 +790,7 @@ export class ProgressionTracker {
     for (const [chapter, events] of chapterMap) {
       chapters.push({ chapter, events });
     }
-    // M12: Numeric chapter sort
+    // M12: Numeric chapter sort (PT-8 puts `unknown` at the end).
     chapters.sort((a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter));
     return chapters;
   }
