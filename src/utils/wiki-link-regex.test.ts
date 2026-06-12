@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
-import { extractWikiTargets } from './wiki-link-regex.js';
+import { WIKI_LINK_RE, extractWikiTargets } from './wiki-link-regex.js';
+import { extractWikiLinks } from './markdown.js';
 
 describe('extractWikiTargets', () => {
   it('should capture a basic [[Foo]] link', () => {
@@ -41,5 +42,37 @@ describe('extractWikiTargets', () => {
 
   it('should not let `]` inside alias break target extraction', () => {
     expect(extractWikiTargets('[[Foo|[link]]]')).toEqual(['Foo']);
+  });
+});
+
+describe('WIKI_LINK_RE shared constant', () => {
+  // ensure wiki-link-regex and markdown.extractWikiLinks use the
+  // same shape of pattern.  If we ever drift them apart, these guards fail.
+  it('exposes a global RegExp', () => {
+    expect(WIKI_LINK_RE).toBeInstanceOf(RegExp);
+    expect(WIKI_LINK_RE.flags).toContain('g');
+  });
+
+  it('matches the same links as markdown.extractWikiLinks', () => {
+    const samples = [
+      '[[Foo]]',
+      '[[A]] and [[B]]',
+      '[[Target|Alias]]',
+      '[[Alice the Wanderer]]',
+      'plain text',
+      '[[alice-v2_test]]',
+    ];
+    for (const s of samples) {
+      expect(extractWikiTargets(s)).toEqual(extractWikiLinks(s));
+    }
+  });
+
+  it('excludes code-fenced links in the markdown variant only', () => {
+    // extractWikiTargets in the wiki-link-regex util intentionally does NOT
+    // strip inline code blocks; that is the markdown wrapper's job.  This
+    // test documents the intentional difference.
+    const sample = '`[[Foo]]`';
+    expect(extractWikiTargets(sample)).toEqual(['Foo']);
+    expect(extractWikiLinks(sample)).toEqual([]);
   });
 });
