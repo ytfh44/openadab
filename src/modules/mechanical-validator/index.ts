@@ -12,6 +12,7 @@ import type { SchemaDef, ArtifactDef } from '../../schemas/schema-def.js';
 import type { ValidationResult, ProjectConfig } from '../../schemas/types.js';
 import { safeReadFile, fileExists } from '../../utils/fs.js';
 import { extractFrontmatter, extractWikiLinks } from '../../utils/markdown.js';
+import { TargetNotFoundError } from '../../utils/errors.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 
@@ -39,6 +40,13 @@ export class MechanicalValidator {
   private readonly projectConfig: ProjectConfig | undefined;
   private readonly wikiEngine: WikiEngine | undefined;
   private readonly projectRoot: string;
+  /**
+   * Per-`validateChange`-call cache for the loaded schema. Populated lazily on
+   * the first `getSchema()` invocation and cleared at the entry of
+   * `validateChange` so that re-runs always observe the latest schema
+   * (e.g. after `update --schemas`).
+   */
+  private schemaCache: SchemaDef | null = null;
 
   /**
    * @param schemaEngine  Optional schema engine for loading the active schema.
@@ -99,9 +107,7 @@ export class MechanicalValidator {
     }
 
     const rules = this.parseRules(
-      this.schemaEngine
-        ? (await this.schemaEngine.load()).artifacts.find((a) => a.id === artifactId)
-        : undefined
+      (await this.getSchema())?.artifacts.find((a) => a.id === artifactId)
     );
     if (rules.requireNonEmpty === true) {
       const nonEmpty = await this.requireNonEmpty(changeDir, artifactId);
@@ -135,7 +141,8 @@ export class MechanicalValidator {
    *          aggregate `artifactId: 'all'` entry.
    */
   async validateChange(changeDir: string): Promise<ValidationResult[]> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    this.schemaCache = null;
+    const schema = await this.getSchema();
     if (!schema) {
       return [];
     }
@@ -184,7 +191,7 @@ export class MechanicalValidator {
    * @returns Validation result.
    */
   async requireNonEmpty(changeDir: string, artifactId: string): Promise<ValidationResult> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
     const fileName = art?.generates ?? `${artifactId}.md`;
     const filePath = join(changeDir, fileName);
@@ -206,7 +213,7 @@ export class MechanicalValidator {
    * @returns Validation result.
    */
   async fileExists(changeDir: string, artifactId: string): Promise<ValidationResult> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
     const fileName = art?.generates ?? `${artifactId}.md`;
     const filePath = join(changeDir, fileName);
@@ -255,7 +262,7 @@ export class MechanicalValidator {
    * @returns Validation result.
    */
   async frontmatterPresent(changeDir: string, artifactId: string): Promise<ValidationResult> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
     if (!art?.validation?.mechanical?.includes('frontmatterPresent')) {
       return { artifactId, passed: true, errors: [], warnings: [] };
@@ -304,7 +311,7 @@ export class MechanicalValidator {
    *          counts are surfaced via `warnings`.
    */
   async wordCount(changeDir: string, artifactId: string): Promise<ValidationResult> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
     const fileName = art?.generates ?? `${artifactId}.md`;
     const filePath = join(changeDir, fileName);
@@ -345,7 +352,7 @@ export class MechanicalValidator {
    * @returns Validation result.
    */
   async wikiLinkValidity(changeDir: string, artifactId: string): Promise<ValidationResult> {
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
     const fileName = art?.generates ?? `${artifactId}.md`;
     const filePath = join(changeDir, fileName);
@@ -369,8 +376,20 @@ export class MechanicalValidator {
           await this.wikiEngine.readPage(pagePath);
           exists = true;
         } catch (err) {
-          console.warn('[MechanicalValidator] Wiki link target not found:', err instanceof Error ? err.message : String(err));
-          exists = false;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (err instanceof TargetNotFoundError || (err instanceof Error && err.name === 'TargetNotFoundError')) {
+            console.warn('[MechanicalValidator] Wiki link target not found:', msg);
+          } else {
+            // A non-TargetNotFoundError exception signals a wiki-engine
+            // internal failure (e.g. EACCES, ENOENT on a parent dir).
+            // Surface it as its own error so a true engine failure is
+            // not silently relabelled as a "Broken wiki link".  The
+            // "Broken wiki link" line is still pushed below because the
+            // engine did not confirm the target exists, but the caller
+            // can distinguish the two by error string.
+            console.warn('[MechanicalValidator] Wiki link check failed:', msg);
+            errors.push(`Wiki link check failed: ${msg}`);
+          }
         }
       } else {
         const targetPath = join(this.projectRoot, 'adab', 'wiki', pagePath);
@@ -526,6 +545,29 @@ export class MechanicalValidator {
   }
 
   /**
+   * Return the active schema, loading it on first access within a
+   * `validateChange` call and memoising the result for subsequent calls.
+   *
+   * Returns `undefined` when no `schemaEngine` was provided to the
+   * constructor, or when `load()` throws (e.g. the schema file is missing).
+   * On load failure the cache is reset to `null` so that the next call
+   * retries from disk instead of returning a stale undefined value.
+   *
+   * @returns The loaded `SchemaDef`, or `undefined` when unavailable.
+   */
+  private async getSchema(): Promise<SchemaDef | undefined> {
+    if (!this.schemaEngine) {return undefined;}
+    if (this.schemaCache !== null) {return this.schemaCache;}
+    try {
+      this.schemaCache = await this.schemaEngine.load();
+      return this.schemaCache;
+    } catch {
+      this.schemaCache = null;
+      return undefined;
+    }
+  }
+
+  /**
    * Parse mechanical validation rules from an artifact definition.
    *
    * Behavior is opt-in: `requireNonEmpty` defaults to `false` and is only set
@@ -572,7 +614,7 @@ export class MechanicalValidator {
    */
   async validateDependencies(manifestArtifacts: Record<string, string>): Promise<ValidationResult> {
     const errors: string[] = [];
-    const schema = this.schemaEngine ? await this.schemaEngine.load() : undefined;
+    const schema = await this.getSchema();
     if (!schema) {
       return { artifactId: 'dependencies', passed: true, errors: [], warnings: [] };
     }

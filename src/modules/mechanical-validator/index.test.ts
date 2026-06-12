@@ -639,4 +639,123 @@ describe('MechanicalValidator', () => {
       expect(result.errors).toHaveLength(0);
     });
   });
+
+  // ===== MV-CACHE: schema is loaded once per validateChange call =====
+  // The pre-fix code called `this.schemaEngine.load()` for every
+  // individual rule (fileExists, wordCount, frontmatterPresent, ...).
+  // For a 5-artifact change that meant 5 disk reads.  The fix adds a
+  // per-`validateChange` cache; this test pins that down.
+  describe('MV-CACHE schema caching', () => {
+    it('schemaEngine.load is called at most once per validateChange invocation', async () => {
+      const { root, validator, schemaEngine } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nBody with enough words here to pass minWords.');
+
+      await validator.validateChange(changeDir);
+      const calls = (schemaEngine.load as ReturnType<typeof vi.fn>).mock.calls.length;
+      // Even with multiple per-artifact checks, the cache must keep
+      // the call count at exactly 1.
+      expect(calls).toBe(1);
+    });
+
+    it('a new validateChange call refreshes the cache (re-loads schema)', async () => {
+      const { root, validator, schemaEngine } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nBody with enough words.');
+
+      await validator.validateChange(changeDir);
+      const callsAfterFirst = (schemaEngine.load as ReturnType<typeof vi.fn>).mock.calls.length;
+      expect(callsAfterFirst).toBe(1);
+
+      // Mutate the underlying schema between calls to simulate
+      // a `update --schemas` workflow that the spec requires to be
+      // observed by subsequent validateChange calls.
+      const newSchema: SchemaDef = {
+        name: 'test-v2',
+        version: 2,
+        artifacts: [
+          { id: 'draft', generates: 'draft.md', requires: [], validation: { mechanical: ['minWords:50', 'maxWords:200'] } },
+        ],
+      };
+      (schemaEngine.load as ReturnType<typeof vi.fn>).mockResolvedValue(newSchema);
+
+      await validator.validateChange(changeDir);
+      const callsAfterSecond = (schemaEngine.load as ReturnType<typeof vi.fn>).mock.calls.length;
+      // The cache MUST be reset between calls — otherwise the
+      // post-update schema is never observed.
+      expect(callsAfterSecond).toBe(2);
+    });
+  });
+
+  // ===== MV-WIKILINK: classify TargetNotFoundError vs other failures =====
+  describe('MV-WIKILINK wiki link error classification', () => {
+    it('distinguishes missing-target (broken link) from wiki-engine internal failure', async () => {
+      // wikiEngine that throws TargetNotFoundError for some links
+      // and a generic Error for others.
+      const wikiEngine = {
+        listPages: vi.fn().mockResolvedValue(['Existing.md']),
+        readPage: vi.fn().mockImplementation((p: string) => {
+          if (p === 'Existing.md') {return Promise.resolve({ frontmatter: { name: 'Existing' }, body: 'x' });}
+          const err = new Error('wiki internal failure') as Error & { name: string };
+          err.name = 'EACCES';
+          return Promise.reject(err);
+        }),
+      };
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-wl-'));
+      const schema: SchemaDef = {
+        name: 't', version: 1,
+        artifacts: [
+          { id: 'wiki-diff', generates: 'wiki-diff.md', requires: [] },
+          { id: 'draft', generates: 'draft.md', requires: [] },
+        ],
+      };
+      const validator = new MechanicalValidator(
+        { load: vi.fn().mockResolvedValue(schema) },
+        { project: { language: 'en-US' } },
+        wikiEngine as unknown as WikiEngine,
+        root,
+      );
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'wiki-diff.md'), '---\ntitle: X\n---\n\nSee [[Existing]] and [[MissingOne]].');
+      const result = await validator.wikiLinkValidity(changeDir, 'wiki-diff');
+      // The missing link should be reported as "Broken wiki link"
+      // but the wiki engine internal failure should also surface
+      // as an error (not a silent "broken link" misclassification).
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('Broken wiki link'))).toBe(true);
+      expect(result.errors.some((e) => e.includes('Wiki link check failed'))).toBe(true);
+    });
+
+    it('TargetNotFoundError specifically produces "Broken wiki link" only', async () => {
+      const wikiEngine = {
+        listPages: vi.fn().mockResolvedValue([]),
+        readPage: vi.fn().mockImplementation(() => {
+          const err = new Error('not found') as Error & { name: string };
+          err.name = 'TargetNotFoundError';
+          return Promise.reject(err);
+        }),
+      };
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-wl2-'));
+      const schema: SchemaDef = {
+        name: 't', version: 1,
+        artifacts: [{ id: 'wiki-diff', generates: 'wiki-diff.md', requires: [] }],
+      };
+      const validator = new MechanicalValidator(
+        { load: vi.fn().mockResolvedValue(schema) },
+        { project: { language: 'en-US' } },
+        wikiEngine as unknown as WikiEngine,
+        root,
+      );
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'wiki-diff.md'), '---\ntitle: X\n---\n\nSee [[Missing]].');
+      const result = await validator.wikiLinkValidity(changeDir, 'wiki-diff');
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('Broken wiki link'))).toBe(true);
+      expect(result.errors.some((e) => e.includes('Wiki link check failed'))).toBe(false);
+    });
+  });
 });
