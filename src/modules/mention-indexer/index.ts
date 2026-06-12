@@ -281,9 +281,8 @@ export class MentionIndexer {
     const seenLines = new Map<string, Set<number>>();
 
     const hasCRLF = raw.includes('\r\n');
-    const lineSepLen = hasCRLF ? 2 : 1;
 
-    let byteOffset = 0;
+    let searchFrom = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       for (const { regex } of this.compiledPatterns) {
@@ -295,7 +294,7 @@ export class MentionIndexer {
           if (!candidateEntities) {
             continue;
           }
-          const context = this.extractContext(raw, byteOffset + match.index, match[0].length, hasCRLF);
+          const context = this.extractContext(raw, searchFrom + match.index, match[0].length, hasCRLF);
           for (const entity of candidateEntities) {
             if (!results.has(entity)) {
               results.set(entity, []);
@@ -310,7 +309,12 @@ export class MentionIndexer {
           }
         }
       }
-      byteOffset += line.length + lineSepLen;
+      searchFrom += line.length;
+      if (raw.startsWith('\r\n', searchFrom)) {
+        searchFrom += 2;
+      } else if (raw[searchFrom] === '\n') {
+        searchFrom += 1;
+      }
     }
 
     return results;
@@ -334,21 +338,31 @@ export class MentionIndexer {
   extractContext(content: string, matchIndex: number, matchLength: number, hasCRLF = false): string {
     const paraSep = hasCRLF ? '\r\n\r\n' : '\n\n';
     const paraSepLen = hasCRLF ? 4 : 2;
+    const lineSep = hasCRLF ? '\r\n' : '\n';
+    const lineSepLen = hasCRLF ? 2 : 1;
     const beforeStart = Math.max(0, matchIndex - 50);
     const afterEnd = Math.min(content.length, matchIndex + matchLength + 50);
 
     let start = beforeStart;
-    if (start > 0) {
-      const prevNewline = content.lastIndexOf(paraSep, matchIndex);
-      if (prevNewline !== -1 && prevNewline + paraSepLen > start) {
-        start = prevNewline + paraSepLen;
+    const prevPara = content.lastIndexOf(paraSep, matchIndex);
+    if (prevPara !== -1 && prevPara + paraSepLen > start) {
+      start = prevPara + paraSepLen;
+    } else {
+      const prevLine = content.lastIndexOf(lineSep, matchIndex);
+      if (prevLine !== -1 && prevLine + lineSepLen > start) {
+        start = prevLine + lineSepLen;
       }
     }
 
     let end = afterEnd;
-    const nextNewline = content.indexOf(paraSep, matchIndex + matchLength);
-    if (nextNewline !== -1 && nextNewline < end) {
-      end = nextNewline;
+    const nextPara = content.indexOf(paraSep, matchIndex + matchLength);
+    if (nextPara !== -1 && nextPara < end) {
+      end = nextPara;
+    } else {
+      const nextLine = content.indexOf(lineSep, matchIndex + matchLength);
+      if (nextLine !== -1 && nextLine < end) {
+        end = nextLine;
+      }
     }
 
     const sliced = content.slice(start, end).replace(/\s+/g, ' ').trim();

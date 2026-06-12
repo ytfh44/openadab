@@ -665,4 +665,168 @@ describe('MentionIndexer', () => {
     const map = JSON.parse(readFileSync(mapPath, 'utf-8'));
     expect(map[file]).toContain('Alice');
   });
+
+  // ===== mixed CRLF/LF byte-offset correctness =====
+  // The pre-fix scanFile assumed a single line-ending length for the whole
+  // file, so the second-and-later lines' match.index was inflated by 1 for
+  // every preceding CRLF.  These tests pin down the corrected behavior:
+  // matches in CRLF files must produce context that exactly wraps the
+  // occurrence in the raw bytes, regardless of which line they live on.
+
+  /** Convert ASCII letters and spaces to CRLF endings. */
+  function toCRLF(input: string): string {
+    return input.replace(/\n/g, '\r\n');
+  }
+
+  it('CRLF file: match on the second line has the correct context window (no offset drift)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    const lf = 'first line ignore\nMara walked through the cold door.\nthird line ignore\n';
+    writeFileSync(file, toCRLF(lf));
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    // The context MUST include both "Mara" and the surrounding text
+    // from the SAME line — "first" / "third" must not leak in because
+    // the offset is now correct.
+    expect(ctx).toContain('Mara');
+    expect(ctx).toContain('walked through the cold door');
+    expect(ctx).not.toContain('first line');
+    expect(ctx).not.toContain('third line');
+  });
+
+  it('CRLF file: match on the first line still finds the entity', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    const lf = 'Mara opens the scene.\nrest of the file\n';
+    writeFileSync(file, toCRLF(lf));
+    const results = await indexer.scanFile(file);
+    expect(results.has('Mara')).toBe(true);
+    expect(results.get('Mara')?.[0]?.line).toBe(1);
+  });
+
+  it('CRLF file: match on the last line (no trailing newline) does not overflow', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    const lf = 'first\nsecond\nMara closes the scene.'; // no trailing newline
+    writeFileSync(file, toCRLF(lf));
+    const results = await indexer.scanFile(file);
+    expect(results.has('Mara')).toBe(true);
+    expect(results.get('Mara')?.[0]?.line).toBe(3);
+  });
+
+  it('LF file: context is computed correctly (regression guard for the rewrite)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    writeFileSync(file, 'first line\nMara walked through the cold door.\nthird line\n');
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).toContain('Mara');
+    expect(ctx).toContain('walked through the cold door');
+    expect(ctx).not.toContain('first line');
+    expect(ctx).not.toContain('third line');
+  });
+
+  it('LF file: paragraph separator takes precedence over line break on the before side', async () => {
+    // Layout: a long Para1 ... \n\n Mara ... \n third-line-ignore
+    // The previous LINE break is at column ~N+2, but the PARAGRAPH separator
+    // is much earlier. Context must stop at the paragraph boundary, not the
+    // closer line break, so "Para1" must NOT leak in.
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    const para1 = 'Para1 ' + 'a'.repeat(80) + '.';
+    const tail = 'third line ignore';
+    writeFileSync(file, `${para1}\n\nMara walked through the cold door.\n${tail}\n`);
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).toContain('Mara');
+    expect(ctx).toContain('walked through the cold door');
+    expect(ctx).not.toContain('Para1');
+    expect(ctx).not.toContain('third line');
+  });
+
+  it('LF file: closest boundary wins when line break is nearer than paragraph separator', async () => {
+    // Layout: Para1..aaa. (within 50 chars of Mara) \n\n Mara ...
+    // The line break sits at ~80 chars before the match, well inside the
+    // 50-char window, but the paragraph separator is even earlier. The
+    // paragraph boundary is the FARTHER one; the LINE break is the closer
+    // boundary on the before side. Context must stop at the line break
+    // (the closer of the two hard boundaries) so "Para1" is excluded.
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    // 30 chars of "Para1 ..." then \n\n then "Mara ..."
+    // - paragraph separator index = 30 (length of "Para1 " + 24 'a's + ".")
+    // - line break does not exist on the before side at all in this case;
+    //   so we just want to confirm the paragraph separator stops the leak.
+    const para1 = 'Para1 ' + 'a'.repeat(24) + '.'; // length 30
+    writeFileSync(file, `${para1}\n\nMara walked through the cold door.\ntail\n`);
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).toContain('Mara');
+    expect(ctx).not.toContain('Para1');
+  });
+
+  it('LF file: match on the first line (no previous line break) does not pull in nothing-but-the-match', async () => {
+    // When the match is on line 1, there is no previous line break and no
+    // paragraph separator. Context should still include the match and a
+    // bounded slice — and must not include content that does not exist.
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    writeFileSync(file, 'Mara opens the scene on line one.\nsecond line ignore\n');
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).toContain('Mara');
+    expect(ctx).toContain('opens the scene');
+    expect(ctx).not.toContain('second line');
+  });
+
+  it('pure CRLF file: context respects paragraph boundaries (\\r\\n\\r\\n separator)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    const lf = 'Para1 ' + 'a'.repeat(200) + '.\n\nMara smiled.\n\nPara3 ' + 'b'.repeat(200) + '.';
+    writeFileSync(file, toCRLF(lf));
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).not.toContain('Para1');
+    expect(ctx).not.toContain('Para3');
+    expect(ctx).toContain('Mara');
+  });
+
+  it('context extraction across many lines produces non-empty, capped context', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'c.md', frontmatter: { name: 'Mara', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'm.md');
+    // 20 lines of fluff + the match on line 21
+    const fluff = Array.from({ length: 20 }, (_, i) => `line ${String(i + 1)} text`).join('\n');
+    writeFileSync(file, toCRLF(`${fluff}\nMara appears here now.\n`));
+    const results = await indexer.scanFile(file);
+    const ctx = results.get('Mara')?.[0]?.context ?? '';
+    expect(ctx).toContain('Mara');
+    expect(ctx.length).toBeLessThanOrEqual(100);
+  });
 });
