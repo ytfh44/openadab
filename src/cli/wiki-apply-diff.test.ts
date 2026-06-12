@@ -2,10 +2,10 @@
  * Unit tests for `wiki apply-diff` CLI option resolution and conflict detection.
  *
  * Covers:
- *  - Bug 3: dryRun flag priority is reversed when both `--apply` and
+ *  - dryRun flag priority is reversed when both `--apply` and
  *    `--dry-run` are passed. After the fix, `--apply` always wins and the
  *    operation writes changes (dryRun=false).
- *  - Bug 4: `--apply` and `--dry-run` are not declared as mutually exclusive
+ *  - `--apply` and `--dry-run` are not declared as mutually exclusive
  *    in Commander. After the fix, passing both should make Commander reject
  *    the input as a usage error and the action handler should not run.
  */
@@ -43,7 +43,7 @@ async function scaffoldProject(): Promise<{ projectRoot: string; diffPath: strin
   return { projectRoot, diffPath: join(changeDir, 'wiki-diff.md') };
 }
 
-describe('resolveApplyDryRun (Bug 3 — dryRun flag priority)', () => {
+describe('resolveApplyDryRun (dryRun flag priority)', () => {
   it('dryRun=false when only --apply is passed', () => {
     expect(resolveApplyDryRun({ apply: true })).toBe(false);
   });
@@ -65,7 +65,7 @@ describe('resolveApplyDryRun (Bug 3 — dryRun flag priority)', () => {
   });
 });
 
-describe('CLI wiki apply-diff dryRun integration (Bug 3)', () => {
+describe('CLI wiki apply-diff dryRun integration', () => {
   let projectRoot: string;
   let diffPath: string;
   let applySpy: ReturnType<typeof vi.spyOn>;
@@ -137,14 +137,14 @@ describe('CLI wiki apply-diff dryRun integration (Bug 3)', () => {
     expect(applySpy.mock.calls[0]?.[1]).toBe(true);
   });
 
-  it('passes dryRun=false to WikiDiffApplier.apply when both --apply and --dry-run are passed (Bug 3: --apply wins)', async () => {
+  it('passes dryRun=false to WikiDiffApplier.apply when both --apply and --dry-run are passed (--apply wins)', async () => {
     await runWithoutConflict(['wiki', 'apply-diff', diffPath, '--apply', '--dry-run']);
     expect(applySpy).toHaveBeenCalledTimes(1);
     expect(applySpy.mock.calls[0]?.[1]).toBe(false);
   });
 });
 
-describe('CLI wiki apply-diff conflict detection (Bug 4)', () => {
+describe('CLI wiki apply-diff conflict detection', () => {
   let projectRoot: string;
   let diffPath: string;
   let applySpy: ReturnType<typeof vi.spyOn>;

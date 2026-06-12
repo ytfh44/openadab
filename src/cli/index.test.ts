@@ -150,9 +150,9 @@ describe('CLI JSON output helper', () => {
   });
 });
 
-describe('CLI wiki lint — system page checks (Bug 11)', () => {
+describe('CLI wiki lint — system page checks', () => {
   it('reports issues for corrupted index.md (missing required type field)', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'openadab-lint-bug11-'));
+    const root = mkdtempSync(join(tmpdir(), 'openadab-lint-'));
     const adabDir = join(root, 'adab');
     mkdirSync(join(adabDir, 'wiki'), { recursive: true });
     mkdirSync(join(adabDir, 'index'), { recursive: true });
@@ -206,7 +206,7 @@ describe('CLI wiki lint — system page checks (Bug 11)', () => {
 });
 
 /**
- * Bug 12 — `update --schemas` should surface explicit warning/error when
+ * `update --schemas` should surface explicit warning/error when
  * `SchemaLoader.listBuiltInSchemas()` returns an empty array or throws.
  *
  * Before the fix:
@@ -222,7 +222,7 @@ describe('CLI wiki lint — system page checks (Bug 11)', () => {
  *   - Normal path (regression): `commandsRun` contains the schema name(s)
  *     and no `warning` field is present.
  */
-describe('CLI update --schemas surfaces empty/error cases (Bug 12)', () => {
+describe('CLI update --schemas surfaces empty/error cases', () => {
   let listSpy: ReturnType<typeof vi.spyOn> | null = null;
   let forkSpy: ReturnType<typeof vi.spyOn> | null = null;
 
@@ -250,7 +250,7 @@ describe('CLI update --schemas surfaces empty/error cases (Bug 12)', () => {
     stderrLines: string[];
     exitCode: number | undefined;
   }> {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'openadab-bug12-'));
+    const projectRoot = mkdtempSync(join(tmpdir(), 'openadab-'));
     await createMinimalProject(projectRoot);
 
     const stdoutLines: string[] = [];
