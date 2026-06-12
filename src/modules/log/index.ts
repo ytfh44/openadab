@@ -33,8 +33,12 @@ export class LogWriter {
     await atomicWriteFile(this.logPath, `${output}\n`);
     // Defensive re-read: detect if another process modified the log concurrently.
     // Since this is a single-user CLI, concurrent writes are unlikely but not impossible.
+    // Compare only the machine-readable `<!-- log-entry ... -->` fragment rather than the
+    // full formatted line, so cosmetic tweaks to the Markdown portion do not trigger
+    // false positives.
     const verify = await safeReadFile(this.logPath);
-    if (verify !== null && !verify.includes(line)) {
+    const lastComment = line.match(/<!--.*?-->/)?.[0] ?? line;
+    if (verify !== null && !verify.includes(lastComment)) {
       console.warn('[LogWriter] Possible concurrent modification detected — log entry may have been lost.');
     }
   }

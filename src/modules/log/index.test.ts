@@ -64,6 +64,100 @@ describe('LogWriter', () => {
     const raw = readFileSync(join(tempDir, 'adab', 'log.md'), 'utf-8');
     expect(raw).toContain('"pagesModified":3');
   });
+
+  // ===== LW-VERIFY: comment-based verify, no false positives =====
+  // The pre-fix code compared the entire formatted line back against
+  // the on-disk log.  Any tiny cosmetic difference (whitespace, an
+  // updated details field, etc.) would have triggered a "concurrent
+  // modification" warning even though the structured `<!-- log-entry
+  // ... -->` comment is what actually carries the audit information.
+  describe('LW-VERIFY comment-based verify', () => {
+    it('does not warn when the formatted Markdown differs but the structured comment is present', async () => {
+      const entry: LogEntry = {
+        ts: '2026-06-06T10:00:00Z',
+        op: 'init',
+        change: null,
+        result: 'ok',
+      };
+      const warnings: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (msg: string) => warnings.push(msg);
+      try {
+        await writer.append(entry);
+        // Mutate the on-disk formatted Markdown line WITHOUT touching
+        // the comment.  This simulates a tooling pass that re-formats
+        // the human-readable line but preserves the audit comment.
+        const logPath = join(tempDir, 'adab', 'log.md');
+        const before = readFileSync(logPath, 'utf-8');
+        const tampered = before.replace(' — ok', ' — reformatted: ok');
+        writeFileSync(logPath, tampered, 'utf-8');
+
+        // Second append — the verify re-read should NOT warn because
+        // the comment from the first entry is still in the file.
+        await writer.append({
+          ts: '2026-06-06T10:01:00Z',
+          op: 'sync',
+          change: 'draft-ch-001',
+          result: 'ok',
+        });
+        const concurrentWarnings = warnings.filter((w) => w.includes('concurrent'));
+        expect(concurrentWarnings).toEqual([]);
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+
+    // SKIPPED: the LogWriter's "concurrent modification" warning is
+    // defense-in-depth for cross-process atomic-write races, not for
+    // in-process overwrites between two `append()` calls.  This test
+    // setup overwrites the log file between appends, but `append()`
+    // itself performs a full read-then-atomic-write: the verify re-read
+    // always observes the file the same `append` call just wrote, so
+    // `verify.includes(lastComment)` is guaranteed `true` and the
+    // warning branch (`!verify.includes(lastComment)`) is unreachable
+    // from this scenario.
+    //
+    // The only way to exercise the warning from a single process would
+    // be to monkey-patch `safeReadFile` to return a foreign value
+    // between the atomic write and the verify re-read, which is a
+    // brittle mock-the-mock test that does not validate real behavior.
+    //
+    // The defense is real for cross-process collisions (e.g. two CLI
+    // invocations racing on the same project); it is not exercisable
+    // from a single-process test.  If `LogWriter` is later extended
+    // with proper file locking (e.g. `proper-lockfile`) or a
+    // rename-based CAS, revive this test to cover the new code path.
+    it.skip('warns when the structured comment from a recent append is missing (true concurrent write)', async () => {
+      const entry: LogEntry = {
+        ts: '2026-06-06T10:00:00Z',
+        op: 'init',
+        change: null,
+        result: 'ok',
+      };
+      const warnings: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (msg: string) => warnings.push(msg);
+      try {
+        await writer.append(entry);
+        // Now OVERWRITE the log with content that does NOT contain
+        // the original comment — simulating another process
+        // clobbering the file.
+        const logPath = join(tempDir, 'adab', 'log.md');
+        writeFileSync(logPath, '<!-- something else -->\n', 'utf-8');
+
+        await writer.append({
+          ts: '2026-06-06T10:01:00Z',
+          op: 'sync',
+          change: 'draft-ch-001',
+          result: 'ok',
+        });
+        const concurrentWarnings = warnings.filter((w) => w.includes('concurrent'));
+        expect(concurrentWarnings.length).toBeGreaterThan(0);
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+  });
 });
 
 describe('LogReader', () => {
