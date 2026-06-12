@@ -334,6 +334,67 @@ describe('SyncEngine', () => {
     });
   });
 
+  // ==================== SE-3b/SE-3c: second pass (requireNonEmpty loop) honors optionalArtifactIds ====================
+  describe('SE-3b/SE-3c: pre-sync validation second pass honors optionalArtifactIds', () => {
+    function makeSchemaWithOptionalArtifact(): { load: () => Promise<SchemaDef> } {
+      return {
+        load: () => Promise.resolve({
+          name: 'chapter-draft',
+          version: 1,
+          artifacts: [
+            { id: 'brief', generates: 'brief.md', requires: [], required: true },
+            { id: 'draft', generates: 'draft.md', requires: ['brief'], required: true },
+            { id: 'wiki-diff', generates: 'wiki-diff.md', requires: ['draft'], required: false },
+          ],
+        }),
+      };
+    }
+
+    it('regression: SE-3b optional artifact marked done in manifest but file missing does not block sync (requireNonEmpty honors optional set)', async () => {
+      const schemaLoader = makeSchemaWithOptionalArtifact();
+      const { engine, root } = setupSyncEngine({ manifestStatus: 'in_progress', schemaLoader });
+      const manifestPath = join(root, 'adab', 'changes', 'draft-ch-001', '.openadab.yaml');
+      const manifest = {
+        changeId: 'draft-ch-001',
+        schema: 'chapter-draft',
+        version: 1,
+        created: new Date().toISOString(),
+        status: 'in_progress',
+        artifacts: { brief: 'done', draft: 'done', 'wiki-diff': 'done' },
+      };
+      writeFileSync(manifestPath, JSON.stringify(manifest));
+      (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+        { artifactId: 'brief', passed: true, errors: [], warnings: [] },
+        { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+        { artifactId: 'wiki-diff', passed: false, errors: ['File missing: wiki-diff.md'], warnings: [] },
+      ]);
+      (engine as any).validator.requireNonEmpty = vi.fn().mockImplementation((_changePath: string, artifactId: string) => {
+        if (artifactId === 'wiki-diff') {
+          return Promise.resolve({ artifactId, passed: false, errors: ['File missing: wiki-diff.md'], warnings: [] });
+        }
+        return Promise.resolve({ artifactId, passed: true, errors: [], warnings: [] });
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.changeId).toBe('draft-ch-001');
+    });
+
+    it('regression: SE-3c required artifact marked done in manifest but file missing still blocks sync (no false negatives)', async () => {
+      const schemaLoader = makeSchemaWithOptionalArtifact();
+      const { engine } = setupSyncEngine({ manifestStatus: 'in_progress', schemaLoader });
+      (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+        { artifactId: 'brief', passed: true, errors: [], warnings: [] },
+        { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+      ]);
+      (engine as any).validator.requireNonEmpty = vi.fn().mockImplementation((_changePath: string, artifactId: string) => {
+        if (artifactId === 'draft') {
+          return Promise.resolve({ artifactId, passed: false, errors: ['File is empty: draft.md'], warnings: [] });
+        }
+        return Promise.resolve({ artifactId, passed: true, errors: [], warnings: [] });
+      });
+      await expect(engine.sync('draft-ch-001')).rejects.toMatchObject({ code: 'SYNC_VALIDATION_FAILED' });
+    });
+  });
+
   // ==================== SE-4: structured error codes (not startsWith) ====================
   describe('SE-4: structured ValidationErrorCode for missing optional artifacts', () => {
     it('classifies FILE_MISSING code when only that error is present for an optional artifact', async () => {
@@ -480,6 +541,294 @@ describe('SyncEngine', () => {
       await expect(engine.sync('draft-ch-001')).rejects.toBeInstanceOf(WikiDiffParseError);
       const status = readManifestStatus((engine as any).projectRoot, 'draft-ch-001');
       expect(status).toBe('in_progress');
+    });
+  });
+
+  // ==================== SE-8: aggregated cause carries ALL index errors ====================
+  describe('SE-8: aggregated index error cause', () => {
+    it('cause.errors lists every failed step, not just the last one', async () => {
+      const { engine, mentionIndexer, wikiEngine, progressionTracker } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }],
+      });
+      mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('mentions broken'));
+      wikiEngine.generateWikilinks = vi.fn().mockRejectedValue(new Error('wikilinks broken'));
+      progressionTracker.generateProgressionsJson = vi.fn().mockRejectedValue(new Error('progressions broken'));
+      try {
+        await engine.sync('draft-ch-001');
+        expect.fail('should throw');
+      } catch (err) {
+        const adabErr = err as Error & { cause?: Error & { errors?: string[] } };
+        expect(adabErr.cause).toBeDefined();
+        const causeErrors = adabErr.cause?.errors ?? [];
+        expect(causeErrors.length).toBe(3);
+        expect(causeErrors[0]).toContain('adab/index/mentions.json');
+        expect(causeErrors[0]).toContain('mentions broken');
+        expect(causeErrors[1]).toContain('adab/index/wikilinks.json');
+        expect(causeErrors[1]).toContain('wikilinks broken');
+        expect(causeErrors[2]).toContain('adab/index/progressions.json');
+        expect(causeErrors[2]).toContain('progressions broken');
+      }
+    });
+
+    it('aggregated error is named AggregatedIndexError for diagnostic clarity', async () => {
+      const { engine, mentionIndexer } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }],
+      });
+      mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('boom'));
+      try {
+        await engine.sync('draft-ch-001');
+        expect.fail('should throw');
+      } catch (err) {
+        const adabErr = err as Error & { cause?: Error };
+        expect(adabErr.cause?.name).toBe('AggregatedIndexError');
+      }
+    });
+
+    it('cause is an Error instance with a string message', async () => {
+      const { engine, mentionIndexer } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }],
+      });
+      mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('alpha failure'));
+      try {
+        await engine.sync('draft-ch-001');
+        expect.fail('should throw');
+      } catch (err) {
+        const adabErr = err as Error & { cause?: Error };
+        expect(adabErr.cause).toBeInstanceOf(Error);
+        expect(typeof adabErr.cause?.message).toBe('string');
+        expect(adabErr.cause?.message).toContain('alpha failure');
+      }
+    });
+
+    it('AggregatedIndexError.errors array preserves the original step labels in order (not just messages)', async () => {
+      const { engine, mentionIndexer, wikiEngine, progressionTracker } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }],
+      });
+      // Two of the five steps fail, in non-adjacent positions; the errors
+      // array must record the step label as a prefix and preserve the
+      // original execution order (mentions then progressions, NOT
+      // progressions then mentions).
+      mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('mentions down'));
+      progressionTracker.generateProgressionsJson = vi.fn().mockRejectedValue(new Error('progressions down'));
+      try {
+        await engine.sync('draft-ch-001');
+        expect.fail('should throw');
+      } catch (err) {
+        const adabErr = err as Error & { cause?: Error & { errors?: string[] } };
+        const causeErrors = adabErr.cause?.errors ?? [];
+        expect(causeErrors.length).toBe(2);
+        // The first error encountered is the mentions step; the second is
+        // the progressions step. Order is the contract — callers rely on
+        // indexErrors[0] being the first failure.
+        expect(causeErrors[0]).toMatch(/^adab\/index\/mentions\.json:/);
+        expect(causeErrors[0]).toContain('mentions down');
+        expect(causeErrors[1]).toMatch(/^adab\/index\/progressions\.json:/);
+        expect(causeErrors[1]).toContain('progressions down');
+        // And never the other way around.
+        expect(causeErrors[0]).not.toMatch(/progressions/);
+        expect(causeErrors[1]).not.toMatch(/^adab\/index\/mentions/);
+      }
+    });
+
+    it('when only ONE index step fails, AggregatedIndexError.errors still wraps it (length === 1, not 0)', async () => {
+      const { engine, mentionIndexer } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [{ type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' }],
+      });
+      // A single failure must still be wrapped in the aggregated error
+      // shape (length 1, not 0). Callers branch on `cause.errors.length >
+      // 0`; a zero-length array on a partial-failure path would be a
+      // regression.
+      mentionIndexer.incrementalIndex = vi.fn().mockRejectedValue(new Error('only mentions failed'));
+      try {
+        await engine.sync('draft-ch-001');
+        expect.fail('should throw');
+      } catch (err) {
+        const adabErr = err as Error & { cause?: Error & { errors?: string[] } };
+        expect(adabErr.cause?.name).toBe('AggregatedIndexError');
+        const causeErrors = adabErr.cause?.errors ?? [];
+        expect(causeErrors.length).toBe(1);
+        expect(causeErrors[0]).toContain('adab/index/mentions.json');
+        expect(causeErrors[0]).toContain('only mentions failed');
+      }
+    });
+  });
+
+  // ==================== SE-9: wikiPagesModified target filtering ====================
+  describe('SE-9: wikiPagesModified target filtering', () => {
+    it('excludes operations whose target is the empty string', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' },
+          { type: 'update_field', target: '', source: 'draft-ch-001' },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified).toContain('characters/alice.md');
+      expect(report.wikiPagesModified).not.toContain('');
+    });
+
+    it('excludes operations whose target is not a .md file', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' },
+          { type: 'update_field', target: 'characters/bob.json', source: 'draft-ch-001' },
+          { type: 'update_field', target: 'characters/carol', source: 'draft-ch-001' },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified).toEqual(['characters/alice.md']);
+    });
+
+    it('deduplicates repeat targets after filtering', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' },
+          { type: 'add_current_state', target: 'characters/alice.md', source: 'draft-ch-001', content: 'x' },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified.filter((p) => p === 'characters/alice.md')).toHaveLength(1);
+    });
+
+    it('flag_contradiction operations are excluded from wikiPagesModified', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' },
+          { type: 'flag_contradiction', target: 'characters/bob.md', source: 'draft-ch-001', description: 'inconsistent' },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified).toEqual(['characters/alice.md']);
+      expect(report.contradictionsFlagged).toBe(1);
+    });
+
+    it('filters out operations with undefined target (defensive)', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      // Defensive: the engine must tolerate a malformed op with no `target`
+      // field (e.g., a parser regression or hand-edited diff) and never let
+      // `undefined` leak into the wikiPagesModified report.
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'characters/alice.md', source: 'draft-ch-001' },
+          { type: 'update_field', source: 'draft-ch-001' } as unknown as { type: string; target: string; source?: string },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified).toEqual(['characters/alice.md']);
+    });
+
+    it('preserves the original target string casing after filtering (no lowercasing)', async () => {
+      const { engine, wikiDiffParser } = setupSyncEngine({
+        manifestStatus: 'in_progress',
+        wikiDiffOps: [],
+      });
+      // The report must be a verbatim copy of the targets — the filter must
+      // not mutate the path casing (downstream consumers rely on the exact
+      // relative path to locate files on disk).
+      (wikiDiffParser.parse as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        changeId: 'draft-ch-001',
+        operations: [
+          { type: 'update_field', target: 'Characters/Alice.md', source: 'draft-ch-001' },
+          { type: 'update_field', target: 'LOCATIONS/Castle.md', source: 'draft-ch-001' },
+        ],
+      });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.wikiPagesModified).toContain('Characters/Alice.md');
+      expect(report.wikiPagesModified).toContain('LOCATIONS/Castle.md');
+    });
+  });
+
+  // ==================== SE-10: optional artifact FILE_EMPTY tolerated ====================
+  // Spec (openspec/specs/sync-engine/spec.md:31-35):
+  //   "WHEN running sync on a change where wiki-diff.md exists but parses to zero
+  //    operations ... THEN the engine SHALL skip the wiki-diff application step
+  //    (no-op) ... AND SHALL NOT emit a warning — an empty diff is a valid state"
+  // A present-but-empty wiki-diff.md yields a FILE_EMPTY error (not FILE_MISSING);
+  // the optional-artifact filter must tolerate FILE_EMPTY just like FILE_MISSING.
+  describe('SE-10: optional artifact FILE_EMPTY tolerated (empty diff is a valid state)', () => {
+    function makeSchemaWithOptionalWikiDiff(): { load: () => Promise<SchemaDef> } {
+      return {
+        load: () => Promise.resolve({
+          name: 'chapter-draft',
+          version: 1,
+          artifacts: [
+            { id: 'brief', generates: 'brief.md', requires: [], required: true },
+            { id: 'draft', generates: 'draft.md', requires: ['brief'], required: true },
+            { id: 'wiki-diff', generates: 'wiki-diff.md', requires: ['draft'], required: false },
+          ],
+        }),
+      };
+    }
+
+    it('regression: FILE_EMPTY on optional artifact is tolerated (empty wiki-diff is a valid state per spec)', async () => {
+      const schemaLoader = makeSchemaWithOptionalWikiDiff();
+      const { engine } = setupSyncEngine({ manifestStatus: 'in_progress', schemaLoader });
+      (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+        { artifactId: 'brief', passed: true, errors: [], warnings: [] },
+        { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+        // File exists but is empty — produces FILE_EMPTY, not FILE_MISSING.
+        { artifactId: 'wiki-diff', passed: false, errors: ['File is empty: wiki-diff.md'], warnings: [] },
+      ]);
+      (engine as any).validator.requireNonEmpty = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' });
+      (engine as any).validator.validateDependencies = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] });
+
+      // Per spec: an empty diff is a valid state — sync must NOT throw.
+      const report = await engine.sync('draft-ch-001');
+      expect(report.changeId).toBe('draft-ch-001');
+    });
+
+    it('regression: mixed FILE_MISSING + FILE_EMPTY on the same optional artifact are both tolerated', async () => {
+      const schemaLoader = makeSchemaWithOptionalWikiDiff();
+      const { engine } = setupSyncEngine({ manifestStatus: 'in_progress', schemaLoader });
+      // Defensive: if a single optional-artifact validation result mixes FILE_MISSING
+      // and FILE_EMPTY, both must be tolerated (any other code would still be fatal).
+      (engine as any).validator.validateChange = vi.fn().mockResolvedValue([
+        { artifactId: 'brief', passed: true, errors: [], warnings: [] },
+        { artifactId: 'draft', passed: true, errors: [], warnings: [] },
+        {
+          artifactId: 'wiki-diff',
+          passed: false,
+          errors: [
+            'File missing: wiki-diff.md',
+            'File is empty: wiki-diff.md',
+          ],
+          warnings: [],
+        },
+      ]);
+      (engine as any).validator.requireNonEmpty = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [], artifactId: '' });
+      (engine as any).validator.validateDependencies = vi.fn().mockResolvedValue({ passed: true, errors: [], warnings: [] });
+
+      const report = await engine.sync('draft-ch-001');
+      expect(report.changeId).toBe('draft-ch-001');
     });
   });
 });

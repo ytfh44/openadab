@@ -212,7 +212,14 @@ export class SyncEngine {
             'SYNC_WIKIDIFF_FAILED',
           );
         }
-        wikiPagesModified = Array.from(new Set(doc.operations.filter((o) => o.type !== 'flag_contradiction').map((o) => o.target)));
+        wikiPagesModified = Array.from(
+          new Set(
+            doc.operations
+              .filter((o) => o.type !== 'flag_contradiction')
+              .map((o) => o.target)
+              .filter((target) => target !== '' && target !== undefined && target.endsWith('.md'))
+          )
+        );
         contradictionsFlagged = doc.operations.filter((o) => o.type === 'flag_contradiction').length;
       }
     }
@@ -255,10 +262,13 @@ export class SyncEngine {
       const detail = `Regenerated indexes: ${indexesRegenerated.join(', ') || 'none'}. ` +
         `Failed: ${indexErrors.join('; ')}. ` +
         `Run \`openadab wiki index\` manually to regenerate missing indexes.`;
+      const aggregatedCause = new Error(indexErrors.join('; '));
+      aggregatedCause.name = 'AggregatedIndexError';
+      (aggregatedCause as Error & { errors: string[] }).errors = indexErrors;
       throw new AdabError(
         `Index regeneration partially failed after wiki-diff was applied.\n${detail}`,
         'SYNC_INDEX_FAILED',
-        { cause: lastIndexError },
+        { cause: aggregatedCause },
       );
     }
 
@@ -353,12 +363,22 @@ export class SyncEngine {
     const errors: string[] = [];
     const validationResults = await this.validator.validateChange(changePath);
     for (const result of validationResults) {
+      if (result.artifactId === 'all') {
+        // The aggregate (`artifactId: 'all'`) concatenates every child's errors,
+        // including those from optional artifacts that the per-result loop below
+        // correctly filters out. Processing it here would re-inject filtered
+        // errors and falsely abort sync on a tolerated gap.
+        continue;
+      }
       if (!result.passed) {
-        const isOptionalMissing = optionalArtifactIds.has(result.artifactId) &&
+        const isOptionalTolerable = optionalArtifactIds.has(result.artifactId) &&
           result.errors.length > 0 &&
-          result.errors.every((e) => classifyValidationError(e) === 'FILE_MISSING');
-        if (isOptionalMissing) {
-          console.warn(`[SyncEngine] Optional artifact "${result.artifactId}" is missing — proceeding without it.`);
+          result.errors.every((e) => {
+            const code = classifyValidationError(e);
+            return code === 'FILE_MISSING' || code === 'FILE_EMPTY';
+          });
+        if (isOptionalTolerable) {
+          console.warn(`[SyncEngine] Optional artifact "${result.artifactId}" is missing or empty — proceeding without it.`);
         } else {
           errors.push(...result.errors);
         }
@@ -370,6 +390,7 @@ export class SyncEngine {
       errors.push(...depResult.errors);
     }
     for (const [artifactId, status] of Object.entries(manifest.artifacts)) {
+      if (optionalArtifactIds.has(artifactId)) continue;
       if (status === 'done') {
         // Delegate to the validator which correctly uses art.generates from the schema
         const nonEmptyResult = await this.validator.requireNonEmpty(changePath, artifactId);
