@@ -1,7 +1,8 @@
 /**
  * Project Config Module — loads, validates, writes, and queries `adab/config.yaml`.
  */
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { join, relative, isAbsolute, sep } from 'node:path';
 
 import YAML from 'yaml';
 import { z } from 'zod';
@@ -9,11 +10,64 @@ import { z } from 'zod';
 import { ProjectConfigSchema, type ProjectConfig } from '../../schemas/project-config.js';
 import { ConfigValidationError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, ensureDir } from '../../utils/fs.js';
+import { redactConfigValue } from '../../utils/redact.js';
+import { LogWriter } from '../log/index.js';
+
+/**
+ * Top-level config keys that {@link resolveVariable} is allowed to walk into.
+ *
+ * The project config schema uses `.passthrough()` so unknown top-level keys
+ * survive validation (forward compatibility for user custom fields). The
+ * whitelist below decouples template variable resolution from passthrough:
+ * a `{{config.<key>.*}}` placeholder MUST start with one of these keys, so
+ * arbitrary passthrough data can never be exfiltrated through a template.
+ */
+const RESOLVABLE_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
+  'schema',
+  'version',
+  'project',
+  'context',
+  'rules',
+  'archive',
+]);
+
+/**
+ * Render a filesystem path in a privacy-preserving form for error messages.
+ *
+ * Absolute paths can disclose user account names (e.g. `C:\Users\Alice\...`)
+ * and full project layouts. This helper:
+ *   1. Tries to express the path relative to the current working directory.
+ *   2. Falls back to a path relative to the user's home directory.
+ *   3. As a last resort, replaces the absolute path with the literal
+ *      `adab/config.yaml` so the user still sees which file failed but the
+ *      surrounding directory layout is not leaked.
+ *
+ * @param absolutePath The path to render.
+ * @returns A redacted, relative-style path string.
+ */
+function toDisplayPath(absolutePath: string): string {
+  if (!isAbsolute(absolutePath)) {
+    return absolutePath;
+  }
+  const cwd = process.cwd();
+  if (absolutePath.startsWith(cwd + sep) || absolutePath === cwd) {
+    const rel = relative(cwd, absolutePath);
+    if (rel && !rel.startsWith('..')) {
+      return rel;
+    }
+  }
+  const home = homedir();
+  if (home && absolutePath.startsWith(home + sep)) {
+    return '~' + sep + relative(home, absolutePath);
+  }
+  return 'adab' + sep + 'config.yaml';
+}
 
 /**
  * Loads and validates `adab/config.yaml` from a project root.
  */
 export class ConfigLoader {
+  private readonly projectRoot: string;
   private readonly configPath: string;
   private config: ProjectConfig | null = null;
 
@@ -21,6 +75,7 @@ export class ConfigLoader {
    * @param projectRoot Absolute path to the project root.
    */
   constructor(projectRoot: string) {
+    this.projectRoot = projectRoot;
     this.configPath = join(projectRoot, 'adab', 'config.yaml');
   }
 
@@ -36,7 +91,7 @@ export class ConfigLoader {
   async load(): Promise<ProjectConfig> {
     const raw = await safeReadFile(this.configPath);
     if (raw === null) {
-      throw new ConfigValidationError(`Config file not found: ${this.configPath}`);
+      throw new ConfigValidationError(`Config file not found: ${toDisplayPath(this.configPath)}`);
     }
     let parsed: unknown;
     try {
@@ -48,29 +103,132 @@ export class ConfigLoader {
     const result = ProjectConfigSchema.safeParse(parsed);
     if (!result.success) {
       const issues = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-      throw new ConfigValidationError(`Config validation failed: ${issues}`);
+      const suggestion = suggestValidValues(result.error.issues);
+      throw new ConfigValidationError(`Config validation failed: ${issues}${suggestion}`);
     }
-    this.warnUnknownFields(parsed as Record<string, unknown>, ProjectConfigSchema, 'config');
+    this.warnUnknownFields(parsed, ProjectConfigSchema, 'config');
     this.config = result.data;
     return result.data;
   }
 
   /**
+   * Walk a zod schema to collect the legal enum values for a given
+   * dotted field path inside the project config.
+   *
+   * Used to enrich validation error messages with a list of accepted
+   * values, e.g. `Valid POV modes: first-person, limited-third,
+   * omniscient-third`.
+   *
+   * @param path Dotted field path (e.g. `project.pov`).
+   * @returns Array of valid values, or `null` if the path does not land on
+   *          an enum schema.
+   */
+  private collectEnumValues(path: string): string[] | null {
+    const segments = path.split('.');
+    let schema: z.ZodType<unknown> = ProjectConfigSchema;
+    for (const segment of segments) {
+      if (schema instanceof z.ZodObject) {
+        const shape = schema.shape as Record<string, z.ZodType<unknown>>;
+        const next = shape[segment];
+        if (next === undefined) {
+          return null;
+        }
+        schema = next;
+      } else if (schema instanceof z.ZodOptional) {
+        schema = schema._def.innerType as z.ZodType<unknown>;
+        const shape = (schema as z.ZodObject<z.ZodRawShape>).shape as Record<string, z.ZodType<unknown>>;
+        const next = shape[segment];
+        if (next === undefined) {
+          return null;
+        }
+        schema = next;
+      } else {
+        return null;
+      }
+    }
+    if (schema instanceof z.ZodEnum) {
+      return [...schema._def.values];
+    }
+    if (schema instanceof z.ZodOptional && schema._def.innerType instanceof z.ZodEnum) {
+      return [...(schema._def.innerType as z.ZodEnum<[string, ...string[]]>)._def.values];
+    }
+    return null;
+  }
+
+  /**
+   * Recursively unwrap a zod schema, peeling off wrapper types that have
+   * no impact on the user-visible field shape (`ZodDefault`,
+   * `ZodOptional`).
+   *
+   * Field-level wrappers are used liberally in the project config schema
+   * (e.g. `project: z.object({...}).default({...})`), so the unknown-field
+   * detector must look through them to find the underlying `ZodObject`,
+   * `ZodRecord`, or `ZodArray` before deciding whether the current value
+   * is structured.
+   *
+   * @param schema A zod schema that may be wrapped.
+   * @returns The innermost non-wrapper schema. If the input is already a
+   *          structural schema it is returned unchanged.
+   */
+  private unwrapSchema(schema: z.ZodType<unknown>): z.ZodType<unknown> {
+    let current: z.ZodType<unknown> = schema;
+    while (true) {
+      if (current instanceof z.ZodDefault || current instanceof z.ZodOptional) {
+        current = (current as z.ZodDefault<z.ZodType<unknown>>)._def.innerType as z.ZodType<unknown>;
+        continue;
+      }
+      break;
+    }
+    return current;
+  }
+
+  /**
    * Warn about keys present in the raw object that are not defined in the zod schema.
    *
-   * @param obj    Raw parsed object.
-   * @param schema Zod object schema to inspect.
+   * Recurses into nested object shapes, into `ZodRecord` values whose value
+   * type is itself a `ZodObject`, and into `ZodArray` elements that are
+   * `ZodObject` instances. Field-level wrappers (`ZodDefault`,
+   * `ZodOptional`) are peeled off before the structural type check so
+   * that nested detection works regardless of how the field is declared
+   * at the parent level. Non-object inputs (e.g. when YAML parses to
+   * `null` or a scalar) are handled by returning early instead of
+   * throwing `TypeError: Cannot convert undefined or null to object`.
+   *
+   * @param obj    Raw parsed object (may be `null`, a scalar, or an array).
+   * @param schema Zod schema describing the expected shape at `obj`.
    * @param prefix Dot-path prefix for nested keys.
    */
-  private warnUnknownFields(obj: Record<string, unknown>, schema: z.ZodType<unknown>, prefix = ''): void {
-    if (schema instanceof z.ZodObject) {
-      const shape = schema.shape as Record<string, z.ZodType<unknown>>;
-      for (const key of Object.keys(obj)) {
+  private warnUnknownFields(obj: unknown, schema: z.ZodType<unknown>, prefix = ''): void {
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+      return;
+    }
+    const unwrapped = this.unwrapSchema(schema);
+    if (unwrapped instanceof z.ZodObject) {
+      const shape = unwrapped.shape as Record<string, z.ZodType<unknown>>;
+      for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
         if (!(key in shape)) {
           // eslint-disable-next-line no-console
           console.warn(`[ConfigLoader] Unknown config field: ${prefix ? `${prefix}.` : ''}${key}`);
-        } else if (obj[key] !== null && typeof obj[key] === 'object' && !Array.isArray(obj[key])) {
-          this.warnUnknownFields(obj[key] as Record<string, unknown>, shape[key], `${prefix ? `${prefix}.` : ''}${key}`);
+        } else if (value !== null && typeof value === 'object') {
+          this.warnUnknownFields(value, shape[key], `${prefix ? `${prefix}.` : ''}${key}`);
+        }
+      }
+      return;
+    }
+    if (unwrapped instanceof z.ZodRecord) {
+      const valueSchema = unwrapped._def.valueType as z.ZodType<unknown>;
+      for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+          this.warnUnknownFields(value, valueSchema, `${prefix ? `${prefix}.` : ''}${key}`);
+        }
+      }
+      return;
+    }
+    if (unwrapped instanceof z.ZodArray) {
+      const elementSchema = unwrapped._def.type as z.ZodType<unknown>;
+      for (const value of obj as unknown[]) {
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+          this.warnUnknownFields(value, elementSchema, prefix);
         }
       }
     }
@@ -112,7 +270,10 @@ export class ConfigLoader {
   }
 
   /**
-   * Return the project language from the loaded config, or `'zh-CN'` as default.
+   * Return the project language from the loaded config.
+   *
+   * The zod schema applies a default of `'zh-CN'` when the field is missing,
+   * so the returned value is always one of the declared enum members.
    */
   getLanguage(): string {
     this.ensureLoaded();
@@ -120,7 +281,10 @@ export class ConfigLoader {
   }
 
   /**
-   * Return the context token heuristic, or `'chars-per-token'` as default.
+   * Return the context token heuristic.
+   *
+   * The zod schema applies a default of `'chars-per-token'` when the field
+   * is missing.
    */
   getTokenHeuristic(): string {
     this.ensureLoaded();
@@ -138,12 +302,14 @@ export class ConfigLoader {
  * Writes project configuration back to `adab/config.yaml`.
  */
 export class ConfigWriter {
+  private readonly projectRoot: string;
   private readonly configPath: string;
 
   /**
    * @param projectRoot Absolute path to the project root.
    */
   constructor(projectRoot: string) {
+    this.projectRoot = projectRoot;
     this.configPath = join(projectRoot, 'adab', 'config.yaml');
   }
 
@@ -159,7 +325,7 @@ export class ConfigWriter {
   }
 
   /**
-   * Set a nested config value by dot-path and write the result.
+   * Set a nested config value by dot-path, persist, and audit-log.
    *
    * Supports both dot notation (`project.title`) and bracket-index notation
    * (`context.alwaysInclude[0]`, `rules.draft[2]`). Intermediate objects and
@@ -168,10 +334,15 @@ export class ConfigWriter {
    * next key is numeric) are replaced with the correct container.
    *
    * After mutation, the resulting object is re-validated against
-   * {@link ProjectConfigSchema}. If validation fails, no file write occurs and
-   * a {@link ConfigValidationError} is thrown.
+   * {@link ProjectConfigSchema}. If validation fails, no file write occurs
+   * and a {@link ConfigValidationError} is thrown.
    *
-   * @param path  Dot-separated path with optional `[N]` array index segments.
+   * On a successful write, an `update` entry is appended to `adab/log.md`
+   * with the changed path and a redacted value (secrets are masked through
+   * {@link redactConfigValue} so credentials never land in the audit log).
+   *
+   * @param path  Dot-separated path with optional `[N]` array index segments,
+   *              or bare numeric segments (e.g. `context.alwaysInclude.0`).
    * @param value The new value to assign at the resolved location.
    * @throws {ConfigValidationError} If the config file is missing, the path
    *         cannot be resolved, or the resulting config fails schema
@@ -180,7 +351,7 @@ export class ConfigWriter {
   async set(path: string, value: unknown): Promise<void> {
     const raw = await safeReadFile(this.configPath);
     if (raw === null) {
-      throw new ConfigValidationError(`Config file not found: ${this.configPath}`);
+      throw new ConfigValidationError(`Config file not found: ${toDisplayPath(this.configPath)}`);
     }
     const parsed = YAML.parse(raw) as Record<string, unknown>;
     const keys = parseConfigPath(path);
@@ -188,10 +359,74 @@ export class ConfigWriter {
     const result = ProjectConfigSchema.safeParse(parsed);
     if (!result.success) {
       const issues = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-      throw new ConfigValidationError(`Config validation failed after set: ${issues}`);
+      const suggestion = suggestValidValuesForPath(result.error.issues, path);
+      throw new ConfigValidationError(`Config validation failed after set: ${issues}${suggestion}`);
     }
     await this.write(result.data);
+    const logValue = redactConfigValue(path, value);
+    const logWriter = new LogWriter(this.projectRoot);
+    await logWriter.append({
+      ts: new Date().toISOString(),
+      op: 'update',
+      change: null,
+      result: 'success',
+      details: { path, value: logValue },
+    });
   }
+}
+
+/**
+ * Build a `Valid values: ...` suffix for an unknown-field validation issue.
+ *
+ * When any of the issues refer to an enum field whose allowed values can be
+ * discovered by walking the project config schema, this returns a comma
+ * separated list. Otherwise returns an empty string.
+ *
+ * @param issues Zod issues from the failed parse.
+ * @returns Suffix string (including a leading space) or empty.
+ */
+function suggestValidValues(issues: ReadonlyArray<z.ZodIssue>): string {
+  for (const issue of issues) {
+    const path = issue.path.map(String).join('.');
+    if (!path) {continue;}
+    const loader = new ConfigLoader(process.cwd());
+    const values = loader['collectEnumValues'](path);
+    if (values !== null && values.length > 0) {
+      return ` (Valid values: ${values.join(', ')})`;
+    }
+  }
+  return '';
+}
+
+/**
+ * Build a `Valid values: ...` suffix targeted at a user-supplied path.
+ *
+ * Used by `ConfigWriter.set` so the user can see the legal alternatives
+ * for the value they just attempted to write, regardless of whether the
+ * zod issue path exactly matches the user path (zod paths are zero-based
+ * on the top-level object, while CLI paths are dotted strings).
+ *
+ * @param issues    Zod issues from the failed parse.
+ * @param userPath  The dotted path the user supplied to `set`.
+ * @returns Suffix string (including a leading space) or empty.
+ */
+function suggestValidValuesForPath(
+  issues: ReadonlyArray<z.ZodIssue>,
+  userPath: string
+): string {
+  const directValues = new ConfigLoader(process.cwd())['collectEnumValues'](userPath);
+  if (directValues !== null && directValues.length > 0) {
+    return ` (Valid values: ${directValues.join(', ')})`;
+  }
+  for (const issue of issues) {
+    const path = issue.path.map(String).join('.');
+    if (!path) {continue;}
+    const values = new ConfigLoader(process.cwd())['collectEnumValues'](path);
+    if (values !== null && values.length > 0) {
+      return ` (Valid values: ${values.join(', ')})`;
+    }
+  }
+  return '';
 }
 
 /**
@@ -199,15 +434,15 @@ export class ConfigWriter {
  * segments.
  *
  * Recognized shapes:
- *   - `a.b.c`           → `['a', 'b', 'c']`
- *   - `a[0].b`          → `['a', 0, 'b']`
- *   - `a.alwaysInclude[0]` → `['a', 'alwaysInclude', 0]`
- *   - `a[0][1]`         → `['a', 0, 1]`
+ *   - `a.b.c`             → `['a', 'b', 'c']`
+ *   - `a[0].b`            → `['a', 0, 'b']`
+ *   - `a.b[0]`            → `['a', 'b', 0]`
+ *   - `a.0.b`             → `['a', 0, 'b']`   (bare numeric segment)
+ *   - `a[0][1]`           → `['a', 0, 1]`
  *
- * The split uses a lookahead at `[` so that bracket indices remain attached
- * to their preceding key (e.g. `alwaysInclude[0]` is kept as a single
- * token), and a secondary regex peels the bracket index off the key so the
- * result is always a flat array.
+ * A bare numeric segment (`a.0.b`) is treated as an array index so users
+ * do not have to type brackets for every positional update. Mixed paths
+ * like `rules.draft.0` work the same as `rules.draft[0]`.
  *
  * @param path The user-supplied path string.
  * @returns A flat list of segments; string for object keys, number for
@@ -222,6 +457,9 @@ function parseConfigPath(path: string): Array<string | number> {
     const bracketMatch = /^(.+?)\[(\d+)\]$/.exec(segment);
     if (bracketMatch) {
       return [bracketMatch[1], parseInt(bracketMatch[2], 10)];
+    }
+    if (/^\d+$/.test(segment)) {
+      return [parseInt(segment, 10)];
     }
     return [segment];
   });
@@ -269,14 +507,20 @@ function isArray(value: unknown): value is unknown[] {
  *
  * Walks the key path one segment at a time, carrying an explicit `parent`
  * reference so that newly created sub-objects and sub-arrays are written
- * back to their parent (this is the bug that the previous local-variable
- * implementation had). For numeric keys whose index is at or beyond the
- * parent's length, the array is padded with empty strings so that the
- * resulting value remains a valid `string[]` per the project config schema.
+ * back to their parent.
+ *
+ * For numeric keys, the target index MUST be at most `parent.length`; any
+ * gap would silently insert empty strings into the array, which both
+ * corrupts the user-visible list and is a likely indicator of a typo
+ * (the user meant to set an adjacent slot). The schema also rejects empty
+ * strings, but relying on schema validation alone hides the problem from
+ * the user. We throw a {@link ConfigValidationError} up front instead.
  *
  * @param root  The object (or array) to mutate in place.
  * @param keys  The flat list of segments produced by {@link parseConfigPath}.
  * @param value The value to assign at the final key.
+ * @throws {ConfigValidationError} When the numeric index is beyond
+ *         `parent.length` (would create empty string padding slots).
  */
 function setIn(root: Record<string, unknown> | unknown[], keys: Array<string | number>, value: unknown): void {
   if (keys.length === 0) {
@@ -316,8 +560,11 @@ function setIn(root: Record<string, unknown> | unknown[], keys: Array<string | n
         `Cannot assign numeric key [${lastKey}]: parent is not an array`
       );
     }
-    while (parent.length < lastKey) {
-      parent.push('');
+    if (lastKey > parent.length) {
+      throw new ConfigValidationError(
+        `Array index [${lastKey}] is out of range (length is ${parent.length}); ` +
+        `set indices sequentially to avoid silent "" padding`
+      );
     }
     parent[lastKey] = value;
   } else {
@@ -331,17 +578,33 @@ function setIn(root: Record<string, unknown> | unknown[], keys: Array<string | n
 }
 
 /**
- * Resolve template variables of the form `{{config.project.pov}}`
+ * Resolve template variables of the form `{{config.<key>.<sub>...}}`
  * against a loaded project configuration.
+ *
+ * Only the committed top-level keys (`schema`, `version`, `project`,
+ * `context`, `rules`, `archive`) are reachable. A `{{config.<other>.*}}`
+ * placeholder — even when the `<other>` key exists in the config because
+ * the schema uses `.passthrough()` — is rejected with a
+ * {@link ConfigValidationError}. This prevents passthrough fields from
+ * being read through templates, which is a separation-of-concerns
+ * guarantee rather than a security claim (the config is local and the
+ * user can read it directly anyway), and it surfaces schema drift
+ * immediately during template rendering.
  *
  * @param template The template string containing `{{config.*}}` placeholders.
  * @param config   The project configuration object.
  * @returns The interpolated string.
- * @throws {ConfigValidationError} If a referenced config path does not exist.
+ * @throws {ConfigValidationError} If a referenced config path is not in
+ *         the whitelisted top-level set, does not exist, or cannot be
+ *         drilled into.
  */
 export function resolveVariable(template: string, config: ProjectConfig): string {
   return template.replace(/\{\{config\.([\w.]+)\}\}/g, (_match, path: string) => {
     const keys = path.split('.');
+    const topKey = keys[0];
+    if (topKey === undefined || !RESOLVABLE_TOP_LEVEL_KEYS.has(topKey)) {
+      throw new ConfigValidationError(`Cannot resolve config variable: config.${path}`);
+    }
     let value: unknown = config;
     for (const key of keys) {
       if (value === null || typeof value !== 'object') {
