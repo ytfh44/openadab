@@ -99,6 +99,39 @@ describe('extractWikiLinks', () => {
     const input = '`[[Foo]]` [[Bar]]';
     expect(extractWikiLinks(input)).toEqual(['Bar']);
   });
+
+  it('should not extract wiki links inside fenced code blocks (```)', () => {
+    const input = '```\n[[Foo]]\n[[Bar]]\n```';
+    expect(extractWikiLinks(input)).toEqual([]);
+  });
+
+  it('should not extract wiki links inside tilde-fenced code blocks (~~~)', () => {
+    const input = '~~~\n[[Foo]]\n~~~\n[[Baz]]';
+    expect(extractWikiLinks(input)).toEqual(['Baz']);
+  });
+
+  it('should not extract wiki links inside a fenced block whose info string contains backticks', () => {
+    // ```` ``` ```` — fence with 4-backtick info, opens with 3 backticks
+    const input = '```\n[[Foo]]\n```\n[[Bar]]';
+    expect(extractWikiLinks(input)).toEqual(['Bar']);
+  });
+
+  it('should handle multi-backtick inline code (``code with ` inside``) correctly', () => {
+    // Two-backtick inline code can contain a single backtick. The
+    // legacy single-backtick regex would match the inner single
+    // backtick and strip the whole thing, eating the wiki link
+    // outside the code span.  Verify the balanced tokeniser handles
+    // it.
+    const input = '`` `not a code span` `` [[Real]]';
+    expect(extractWikiLinks(input)).toEqual(['Real']);
+  });
+
+  it('extractFrontmatter wraps YAML parse failures in a structured WikiDiffParseError', () => {
+    // gray-matter uses js-yaml under the hood; an unterminated flow
+    // mapping is the cheapest portable way to trigger a parse error.
+    const bad = `---\ntitle: [unterminated\n---\nbody`;
+    expect(() => extractFrontmatter(bad)).toThrow(/frontmatter|yaml|parse/i);
+  });
 });
 
 describe('extractSectionsByHeading', () => {
@@ -142,7 +175,7 @@ A content
 ### Sub
 Sub content
 `;
-    expect(extractSectionsByHeading(input, 'A')).toBe('A content\n### Sub\nSub content');
+    expect(extractSectionsByHeading(input, 'A')).toBe('A content\n### Sub\nSub content\n');
   });
 
   it('should return empty string for empty section', () => {
@@ -150,20 +183,48 @@ Sub content
 ## B
 B content
 `;
-    expect(extractSectionsByHeading(input, 'A')).toBe('');
+    // After the null-vs-empty-string fix, an empty section returns
+    // null so "not found" and "found but empty" are unambiguous.
+    expect(extractSectionsByHeading(input, 'A')).toBeNull();
   });
 
   it('should handle heading with extra spaces', () => {
-    const input = `##  Target  
+    const input = `##  Target
 Content
 `;
-    expect(extractSectionsByHeading(input, 'Target')).toBe('Content');
+    expect(extractSectionsByHeading(input, 'Target')).toBe('Content\n');
   });
 
   it('should handle heading with special regex characters', () => {
     const input = `## C++
 Content
 `;
-    expect(extractSectionsByHeading(input, 'C++')).toBe('Content');
+    expect(extractSectionsByHeading(input, 'C++')).toBe('Content\n');
+  });
+
+  it('returns null (not "") for an empty section so callers can distinguish missing from empty', () => {
+    // Regression: the helper used to return the empty string for an
+    // empty section, which collided with the "not found" sentinel in
+    // some call sites.  Use null so "not found" and "found but empty"
+    // are unambiguous.
+    const input = `## A
+## B
+B content
+`;
+    expect(extractSectionsByHeading(input, 'A')).toBeNull();
+  });
+
+  it('finds a heading that is not on the first line (multiline-prefix regression)', () => {
+    // headingPattern used to be built without the `m` flag, so `^`
+    // only matched the string's first character — a heading past the
+    // first line was silently invisible.  Verify the multiline flag
+    // is now in effect.
+    const input = `first line of prose
+second line
+
+## Target
+Content
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe('Content\n');
   });
 });
