@@ -8,7 +8,7 @@ import { join, basename, dirname, isAbsolute, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import YAML from 'yaml';
-import { glob } from 'fast-glob';
+import glob from 'fast-glob';
 
 import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';

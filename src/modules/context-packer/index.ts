@@ -632,7 +632,7 @@ export class ContextPacker {
 
     // Gapped sequence: find the highest existing chapter < num.
     const chaptersDir = join(this.projectRoot, 'adab', 'manuscript', 'chapters');
-    const { glob } = await import('fast-glob');
+    const { default: glob } = await import('fast-glob');
     const files = await glob('ch-*.md', { cwd: chaptersDir, onlyFiles: true });
     let best: number | null = null;
     for (const f of files) {
@@ -676,7 +676,7 @@ export class ContextPacker {
       join(this.projectRoot, 'adab', 'changes'),
       join(this.projectRoot, 'adab', 'raw'),
     ];
-    const { glob } = await import('fast-glob');
+    const { default: glob } = await import('fast-glob');
     let maxMtime = 0;
     for (const dir of watchDirs) {
       if (!(await fileExists(dir))) {
