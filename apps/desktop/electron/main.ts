@@ -30,6 +30,7 @@ import {
 } from '../shared/ipc-types.js';
 import type {
   ProjectInfo,
+  ProjectOpenResult,
   FileReadResponse,
   FileWriteResponse,
   FileListDirResponse,
@@ -72,10 +73,10 @@ const fileWatchers = new Map<string, FSWatcher>();
  * Create the main application window with secure web preferences.
  *
  * Security defaults:
- * - `contextIsolation: true` — preload scripts run in isolated world
- * - `nodeIntegration: false` — renderer has no Node.js access
- * - `sandbox: true` — renderer runs in OS sandbox (platform-dependent)
- * - `webSecurity: true` — same-origin policy enforced
+ * - `contextIsolation: true` �?preload scripts run in isolated world
+ * - `nodeIntegration: false` �?renderer has no Node.js access
+ * - `sandbox: true` �?renderer runs in OS sandbox (platform-dependent)
+ * - `webSecurity: true` �?same-origin policy enforced
  */
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -143,7 +144,8 @@ function registerIpcHandlers(): void {
     if (!root) {
       root = await showOpenProjectDialog(mainWindow);
       if (!root) {
-        return null;
+        const result: ProjectOpenResult = { success: false, reason: 'cancelled' };
+        return result;
       }
     }
 
@@ -156,7 +158,8 @@ function registerIpcHandlers(): void {
       agentLogger = null;
       agentSupervisor.setLogger(null);
       commandRunner.onCommandComplete = undefined;
-      throw new Error(validated.reason);
+      const result: ProjectOpenResult = { success: false, reason: validated.reason };
+      return result;
     }
 
     const info = detectProject(validated.projectRoot);
@@ -167,7 +170,8 @@ function registerIpcHandlers(): void {
       agentLogger = null;
       agentSupervisor.setLogger(null);
       commandRunner.onCommandComplete = undefined;
-      throw new Error('not_a_project');
+      const result: ProjectOpenResult = { success: false, reason: 'not_a_project' };
+      return result;
     }
 
     currentProject = info;
@@ -183,7 +187,8 @@ function registerIpcHandlers(): void {
     await agentLogger.load();
     agentSupervisor.setLogger(agentLogger);
 
-    return currentProject;
+    const result: ProjectOpenResult = { success: true, project: currentProject };
+    return result;
   });
 
   ipcMain.handle('project:get-info', async () => {
@@ -197,7 +202,7 @@ function registerIpcHandlers(): void {
     return loadRecentProjects(await recentProjectsPath());
   });
 
-  // ── CLI handlers (real implementations — Section 3) ──────
+  // ── CLI handlers (real implementations �?Section 3) ──────
   ipcMain.handle('cli:run', async (event, request) => {
     const parseResult = CliRunRequestSchema.safeParse(request);
     if (!parseResult.success) {
@@ -290,7 +295,7 @@ function registerIpcHandlers(): void {
           return response;
         }
       } catch {
-        // File does not exist yet — no conflict possible.
+        // File does not exist yet �?no conflict possible.
       }
     }
 
@@ -408,7 +413,7 @@ function registerIpcHandlers(): void {
     }
   });
 
-  // ── Transcript handlers (real implementations — Section 3)
+  // ── Transcript handlers (real implementations �?Section 3)
   ipcMain.handle('transcript:get-events', async (_event, request) => {
     if (!transcriptStore) return [];
     const parseResult =
@@ -424,7 +429,7 @@ function registerIpcHandlers(): void {
     }
   });
 
-  // ── Agent handlers (real — Section 11) ────────────────
+  // ── Agent handlers (real �?Section 11) ────────────────
   ipcMain.handle('agent:start-session', async (_event, request) => {
     if (!agentSupervisor.isConfigured()) {
       throw new Error('No agent configured. Configure an agent in the Agent Dock to get started.');

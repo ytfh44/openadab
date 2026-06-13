@@ -143,7 +143,7 @@ export interface SubScopeResult {
  *
  * All operations require the resolved path to be inside `projectRoot`.
  * Additionally:
- * - `temp` operations are restricted to the `.temp-review` subdirectory.
+ * - `temp` operations are restricted to the `adab/.temp` subdirectory.
  *
  * Uses {@link resolve} and {@link normalize} for path normalisation;
  * symlink resolution via {@link resolveForGuard} is applied to prevent
@@ -188,9 +188,9 @@ export function validateSubScope(
     };
   }
 
-  // Temp operations are scoped to the .temp-review subdirectory only.
+  // Temp operations are scoped to the adab/.temp subdirectory only.
   if (operation === 'temp') {
-    const tempRoot = join(normalisedRoot, '.temp-review');
+    const tempRoot = join(normalisedRoot, 'adab', '.temp');
     const inTemp =
       resolvedPath === tempRoot ||
       resolvedPath.startsWith(tempRoot + sep);
@@ -199,7 +199,7 @@ export function validateSubScope(
       return {
         valid: false,
         resolvedPath,
-        error: `Path "${path}" is not within the .temp-review subdirectory`,
+        error: `Path "${path}" is not within the adab/.temp subdirectory`,
       };
     }
   }

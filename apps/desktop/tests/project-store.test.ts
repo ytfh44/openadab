@@ -335,3 +335,66 @@ describe('recent-projects persistence', () => {
     });
   });
 });
+
+// ─── project:open result shape (using pure functions) ─────
+
+describe('project:open IPC result shape', () => {
+  it('returns success project for a valid project directory', () => {
+    createProject(tmpRoot, { title: 'Valid Project', language: 'en' });
+    const validated = validateProjectRoot(tmpRoot);
+    expect(validated.valid).toBe(true);
+    if (validated.valid) {
+      const info = detectProject(validated.projectRoot);
+      expect(info).not.toBeNull();
+      const result = { success: true as const, project: info! };
+      expect(result.success).toBe(true);
+      expect(result.project.title).toBe('Valid Project');
+      expect(result.project.projectRoot).toBe(resolve(tmpRoot));
+    }
+  });
+
+  it('returns not_a_project for a directory without adab/config.yaml', () => {
+    mkdirSync(join(tmpRoot, 'some-dir'), { recursive: true });
+    const validated = validateProjectRoot(tmpRoot);
+    expect(validated.valid).toBe(false);
+    if (!validated.valid) {
+      const result = { success: false as const, reason: validated.reason };
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('not_a_project');
+    }
+  });
+
+  it('returns not_found for a non-existent path', () => {
+    const validated = validateProjectRoot(join(tmpRoot, 'does-not-exist'));
+    expect(validated.valid).toBe(false);
+    if (!validated.valid) {
+      const result = { success: false as const, reason: validated.reason };
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('not_found');
+    }
+  });
+
+  it('returns not_a_directory for a file path', () => {
+    const filePath = join(tmpRoot, 'just-a-file.txt');
+    writeFileSync(filePath, 'contents', 'utf-8');
+    const validated = validateProjectRoot(filePath);
+    expect(validated.valid).toBe(false);
+    if (!validated.valid) {
+      const result = { success: false as const, reason: validated.reason };
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe('not_a_directory');
+    }
+  });
+
+  it('detectProject returns null for a non-project, keeping reason from validation', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    const validated = validateProjectRoot(tmpRoot);
+    // validateProjectRoot should already reject it, but defensively:
+    if (validated.valid) {
+      const info = detectProject(validated.projectRoot);
+      expect(info).toBeNull();
+    } else {
+      expect(validated.reason).toBe('not_a_project');
+    }
+  });
+});

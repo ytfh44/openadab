@@ -127,13 +127,13 @@
 
 ## Correctness Hardening
 
-- [ ] Refine project-open IPC so non-project directories are not active projects and the renderer can show initialization recovery.
-- [ ] Resolve the OpenAdab CLI entrypoint in development and packaged modes, and emit only one transcript completion when spawning fails.
-- [ ] Parse JSON command output from stdout or stderr while preserving raw streams and parse errors.
-- [ ] Classify mutating commands by flags, including `wiki index` as mutating and `wiki apply-diff --dry-run` as read-only.
-- [ ] Enforce file API subdirectory scopes for reads, writes, directory listing, and temporary review artifacts.
-- [ ] Fix config editing so raw string values do not use CLI JSON mode unless the user explicitly selects it.
-- [ ] Make operation-level wiki-diff selection use per-operation identities and a CLI-accepted temporary diff format.
-- [ ] Replace timeline stale-index refresh commands that lack required CLI arguments with valid sync/index actions and visible errors.
-- [ ] Make Agent Dock startup avoid renderer Node globals and surface spawn failures without marking sessions active.
-- [ ] Add regression tests for each hardening item before implementing the corresponding fix.
+- [x] Refine project-open IPC so non-project directories are not active projects and the renderer can show initialization recovery.
+- [x] Resolve the OpenAdab CLI entrypoint in development and packaged modes, and emit only one transcript completion when spawning fails.
+- [x] Parse JSON command output from stdout or stderr while preserving raw streams and parse errors.
+- [x] Classify mutating commands by flags, including `wiki index` as mutating and `wiki apply-diff --dry-run` as read-only.
+- [x] Enforce file API subdirectory scopes for reads, writes, directory listing, and temporary review artifacts.
+- [x] Fix config editing so raw string values do not use CLI JSON mode unless the user explicitly selects it.
+- [x] Make operation-level wiki-diff selection use per-operation identities and a CLI-accepted temporary diff format.
+- [x] Replace timeline stale-index refresh commands that lack required CLI arguments with valid sync/index actions and visible errors.
+- [x] Make Agent Dock startup avoid renderer Node globals and surface spawn failures without marking sessions active.
+- [x] Add regression tests for each hardening item before implementing the corresponding fix.

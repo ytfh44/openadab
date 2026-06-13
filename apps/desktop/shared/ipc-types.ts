@@ -81,6 +81,20 @@ export const RecentProjectSchema = z.object({
 });
 
 export type RecentProject = z.infer<typeof RecentProjectSchema>;
+// ─── Project Open Result (Discriminated Union) ────────────
+
+export const ProjectOpenResultSchema = z.discriminatedUnion('success', [
+  z.object({
+    success: z.literal(true),
+    project: ProjectInfoSchema,
+  }),
+  z.object({
+    success: z.literal(false),
+    reason: z.enum(['not_found', 'not_a_directory', 'not_a_project', 'cancelled']),
+  }),
+]);
+
+export type ProjectOpenResult = z.infer<typeof ProjectOpenResultSchema>;
 
 // ─── CLI Schemas ──────────────────────────────────────────
 
@@ -284,7 +298,7 @@ export type AgentSpawnFailedEvent = z.infer<typeof AgentSpawnFailedEventSchema>;
  */
 export interface OpenAdabPreloadApi {
   // ── Project ──
-  openProject(request: ProjectOpenRequest): Promise<ProjectInfo | null>;
+  openProject(request: ProjectOpenRequest): Promise<ProjectOpenResult>;
   getProjectInfo(): Promise<ProjectInfo | null>;
   listRecentProjects(): Promise<RecentProject[]>;
 

@@ -95,15 +95,15 @@ export function buildFilteredWikiDiffDocument(
 /**
  * Path components used for the temporary wiki-diff file.
  */
-const TMP_DIR_NAME = '.openadab';
-const TMP_SUBDIR_NAME = 'tmp';
+const TMP_DIR_NAME = 'adab';
+const TMP_SUBDIR_NAME = '.temp';
 const TMP_FILE_PREFIX = 'wiki-diff-selected-';
 const TMP_FILE_SUFFIX = '.json';
 
 /**
  * Write a temporary diff file containing only the selected operations.
  *
- * The file is placed under `<projectRoot>/.openadab/tmp/` so that it is
+ * The file is placed under `<projectRoot>/adab/.temp/` so that it is
  * co-located with project state and discoverable by the CLI. The caller is
  * responsible for cleaning up the file after the CLI consumes it.
  *

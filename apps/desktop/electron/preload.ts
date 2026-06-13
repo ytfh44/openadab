@@ -11,6 +11,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   OpenAdabPreloadApi,
   ProjectOpenRequest,
+  ProjectOpenResult,
   ProjectInfo,
   RecentProject,
   CliRunRequest,
@@ -36,7 +37,7 @@ import type {
 
 const api: OpenAdabPreloadApi = {
   // ── Project ──
-  openProject(request: ProjectOpenRequest): Promise<ProjectInfo | null> {
+  openProject(request: ProjectOpenRequest): Promise<ProjectOpenResult> {
     return ipcRenderer.invoke('project:open', request);
   },
 

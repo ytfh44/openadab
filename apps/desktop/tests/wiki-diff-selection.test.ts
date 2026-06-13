@@ -198,14 +198,14 @@ describe('writeWikiDiffTempFile', () => {
     await fs.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('writes a temp file under .openadab/tmp/ within the project root', async () => {
+  it('writes a temp file under adab/.temp/ within the project root', async () => {
     const ops = [makeOp()];
     const filePath = await writeWikiDiffTempFile(ops, tmpRoot, fs, path);
 
-    expect(filePath).toContain(path.join(tmpRoot, '.openadab', 'tmp', 'wiki-diff-selected-'));
+    expect(filePath).toContain(path.join(tmpRoot, 'adab', '.temp', 'wiki-diff-selected-'));
   });
 
-  it('creates the .openadab/tmp directory if it does not exist', async () => {
+  it('creates the adab/.temp directory if it does not exist', async () => {
     const ops = [makeOp()];
     const filePath = await writeWikiDiffTempFile(ops, tmpRoot, fs, path);
 

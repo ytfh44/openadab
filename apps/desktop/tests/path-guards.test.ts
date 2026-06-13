@@ -394,32 +394,32 @@ describe('validateSubScope', () => {
   });
 
   // ── Temp scope ───────────────────────────────────────
-  it('allows temp artifact within .temp-review subdirectory', () => {
-    mkdirSync(join(root, '.temp-review'), { recursive: true });
-    writeFileSync(join(root, '.temp-review', 'diff.json'), '{}');
-    const result = validateSubScope('.temp-review/diff.json', root, 'temp');
+  it('allows temp artifact within adab/.temp subdirectory', () => {
+    mkdirSync(join(root, 'adab/.temp'), { recursive: true });
+    writeFileSync(join(root, 'adab/.temp', 'diff.json'), '{}');
+    const result = validateSubScope('adab/.temp/diff.json', root, 'temp');
     expect(result.valid).toBe(true);
-    expect(result.resolvedPath).toBe(resolve(root, '.temp-review', 'diff.json'));
+    expect(result.resolvedPath).toBe(resolve(root, 'adab/.temp', 'diff.json'));
   });
 
-  it('allows non-existent temp artifact within .temp-review', () => {
-    mkdirSync(join(root, '.temp-review'), { recursive: true });
-    const result = validateSubScope('.temp-review/new-artifact.md', root, 'temp');
+  it('allows non-existent temp artifact within adab/.temp', () => {
+    mkdirSync(join(root, 'adab/.temp'), { recursive: true });
+    const result = validateSubScope('adab/.temp/new-artifact.md', root, 'temp');
     expect(result.valid).toBe(true);
-    expect(result.resolvedPath).toBe(resolve(root, '.temp-review', 'new-artifact.md'));
+    expect(result.resolvedPath).toBe(resolve(root, 'adab/.temp', 'new-artifact.md'));
   });
 
-  it('rejects temp artifact outside .temp-review', () => {
+  it('rejects temp artifact outside adab/.temp', () => {
     const result = validateSubScope('subdir/temp-file.txt', root, 'temp');
     expect(result.valid).toBe(false);
     expect(result.error).toBeTruthy();
-    expect(result.error).toContain('.temp-review');
+    expect(result.error).toContain('adab/.temp');
   });
 
   it('rejects temp artifact at project root', () => {
     const result = validateSubScope('temp-artifact.json', root, 'temp');
     expect(result.valid).toBe(false);
-    expect(result.error).toContain('.temp-review');
+    expect(result.error).toContain('adab/.temp');
   });
 
   // ── Path traversal attacks ───────────────────────────
