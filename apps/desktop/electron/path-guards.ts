@@ -124,6 +124,89 @@ export function guardProjectFilePath(
   return safePath;
 }
 
+/** File API subdirectory operation category. */
+export type SubScopeOperation = 'read' | 'write' | 'list' | 'temp';
+
+/** Structured result from {@link validateSubScope}. */
+export interface SubScopeResult {
+  /** Whether the path is within the allowed subdirectory scope. */
+  valid: boolean;
+  /** The resolved absolute path when {@link valid} is true. */
+  resolvedPath?: string;
+  /** Human-readable error description when {@link valid} is false. */
+  error?: string;
+}
+
+/**
+ * Validate that a path is within the allowed subdirectory scope for a
+ * file API operation.
+ *
+ * All operations require the resolved path to be inside `projectRoot`.
+ * Additionally:
+ * - `temp` operations are restricted to the `.temp-review` subdirectory.
+ *
+ * Uses {@link resolve} and {@link normalize} for path normalisation;
+ * symlink resolution via {@link resolveForGuard} is applied to prevent
+ * symlink traversal attacks, handling both existing paths and
+ * non-existent write targets.
+ *
+ * Unlike {@link guardFilePath} and {@link guardProjectFilePath}, this
+ * function returns a structured result instead of throwing errors,
+ * making it suitable for IPC boundary validation where the caller
+ * should receive a clear outcome without an exception crossing
+ * process boundaries.
+ *
+ * @param path - A relative or absolute path to validate.
+ * @param projectRoot - The absolute project root directory.
+ * @param operation - The file API operation category.
+ * @returns A structured result indicating validity and the resolved
+ *   canonical path or an error message.
+ */
+export function validateSubScope(
+  path: string,
+  projectRoot: string,
+  operation: SubScopeOperation,
+): SubScopeResult {
+  const decodedPath = path.replace(/%2[fF]/g, '/');
+  const resolvedRoot = resolve(projectRoot);
+  const absolutePath = resolve(resolvedRoot, decodedPath);
+
+  // Resolve symlinks for existing paths; fall back to nearest
+  // existing ancestor for non-existent write targets so that
+  // parent-directory symlinks cannot redirect writes outside root.
+  const resolvedPath = normalize(resolveForGuard(absolutePath));
+  const normalisedRoot = normalize(tryRealpath(resolvedRoot));
+
+  const rooted =
+    resolvedPath === normalisedRoot ||
+    resolvedPath.startsWith(normalisedRoot + sep);
+
+  if (!rooted) {
+    return {
+      valid: false,
+      error: `Path "${path}" resolves outside project root "${projectRoot}"`,
+    };
+  }
+
+  // Temp operations are scoped to the .temp-review subdirectory only.
+  if (operation === 'temp') {
+    const tempRoot = join(normalisedRoot, '.temp-review');
+    const inTemp =
+      resolvedPath === tempRoot ||
+      resolvedPath.startsWith(tempRoot + sep);
+
+    if (!inTemp) {
+      return {
+        valid: false,
+        resolvedPath,
+        error: `Path "${path}" is not within the .temp-review subdirectory`,
+      };
+    }
+  }
+
+  return { valid: true, resolvedPath };
+}
+
 /**
  * Return the canonical project-relative path used by scope allow-lists.
  *

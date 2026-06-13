@@ -796,3 +796,221 @@ describe('AgentSupervisor graceful degradation', () => {
     expect(supervisor.getSessionStatus().sessionId).toBeNull();
   });
 });
+
+// ═══════════════════════════════════════════════════════════
+// Hardening item ⑨ — Agent Dock avoid renderer Node globals
+// ═══════════════════════════════════════════════════════════
+
+describe('AgentSupervisor spawn-failure hardening (item ⑨)', () => {
+  let supervisor: AgentSupervisor;
+
+  beforeEach(() => {
+    supervisor = new AgentSupervisor();
+    mockSpawn.mockReset();
+  });
+
+  // ── Spawn-failure IPC event ─────────────────────────────
+
+  it('emits agent:spawn-failed event when spawn throws', async () => {
+    mockSpawn.mockImplementation(() => {
+      throw new Error('ENOENT: command not found');
+    });
+    const sender = mockSender();
+    supervisor.setSender(sender);
+
+    await expect(
+      supervisor.startSession({
+        agentCommand: 'nonexistent',
+        args: [],
+        cwd: '/test',
+      }),
+    ).rejects.toThrow('ENOENT');
+
+    const spawnFailedCalls = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0] === 'event:agent-spawn-failed',
+    );
+    expect(spawnFailedCalls.length).toBe(1);
+    const payload = spawnFailedCalls[0][1] as Record<string, unknown>;
+    expect(payload.error).toBe('ENOENT: command not found');
+    expect(payload).toHaveProperty('sessionId');
+    expect(payload).toHaveProperty('timestamp');
+  });
+
+  // ── Session NOT active after spawn failure ──────────────
+
+  it('does not mark session active after spawn failure', async () => {
+    mockSpawn.mockImplementation(() => {
+      throw new Error('ENOENT: command not found');
+    });
+    const sender = mockSender();
+    supervisor.setSender(sender);
+
+    await expect(
+      supervisor.startSession({
+        agentCommand: 'nonexistent',
+        args: [],
+        cwd: '/test',
+      }),
+    ).rejects.toThrow('ENOENT');
+
+    const status = supervisor.getSessionStatus();
+    expect(status.sessionId).toBeNull();
+    expect(status.status).toBe('none');
+  });
+
+  // ── Multiple spawn failures do not leak ─────────────────
+
+  it('does not leak sessions or duplicate error events across multiple failures', async () => {
+    mockSpawn.mockImplementation(() => {
+      throw new Error('ENOENT: command not found');
+    });
+    const sender = mockSender();
+    supervisor.setSender(sender);
+
+    for (let i = 0; i < 3; i++) {
+      await expect(
+        supervisor.startSession({
+          agentCommand: 'nonexistent',
+          args: [],
+          cwd: '/test',
+        }),
+      ).rejects.toThrow('ENOENT');
+    }
+
+    const spawnFailedCalls = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0] === 'event:agent-spawn-failed',
+    );
+    // One event per failure
+    expect(spawnFailedCalls.length).toBe(3);
+    // No stale session remains
+    expect(supervisor.getSessionStatus().sessionId).toBeNull();
+  });
+
+  // ── Settled guard prevents duplicate close/error events ─
+
+  it('uses settled guard: close after error does not emit second event', async () => {
+    const child = mockChildProcess();
+    mockSpawn.mockReturnValue(child);
+    const sender = mockSender();
+    supervisor.setSender(sender);
+
+    await supervisor.startSession({
+      agentCommand: 'opencode',
+      args: [],
+      cwd: '/test',
+    });
+
+    // Clear messages from session start
+    (sender.send as ReturnType<typeof vi.fn>).mockClear();
+
+    // Fire error first
+    child.emit('error', new Error('Process crashed'));
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Fire close second
+    child.emit('close', 1, null);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const agentMessages = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0] === 'event:agent-message',
+    );
+    // Only one agent-message from the first (error) handler; close is suppressed
+    expect(agentMessages.length).toBe(1);
+  });
+
+  it('uses settled guard: error after close does not emit second event', async () => {
+    const child = mockChildProcess();
+    mockSpawn.mockReturnValue(child);
+    const sender = mockSender();
+    supervisor.setSender(sender);
+
+    await supervisor.startSession({
+      agentCommand: 'opencode',
+      args: [],
+      cwd: '/test',
+    });
+
+    (sender.send as ReturnType<typeof vi.fn>).mockClear();
+
+    // Fire close first
+    child.emit('close', 0, null);
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Fire error second
+    child.emit('error', new Error('Late error'));
+    await new Promise((r) => setTimeout(r, 30));
+
+    const agentMessages = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c: unknown[]) => c[0] === 'event:agent-message',
+    );
+    expect(agentMessages.length).toBe(1);
+  });
+
+  // ── Graceful shutdown: shutdown → SIGTERM → SIGKILL ────
+
+  it('sends shutdown message then escalates to SIGTERM after timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockChildProcess();
+      mockSpawn.mockReturnValue(child);
+      const sender = mockSender();
+      supervisor.setSender(sender);
+
+      const { sessionId } = await supervisor.startSession({
+        agentCommand: 'opencode',
+        args: [],
+        cwd: '/test',
+      });
+
+      const stopPromise = supervisor.stopSession(sessionId);
+
+      // Shutdown message should have been written immediately
+      const writes = (child.stdin.write as ReturnType<typeof vi.fn>).mock.calls;
+      const hasShutdown = writes.some(
+        (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('shutdown'),
+      );
+      expect(hasShutdown).toBe(true);
+
+      // SIGTERM should NOT have been called yet
+      expect(child.kill).not.toHaveBeenCalled();
+
+      // Advance past the SIGTERM timeout
+      vi.advanceTimersByTime(2500);
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+
+      await stopPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('escalates to SIGKILL if SIGTERM does not terminate the process', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = mockChildProcess();
+      mockSpawn.mockReturnValue(child);
+      const sender = mockSender();
+      supervisor.setSender(sender);
+
+      const { sessionId } = await supervisor.startSession({
+        agentCommand: 'opencode',
+        args: [],
+        cwd: '/test',
+      });
+
+      const stopPromise = supervisor.stopSession(sessionId);
+
+      // Advance past SIGTERM timeout
+      vi.advanceTimersByTime(2500);
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+
+      // Advance past SIGKILL timeout (additional 3s)
+      vi.advanceTimersByTime(3500);
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+
+      await stopPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

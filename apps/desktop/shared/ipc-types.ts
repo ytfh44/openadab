@@ -42,6 +42,7 @@ export const IpcChannel = {
   AGENT_STOP_SESSION: 'agent:stop-session',
   AGENT_APPROVE_PERMISSION: 'agent:approve-permission',
   AGENT_DENY_PERMISSION: 'agent:deny-permission',
+  AGENT_SPAWN_FAILED: 'agent:spawn-failed',
 
   // ── Events (main → renderer) ──
   EVENT_COMMAND_OUTPUT: 'event:command-output',
@@ -49,6 +50,7 @@ export const IpcChannel = {
   EVENT_FILE_CHANGED: 'event:file-changed',
   EVENT_AGENT_MESSAGE: 'event:agent-message',
   EVENT_PERMISSION_REQUEST: 'event:permission-request',
+  EVENT_AGENT_SPAWN_FAILED: 'event:agent-spawn-failed',
 } as const;
 
 export type IpcChannel = (typeof IpcChannel)[keyof typeof IpcChannel];
@@ -263,6 +265,14 @@ export const AgentMessageEventSchema = z.object({
 
 export type AgentMessageEvent = z.infer<typeof AgentMessageEventSchema>;
 
+export const AgentSpawnFailedEventSchema = z.object({
+  sessionId: z.string(),
+  error: z.string(),
+  timestamp: z.string(),
+});
+
+export type AgentSpawnFailedEvent = z.infer<typeof AgentSpawnFailedEventSchema>;
+
 // ─── Preload API Surface ──────────────────────────────────
 
 /**
@@ -322,6 +332,9 @@ export interface OpenAdabPreloadApi {
   ): () => void;
   onPermissionRequest(
     callback: (event: PermissionRequest) => void,
+  ): () => void;
+  onAgentSpawnFailed(
+    callback: (event: AgentSpawnFailedEvent) => void,
   ): () => void;
 }
 

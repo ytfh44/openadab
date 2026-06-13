@@ -31,6 +31,7 @@ import type {
   FileChangedEvent,
   AgentMessageEvent,
   PermissionRequest,
+  AgentSpawnFailedEvent,
 } from '../shared/ipc-types.js';
 
 const api: OpenAdabPreloadApi = {
@@ -192,6 +193,23 @@ const api: OpenAdabPreloadApi = {
       ipcRenderer.removeListener('event:permission-request', handler);
     };
   },
+
+
+  onAgentSpawnFailed(
+    callback: (event: AgentSpawnFailedEvent) => void,
+  ): () => void {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      data: AgentSpawnFailedEvent,
+    ): void => {
+      callback(data);
+    };
+    ipcRenderer.on('event:agent-spawn-failed', handler);
+    return () => {
+      ipcRenderer.removeListener('event:agent-spawn-failed', handler);
+    };
+  },
+
 };
 
 contextBridge.exposeInMainWorld('openadab', api);

@@ -9,7 +9,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, extname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { WebContents } from 'electron';
 import type {
   CliRunRequest,
@@ -92,6 +91,10 @@ export interface CommandRunnerOptions {
   cliPath?: string;
   env?: NodeJS.ProcessEnv;
   workspaceRoot?: string;
+  /** When true, searches for a bundled CLI binary in the packaged app resources. */
+  isPackaged?: boolean;
+  /** Override the resources path used in packaged mode (for tests). */
+  resourcesPath?: string;
 }
 
 /**
@@ -106,7 +109,7 @@ export interface CommandRunnerOptions {
 interface ResolvedCliCommand {
   command: string;
   argsPrefix: string[];
-  source: 'configured' | 'environment' | 'workspace' | 'path';
+  source: 'configured' | 'environment' | 'workspace' | 'path' | 'packaged';
   displayPath: string;
 }
 
@@ -122,7 +125,7 @@ interface ParsedCommandJson {
   parseError?: string;
 }
 
-const CURRENT_MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const CURRENT_MODULE_DIR = __dirname;
 const CLI_PATH_ENV_NAMES = ['OPENADAB_CLI_PATH', 'OPENADAB_CLI'] as const;
 const PATH_FALLBACK_COMMAND = 'openadab';
 
@@ -130,6 +133,23 @@ const PATH_FALLBACK_COMMAND = 'openadab';
  * Resolves the OpenAdab CLI command using explicit configuration, local build
  * output, then PATH fallback.
  */
+
+/**
+ * Searches for a bundled CLI binary in packaged app resources.
+ */
+function findPackagedCliEntrypoint(resourcesPathOverride?: string): string | undefined {
+  const root = resourcesPathOverride ?? process.resourcesPath;
+  if (!root) return undefined;
+  const candidates = [
+    resolve(root, 'cli', 'openadab'),
+    resolve(root, 'cli', 'openadab.cmd'),
+    resolve(root, 'cli', 'openadab.bat'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
 function resolveOpenAdabCli(options: CommandRunnerOptions): ResolvedCliCommand {
   const configuredCliPath = options.cliPath?.trim();
   if (configuredCliPath) {
@@ -141,6 +161,13 @@ function resolveOpenAdabCli(options: CommandRunnerOptions): ResolvedCliCommand {
     .find((candidate): candidate is string => Boolean(candidate));
   if (environmentCliPath) {
     return toResolvedCliCommand(environmentCliPath, 'environment');
+  }
+
+  if (options.isPackaged) {
+    const packagedEntrypoint = findPackagedCliEntrypoint(options.resourcesPath);
+    if (packagedEntrypoint) {
+      return toResolvedCliCommand(packagedEntrypoint, 'packaged');
+    }
   }
 
   const localEntrypoint = findLocalCliEntrypoint(options.workspaceRoot);
@@ -172,6 +199,49 @@ function buildSpawnInvocation(
 /**
  * Parses command JSON from stdout or stderr when the request asked for JSON.
  */
+
+/**
+ * Attempts to extract a complete JSON value (object or array) from text that
+ * may contain leading or trailing non-JSON content.  Tries a full-content parse
+ * first, then falls back to bracket-matching extraction that respects string
+ * boundaries and escape sequences.
+ */
+function tryExtractJson(text: string): { value: unknown } | undefined {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return undefined;
+  try {
+    return { value: JSON.parse(trimmed) };
+  } catch { /* try bracket-matching below */ }
+
+  const openers: Array<{ open: string; close: string }> = [
+    { open: '{', close: '}' },
+    { open: '[', close: ']' },
+  ];
+  for (const { open, close } of openers) {
+    const start = trimmed.indexOf(open);
+    if (start === -1) continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\' && inString) { escaped = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === open) { depth++; continue; }
+      if (ch === close) {
+        depth--;
+        if (depth === 0) {
+          try {
+            return { value: JSON.parse(trimmed.slice(start, i + 1)) };
+          } catch { break; }
+        }
+      }
+    }
+  }
+  return undefined;
+}
 function parseCommandJson(
   args: readonly string[],
   stdout: string,
@@ -187,11 +257,8 @@ function parseCommandJson(
   ].filter((candidate) => candidate.value.trim().length > 0);
 
   for (const attempt of attempts) {
-    try {
-      return { parsedJson: JSON.parse(attempt.value.trim()) as unknown };
-    } catch {
-      continue;
-    }
+    const extracted = tryExtractJson(attempt.value);
+    if (extracted) { return { parsedJson: extracted.value }; }
   }
 
   if (attempts.length === 0) {
@@ -367,6 +434,8 @@ export class CommandRunner {
 
   /** Optional local workspace root used to find compiled CLI build output. */
   private workspaceRoot?: string;
+  private isPackagedOption?: boolean;
+  private resourcesPathOverride?: string;
 
   /** Mutating command pending flag — only one mutating command at a time. */
   private mutatingRunning = false;
@@ -392,6 +461,8 @@ export class CommandRunner {
     this.configuredCliPath = options.cliPath;
     this.runnerEnv = options.env ?? process.env;
     this.workspaceRoot = options.workspaceRoot;
+    this.isPackagedOption = options.isPackaged;
+    this.resourcesPathOverride = options.resourcesPath;
   }
 
   /**
@@ -480,6 +551,8 @@ export class CommandRunner {
         cliPath: this.configuredCliPath,
         env: this.runnerEnv,
         workspaceRoot: this.workspaceRoot,
+        isPackaged: this.isPackagedOption,
+        resourcesPath: this.resourcesPathOverride,
       });
       const invocation = buildSpawnInvocation(resolvedCli, request.args);
 

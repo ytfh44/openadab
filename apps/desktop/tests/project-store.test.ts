@@ -22,6 +22,7 @@ import {
   detectProject,
   isOpenAdabProject,
   readProjectConfig,
+  validateProjectRoot,
   loadRecentProjects,
   saveRecentProjects,
   addRecentProject,
@@ -165,6 +166,60 @@ describe('detectProject', () => {
   });
 });
 
+describe('validateProjectRoot', () => {
+  it('returns valid for a directory containing adab/config.yaml', () => {
+    createProject(tmpRoot);
+    const result = validateProjectRoot(tmpRoot);
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.projectRoot).toBe(resolve(tmpRoot));
+    }
+  });
+
+  it('returns valid and resolves relative paths', () => {
+    createProject(join(tmpRoot, 'nested'));
+    const result = validateProjectRoot(join(tmpRoot, 'nested', '.'));
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.projectRoot).toBe(resolve(tmpRoot, 'nested'));
+    }
+  });
+
+  it('returns not_a_project when adab/config.yaml is missing', () => {
+    mkdirSync(join(tmpRoot, 'adab'), { recursive: true });
+    const result = validateProjectRoot(tmpRoot);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toBe('not_a_project');
+    }
+  });
+
+  it('returns not_a_project when adab/ directory is missing entirely', () => {
+    const result = validateProjectRoot(tmpRoot);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toBe('not_a_project');
+    }
+  });
+
+  it('returns not_found for a non-existent directory', () => {
+    const result = validateProjectRoot(join(tmpRoot, 'does-not-exist'));
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toBe('not_found');
+    }
+  });
+
+  it('returns not_a_directory for a file path', () => {
+    const filePath = join(tmpRoot, 'plain-file.txt');
+    writeFileSync(filePath, 'hello', 'utf-8');
+    const result = validateProjectRoot(filePath);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toBe('not_a_directory');
+    }
+  });
+});
 describe('recent-projects persistence', () => {
   let recentFile: string;
 

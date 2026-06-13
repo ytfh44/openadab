@@ -18,6 +18,22 @@ interface ProjectInitDialogProps {
   onClose: () => void;
   /** Called with the project root path after successful initialization. */
   onProjectInit: (projectRoot: string) => void;
+  /**
+   * The directory path that failed project-open validation.
+   * When provided, the dialog enters recovery mode: the project-root
+   * field is pre-filled and a banner explains that the directory is
+   * not yet an initialized OpenAdab project.
+   */
+  recoveryPath?: string;
+  /**
+   * Machine-readable reason for the recovery (e.g. 
+ot_a_project,
+   * 
+ot_found, 
+ot_a_directory).  Used to tailor the recovery
+   * message.
+   */
+  recoveryReason?: string;
 }
 
 /** Generate a unique command ID for each CLI invocation. */
@@ -28,10 +44,12 @@ function genCommandId(): string {
 const ProjectInitDialog: React.FC<ProjectInitDialogProps> = ({
   onClose,
   onProjectInit,
+  recoveryPath,
+  recoveryReason,
 }) => {
   const [schemaName, setSchemaName] = useState('chapter-draft');
   const [hostName, setHostName] = useState('');
-  const [projectRoot, setProjectRoot] = useState('');
+  const [projectRoot, setProjectRoot] = useState(recoveryPath ?? '');
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resultEvent, setResultEvent] = useState<CommandEvent | null>(null);
@@ -151,6 +169,31 @@ const ProjectInitDialog: React.FC<ProjectInitDialogProps> = ({
         >
           Create a new OpenAdab project with a schema-driven workflow.
         </p>
+
+        {/* Recovery banner */}
+        {recoveryPath && (
+          <div
+            style={{
+              padding: '10px 14px',
+              backgroundColor: '#fffbeb',
+              border: '1px solid #fde68a',
+              borderRadius: 4,
+              marginBottom: 16,
+              fontSize: '0.8rem',
+              color: '#92400e',
+              lineHeight: 1.5,
+            }}
+          >
+            <strong style={{ display: 'block', marginBottom: 4 }}>
+              Directory not initialized
+            </strong>
+            {recoveryReason === 'not_found'
+              ? `The path "${recoveryPath}" does not exist. Create it as a new project below.`
+              : recoveryReason === 'not_a_directory'
+                ? `"${recoveryPath}" is not a directory. Choose a folder to initialize.`
+                : `"${recoveryPath}" is not an OpenAdab project (adab/config.yaml not found). Initialize it below.`}
+          </div>
+        )}
 
         {/* Project Root */}
         <div style={{ marginBottom: 14 }}>

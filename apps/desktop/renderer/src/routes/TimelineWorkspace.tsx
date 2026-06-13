@@ -37,14 +37,35 @@ function genCommandId(): string {
 }
 
 /**
- * Build the CLI args used by Timeline when it can refresh index data without
- * a selected change id.
+ * Build the CLI args for a timeline index refresh.
  *
- * @returns Arguments for a read/write maintenance command that does not
- * require `--change`.
+ * When `changeId` is provided the index refresh is scoped to that change;
+ * when omitted, the full wiki index is rebuilt.
+ *
+ * @param changeId - Optional change ID to scope the index refresh.
+ * @returns CLI arguments for `wiki index`.
  */
-export function buildTimelineIndexRefreshArgs(): string[] {
-  return ['wiki', 'index', '--json'];
+export function buildTimelineIndexRefreshArgs(changeId?: string): string[] {
+  const args = ['wiki', 'index', '--json'];
+  if (changeId) {
+    args.push('--change', changeId.trim());
+  }
+  return args;
+}
+
+/**
+ * Build the CLI args for syncing a specific change.
+ *
+ * @param changeId - Required change ID to sync.
+ * @returns CLI arguments for `sync --change <id> --json`.
+ * @throws When `changeId` is empty or whitespace-only.
+ */
+export function buildTimelineSyncArgs(changeId: string): string[] {
+  const trimmed = changeId.trim();
+  if (!trimmed) {
+    throw new Error('changeId is required for sync');
+  }
+  return ['sync', '--change', trimmed, '--json'];
 }
 
 /** Shape from progressions.json chapters[].events[]. */
@@ -107,7 +128,10 @@ const TimelineWorkspace: React.FC<TimelineWorkspaceProps> = ({
   const [typeFilter, setTypeFilter] = useState<TimelineEvent['type'] | 'all'>('all');
 
   const loadTimeline = useCallback(async () => {
-    if (!projectInfo) return;
+    if (!projectInfo) {
+      setError('Cannot refresh index: no project is open.');
+      return;
+    }
     setDataLoading(true);
     setError(null);
     setStaleWarnings([]);
@@ -269,7 +293,10 @@ const TimelineWorkspace: React.FC<TimelineWorkspaceProps> = ({
 
   // ── Regenerate index handler ──
   const handleRegenerateIndex = useCallback(async () => {
-    if (!projectInfo) return;
+    if (!projectInfo) {
+      setError('Cannot refresh index: no project is open.');
+      return;
+    }
     setDataLoading(true);
     setError(null);
     try {

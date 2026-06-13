@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import {
   guardFilePath,
   guardProjectFilePath,
+  validateSubScope,
   PathEscapeError,
   PathScopeError,
 } from '../electron/path-guards.js';
@@ -317,6 +318,213 @@ describe('guardFilePath', () => {
     writeFileSync(join(deep, 'deep.txt'), 'deep');
     const result = guardFilePath('a/b/c/d/deep.txt', root);
     expect(result).toBe(resolve(root, 'a', 'b', 'c', 'd', 'deep.txt'));
+  });
+});
+
+
+describe('validateSubScope', () => {
+  // ── Read scope ───────────────────────────────────────
+  it('allows read within project root', () => {
+    const result = validateSubScope('file.txt', root, 'read');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'file.txt'));
+    expect(result.error).toBeUndefined();
+  });
+
+  it('allows read of deeply nested file within project root', () => {
+    const result = validateSubScope('subdir/nested.txt', root, 'read');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'subdir', 'nested.txt'));
+  });
+
+  it('rejects read outside project root via parent traversal', () => {
+    const result = validateSubScope('../outside.txt', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.error).toContain('outside');
+  });
+
+  it('rejects read via absolute path outside root', () => {
+    const result = validateSubScope('C:/Windows/System32', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  // ── Write scope ──────────────────────────────────────
+  it('allows write within project root subdirectory', () => {
+    const result = validateSubScope('subdir/new-file.md', root, 'write');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'subdir', 'new-file.md'));
+  });
+
+  it('allows write to non-existent nested path within root', () => {
+    const result = validateSubScope('adab/.temp/draft.json', root, 'write');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'adab', '.temp', 'draft.json'));
+  });
+
+  it('rejects write outside project root', () => {
+    const result = validateSubScope('../../outside/write.txt', root, 'write');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('rejects write via absolute path outside root', () => {
+    const result = validateSubScope('/etc/malicious.sh', root, 'write');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  // ── List scope ───────────────────────────────────────
+  it('allows directory listing within project root', () => {
+    const result = validateSubScope('subdir', root, 'list');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'subdir'));
+  });
+
+  it('allows directory listing at project root', () => {
+    const result = validateSubScope('.', root, 'list');
+    expect(result.valid).toBe(true);
+  });
+
+  it('rejects directory listing outside project root', () => {
+    const result = validateSubScope('../../../', root, 'list');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  // ── Temp scope ───────────────────────────────────────
+  it('allows temp artifact within .temp-review subdirectory', () => {
+    mkdirSync(join(root, '.temp-review'), { recursive: true });
+    writeFileSync(join(root, '.temp-review', 'diff.json'), '{}');
+    const result = validateSubScope('.temp-review/diff.json', root, 'temp');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, '.temp-review', 'diff.json'));
+  });
+
+  it('allows non-existent temp artifact within .temp-review', () => {
+    mkdirSync(join(root, '.temp-review'), { recursive: true });
+    const result = validateSubScope('.temp-review/new-artifact.md', root, 'temp');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, '.temp-review', 'new-artifact.md'));
+  });
+
+  it('rejects temp artifact outside .temp-review', () => {
+    const result = validateSubScope('subdir/temp-file.txt', root, 'temp');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.error).toContain('.temp-review');
+  });
+
+  it('rejects temp artifact at project root', () => {
+    const result = validateSubScope('temp-artifact.json', root, 'temp');
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('.temp-review');
+  });
+
+  // ── Path traversal attacks ───────────────────────────
+  it('rejects dot-dot-slash traversal to /etc/passwd', () => {
+    const result = validateSubScope('../../etc/passwd', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('rejects encoded traversal attempt', () => {
+    const result = validateSubScope('..%2F..%2Fetc%2Fpasswd', root, 'read');
+    expect(result.valid).toBe(false);
+  });
+
+  it('rejects deep traversal with many ../ segments', () => {
+    const result = validateSubScope('../../../../../../../../etc/passwd', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  // ── Absolute path attacks ────────────────────────────
+  it('rejects absolute Unix-style path', () => {
+    const result = validateSubScope('/etc/passwd', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('rejects absolute Windows-style path', () => {
+    const result = validateSubScope('D:/secret/data.txt', root, 'read');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  // ── Symlink traversal ────────────────────────────────
+  if (process.platform !== 'win32' || hasSymlinkSupport()) {
+    it('rejects absolute symlink traversal', () => {
+      const outsideDir = resolve(tmpdir(), 'openadab-symscope-' + Date.now());
+      mkdirSync(outsideDir, { recursive: true });
+      writeFileSync(join(outsideDir, 'secret.txt'), 'stolen');
+      try {
+        symlinkSync(outsideDir, join(root, 'escape-link'), 'dir');
+        const result = validateSubScope('escape-link/secret.txt', root, 'read');
+        expect(result.valid).toBe(false);
+        expect(result.error).toBeTruthy();
+      } finally {
+        try {
+          rmSync(outsideDir, { recursive: true, force: true });
+        } catch { /* best-effort */ }
+      }
+    });
+
+    it('rejects non-existent write below escaping symlink', () => {
+      const outsideDir = resolve(tmpdir(), 'openadab-symscope-write-' + Date.now());
+      mkdirSync(outsideDir, { recursive: true });
+      try {
+        symlinkSync(outsideDir, join(root, 'escape-link'), 'dir');
+        const result = validateSubScope('escape-link/new-file.md', root, 'write');
+        expect(result.valid).toBe(false);
+        expect(result.error).toBeTruthy();
+      } finally {
+        try {
+          rmSync(outsideDir, { recursive: true, force: true });
+        } catch { /* best-effort */ }
+      }
+    });
+
+    it('allows symlink that stays inside project root', () => {
+      symlinkSync(join(root, 'subdir'), join(root, 'safe-link'), 'dir');
+      const result = validateSubScope('safe-link/nested.txt', root, 'read');
+      expect(result.valid).toBe(true);
+      expect(result.resolvedPath).toBe(resolve(root, 'subdir', 'nested.txt'));
+    });
+  } else {
+    it.skip('symlink traversal tests — symlink creation not available on this platform', () => {});
+  }
+
+  // ── Edge cases ───────────────────────────────────────
+  it('handles empty string (resolves to root)', () => {
+    const result = validateSubScope('', root, 'read');
+    expect(result.valid).toBe(true);
+  });
+
+  it('handles dot-only path (current directory)', () => {
+    const result = validateSubScope('.', root, 'read');
+    expect(result.valid).toBe(true);
+  });
+
+  it('handles paths with spaces', () => {
+    const result = validateSubScope('spaces in path/spaced.txt', root, 'read');
+    expect(result.valid).toBe(true);
+    expect(result.resolvedPath).toBe(resolve(root, 'spaces in path', 'spaced.txt'));
+  });
+
+  it('returns structured result with valid=true and no error on success', () => {
+    const result = validateSubScope('file.txt', root, 'read');
+    expect(result).toHaveProperty('valid', true);
+    expect(result).toHaveProperty('resolvedPath');
+    expect(result).not.toHaveProperty('error');
+  });
+
+  it('returns structured result with valid=false and error on failure', () => {
+    const result = validateSubScope('../outside', root, 'read');
+    expect(result).toHaveProperty('valid', false);
+    expect(result).toHaveProperty('error');
+    expect(typeof result.error).toBe('string');
   });
 });
 

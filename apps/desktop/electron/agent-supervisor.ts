@@ -26,6 +26,7 @@ import type {
   PermissionRequest,
   PermissionResponse,
   AgentCapability,
+  AgentSpawnFailedEvent,
 } from '../shared/ipc-types.js';
 import { AgentLogger } from './agent-logger.js';
 
@@ -97,6 +98,8 @@ interface AgentSession {
   approvedCapabilities: Set<AgentCapability>;
   /** Pending permission requests awaiting user response. */
   pendingPermissions: Map<string, PendingPermission>;
+  /** Whether lifecycle events (close/error) have already been handled. */
+  settled: boolean;
 }
 
 // ─── Agent Config Persistence ──────────────────────────────
@@ -217,6 +220,7 @@ export class AgentSupervisor {
       startedAt: new Date().toISOString(),
       approvedCapabilities: new Set(),
       pendingPermissions: new Map(),
+      settled: false,
     };
 
     this.session = session;
@@ -250,6 +254,8 @@ export class AgentSupervisor {
       }
 
       child.on('close', (code, signal) => {
+        if (session.settled) return;
+        session.settled = true;
         const reason = signal
           ? `Process terminated by signal ${signal}`
           : `Process exited with code ${code}`;
@@ -263,6 +269,8 @@ export class AgentSupervisor {
       });
 
       child.on('error', (err) => {
+        if (session.settled) return;
+        session.settled = true;
         session.status = 'error';
         session.errorMessage = err.message;
         session.child = null;
@@ -275,6 +283,14 @@ export class AgentSupervisor {
 
       return { sessionId };
     } catch (err) {
+      // Surface spawn failure to renderer before marking session as error
+      const spawnFailedEvent: AgentSpawnFailedEvent = {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        timestamp: new Date().toISOString(),
+      };
+      this.sender?.send('event:agent-spawn-failed', spawnFailedEvent);
+
       session.status = 'error';
       session.errorMessage = err instanceof Error ? err.message : String(err);
       this.emitAgentMessage(sessionId, 'system', `Failed to start agent: ${session.errorMessage}`);
@@ -309,27 +325,39 @@ export class AgentSupervisor {
       return;
     }
 
-    if (session.child) {
+    // Capture child reference before nullifying session.child below,
+    // so timeout callbacks hold a stable reference.
+    const child = session.child;
+
+    // Send graceful shutdown message over stdin
+    if (child?.stdin) {
       try {
-        // Send graceful shutdown message
-        session.child.stdin!.write(JSON.stringify({ type: 'shutdown' }) + '\n');
-        // Give the process a moment, then kill
-        setTimeout(() => {
-          try {
-            session.child?.kill('SIGTERM');
-          } catch {
-            // Process already gone
-          }
-        }, 2000);
+        child.stdin.write(JSON.stringify({ type: 'shutdown' }) + '\n');
       } catch {
-        try {
-          session.child.kill('SIGTERM');
-        } catch {
-          // Process already gone
-        }
+        // stdin may already be closed
       }
     }
 
+    // Schedule process termination escalation only for still-running children
+    if (child && child.exitCode === null && child.pid !== undefined) {
+      const sigtermTimer = setTimeout(() => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Already gone
+        }
+        // Escalate to SIGKILL after grace period
+        const sigkillTimer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            // Already gone
+          }
+        }, 3000);
+        child.on('close', () => clearTimeout(sigkillTimer));
+      }, 2000);
+      child.on('close', () => clearTimeout(sigtermTimer));
+    }
     session.status = 'stopped';
     session.child = null;
     if (session.lineReader) {

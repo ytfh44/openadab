@@ -10,7 +10,7 @@
  * module during test execution.
  */
 
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -49,6 +49,48 @@ interface ProjectConfig {
  */
 export function isOpenAdabProject(projectRoot: string): boolean {
   return existsSync(join(projectRoot, CONFIG_PATH));
+}
+
+/**
+ * Result of {@link validateProjectRoot}.
+ *
+ * When alid is 	rue, projectRoot holds the resolved absolute
+ * path.  When alid is alse, eason describes why the path
+ * cannot be opened as an OpenAdab project.
+ */
+export type ProjectRootValidation =
+  | { valid: true; projectRoot: string }
+  | { valid: false; reason: 'not_found' | 'not_a_directory' | 'not_a_project' };
+
+/**
+ * Validate that projectRoot can be opened as an OpenAdab project.
+ *
+ * Checks (in order):
+ * 1. The path exists on the filesystem.
+ * 2. The path is a directory (not a regular file).
+ * 3. The directory contains dab/config.yaml.
+ *
+ * @returns A discriminated union.  Callers should switch on alid
+ *   and, on failure, use eason to present appropriate recovery UI
+ *   (e.g. suggest initialization when eason is 
+ot_a_project).
+ */
+export function validateProjectRoot(
+  projectRoot: string,
+): ProjectRootValidation {
+  const resolved = resolve(projectRoot);
+  try {
+    const stat = statSync(resolved);
+    if (!stat.isDirectory()) {
+      return { valid: false, reason: 'not_a_directory' };
+    }
+  } catch {
+    return { valid: false, reason: 'not_found' };
+  }
+  if (!isOpenAdabProject(resolved)) {
+    return { valid: false, reason: 'not_a_project' };
+  }
+  return { valid: true, projectRoot: resolved };
 }
 
 /**

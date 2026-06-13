@@ -5,6 +5,11 @@
  * configuration via `openadab config get <path> --json` and
  * `openadab config set <path> <value>` with explicit raw/JSON mode.
  *
+ * Auto-detects whether a config value looks like structured JSON (object
+ * or array) and defaults to JSON mode for those values.  Plain strings,
+ * numbers, and booleans default to raw mode.  The user can override
+ * auto-detection with a manual "Use JSON mode" checkbox.
+ *
  * Displays a summary of known config values from the current project info
  * and allows ad-hoc get/set operations on arbitrary dot-paths.
  *
@@ -57,17 +62,40 @@ function configValueModeHint(mode: ConfigValueMode): string {
     : 'Raw mode stores ordinary text exactly as entered.';
 }
 
+/**
+ * Heuristically detect whether a config value looks like structured JSON.
+ *
+ * Returns `'json'` when the trimmed value starts with `{` or `[`;
+ * otherwise returns `'raw'`.  This avoids the `--json` flag for
+ * everyday string values while automatically opting into JSON parsing for
+ * objects and arrays.
+ *
+ * @param value - Raw input value from the user.
+ * @returns The suggested config value mode.
+ */
+export function detectConfigValueMode(value: string): ConfigValueMode {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return 'json';
+  }
+  return 'raw';
+}
+
 const ConfigEditor: React.FC<ConfigEditorProps> = ({
   projectInfo,
   onConfigChanged,
 }) => {
   const [configPath, setConfigPath] = useState('');
   const [configValue, setConfigValue] = useState('');
-  const [configValueMode, setConfigValueMode] =
-    useState<ConfigValueMode>('raw');
+  const [jsonModeManual, setJsonModeManual] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Effective mode: auto-detect or manual override ──
+  const effectiveMode: ConfigValueMode = jsonModeManual
+    ? 'json'
+    : detectConfigValueMode(configValue);
 
   /** Run a config CLI command and display the result. */
   const runConfigCommand = useCallback(
@@ -137,9 +165,9 @@ const ConfigEditor: React.FC<ConfigEditorProps> = ({
     runConfigCommand(buildConfigSetArgs(
       trimmedPath,
       configValue,
-      configValueMode,
+      effectiveMode,
     ));
-  }, [configPath, configValue, configValueMode, runConfigCommand]);
+  }, [configPath, configValue, effectiveMode, runConfigCommand]);
 
   // ── Empty state (no project) ──
   if (!projectInfo) {
@@ -283,20 +311,56 @@ const ConfigEditor: React.FC<ConfigEditorProps> = ({
       </div>
 
       <div style={{ marginBottom: 14 }}>
-        <label style={labelStyle} htmlFor="config-value-mode">
+        <label style={labelStyle}>
           Value Mode
         </label>
-        <select
-          id="config-value-mode"
-          value={configValueMode}
-          onChange={(e) =>
-            setConfigValueMode(e.target.value as ConfigValueMode)}
-          disabled={loading}
-          style={inputStyle}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: '0.75rem',
+            color: '#374151',
+            marginBottom: 4,
+          }}
         >
-          <option value="raw">Raw string</option>
-          <option value="json">JSON</option>
-        </select>
+          <span
+            style={{
+              display: 'inline-block',
+              padding: '2px 10px',
+              borderRadius: 3,
+              backgroundColor: effectiveMode === 'json' ? '#fef3c7' : '#e0f2fe',
+              color: effectiveMode === 'json' ? '#92400e' : '#0369a1',
+              fontFamily: 'monospace',
+              fontWeight: 600,
+              fontSize: '0.72rem',
+            }}
+          >
+            {effectiveMode === 'json' ? 'JSON' : 'RAW'}
+          </span>
+          <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+            {jsonModeManual ? '(manual)' : '(auto-detected)'}
+          </span>
+        </div>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: '0.72rem',
+            color: '#4b5563',
+            cursor: loading ? 'not-allowed' : 'pointer',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={jsonModeManual}
+            onChange={(e) => setJsonModeManual(e.target.checked)}
+            disabled={loading}
+            id="config-json-override"
+          />
+          Always use JSON mode (override auto-detection)
+        </label>
         <div
           style={{
             marginTop: 4,
@@ -305,7 +369,7 @@ const ConfigEditor: React.FC<ConfigEditorProps> = ({
             lineHeight: 1.4,
           }}
         >
-          {configValueModeHint(configValueMode)}
+          {configValueModeHint(effectiveMode)}
         </div>
       </div>
 

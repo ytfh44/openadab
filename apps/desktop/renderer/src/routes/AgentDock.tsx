@@ -15,7 +15,7 @@
  */
 
 import React, { useState, useCallback, useEffect } from 'react';
-import type { ProjectInfo, PermissionRequest, PermissionResponse } from '../../../shared/ipc-types.js';
+import type { AgentSpawnFailedEvent, ProjectInfo, PermissionRequest, PermissionResponse } from '../../../shared/ipc-types.js';
 import AgentSessionPanel from '../components/AgentSessionPanel.js';
 import AgentConfigPanel from '../components/AgentConfigPanel.js';
 import type { AgentConfigState, AgentMode } from '../components/AgentConfigPanel.js';
@@ -64,6 +64,18 @@ const AgentDock: React.FC<AgentDockProps> = ({ projectInfo }) => {
     const unsub = window.openadab.onPermissionRequest(
       (request: PermissionRequest) => {
         setPendingPermission(request);
+      },
+    );
+    return unsub;
+  }, []);
+
+  // Subscribe to spawn-failed events from main process
+  useEffect(() => {
+    const unsub = window.openadab.onAgentSpawnFailed(
+      (event: AgentSpawnFailedEvent) => {
+        setError(event.error);
+        setSessionActive(false);
+        setStarting(false);
       },
     );
     return unsub;

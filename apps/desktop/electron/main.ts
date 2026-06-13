@@ -8,7 +8,6 @@
 
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync, statSync, readdirSync, watch, type FSWatcher } from 'node:fs';
 import { mkdirSync } from 'node:fs';
@@ -38,14 +37,13 @@ import type {
 import { guardProjectFilePath } from './path-guards.js';
 import {
   detectProject,
+  validateProjectRoot,
   showOpenProjectDialog,
   loadRecentProjects,
   addRecentProject,
   recentProjectsPath,
 } from './project-store.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 /** Whether the app is running from source (unpackaged). */
 const isDev = !app.isPackaged;
@@ -92,7 +90,7 @@ function createMainWindow(): BrowserWindow {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
-      preload: join(__dirname, 'preload.js'),
+      preload: join(__dirname, 'preload.cjs'),
     },
   });
 
@@ -150,7 +148,18 @@ function registerIpcHandlers(): void {
     }
 
     const resolvedRoot = root;
-    const info = detectProject(resolvedRoot);
+    const validated = validateProjectRoot(resolvedRoot);
+
+    if (!validated.valid) {
+      currentProject = null;
+      transcriptStore = null;
+      agentLogger = null;
+      agentSupervisor.setLogger(null);
+      commandRunner.onCommandComplete = undefined;
+      throw new Error(validated.reason);
+    }
+
+    const info = detectProject(validated.projectRoot);
 
     if (!info) {
       currentProject = null;
@@ -158,19 +167,19 @@ function registerIpcHandlers(): void {
       agentLogger = null;
       agentSupervisor.setLogger(null);
       commandRunner.onCommandComplete = undefined;
-      return null;
+      throw new Error('not_a_project');
     }
 
     currentProject = info;
-    addRecentProject(await recentProjectsPath(), resolvedRoot, info.title);
+    addRecentProject(await recentProjectsPath(), validated.projectRoot, info.title);
 
-    transcriptStore = new TranscriptStore(resolvedRoot);
+    transcriptStore = new TranscriptStore(validated.projectRoot);
     await transcriptStore.load();
     commandRunner.onCommandComplete = async (event) => {
       await transcriptStore?.append(event);
     };
 
-    agentLogger = new AgentLogger(resolvedRoot);
+    agentLogger = new AgentLogger(validated.projectRoot);
     await agentLogger.load();
     agentSupervisor.setLogger(agentLogger);
 
