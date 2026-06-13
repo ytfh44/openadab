@@ -16,6 +16,7 @@ import type {
   CommandEvent,
   CommandOutputEvent,
   TranscriptGetEventsRequest,
+  CliCheckResult,
 } from '../shared/ipc-types.js';
 
 /** Allowed CLI subcommands (first-level argument). */
@@ -422,6 +423,9 @@ interface QueuedMutatingCommand {
  * emits streaming output events to the renderer, and persists results
  * via a transcript store callback.
  */
+
+/** Result returned by {@link CommandRunner.check}. */
+
 export class CommandRunner {
   /** Currently running child processes, keyed by command ID. */
   private activeCommands = new Map<string, ChildProcess>();
@@ -734,6 +738,74 @@ export class CommandRunner {
   get mutatingQueueLength(): number {
     return this.mutatingQueue.length;
   }
+
+  /**
+   * Resolves the CLI entrypoint and optionally spawns it with a test command
+   * to verify it is reachable.
+   *
+   * Intended to be called from the `cli:check` IPC handler at startup so the
+   * renderer can display a "CLI not found" warning before the user tries to
+   * run any command.
+   *
+   * @returns A structured result describing the resolution and test outcome.
+   */
+  async check(): Promise<CliCheckResult> {
+    const resolved = resolveOpenAdabCli({
+      cliPath: this.configuredCliPath,
+      env: this.runnerEnv,
+      workspaceRoot: this.workspaceRoot,
+      isPackaged: this.isPackagedOption,
+      resourcesPath: this.resourcesPathOverride,
+    });
+
+    let spawnOk = false;
+    let spawnError: string | undefined;
+
+    try {
+      const child = spawn(resolved.command, [...resolved.argsPrefix, '--help'], {
+        env: { ...this.runnerEnv },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (err) spawnError = err.message;
+          resolve();
+        };
+
+        child.on('error', (err) => done(err));
+        child.on('close', (code) => {
+          spawnOk = code === 0;
+          done();
+        });
+
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          spawnError = 'CLI check timed out after 5 seconds';
+          done();
+        }, 5000);
+      });
+    } catch (err) {
+      spawnOk = false;
+      spawnError = String(err);
+    }
+
+    return {
+      resolved: true,
+      command: resolved.command,
+      argsPrefix: resolved.argsPrefix,
+      source: resolved.source,
+      displayPath: resolved.displayPath,
+      spawnOk,
+      spawnError,
+    };
+  }
+
 
   /**
    * Check if a list of args would be allowed (used by tests).

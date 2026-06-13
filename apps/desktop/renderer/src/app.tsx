@@ -120,12 +120,12 @@ const App: React.FC = () => {
     [],
   );
 
-  /** Open an existing project via user prompt. */
+  /** Open an existing project via native system file picker. */
   const handleOpenExisting = useCallback(async () => {
-    const path = window.prompt('Enter project root path:');
-    if (!path || !path.trim()) return;
+    const path = await window.openadab.selectProjectFolder('Select OpenAdab Project');
+    if (!path) return;
     try {
-      await window.openadab.openProject({ projectRoot: path.trim() });
+      await window.openadab.openProject({ projectRoot: path });
       await fetchProjectInfo();
     } catch (e) {
       window.alert(

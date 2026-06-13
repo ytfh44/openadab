@@ -19,11 +19,13 @@ export const IpcChannel = {
   PROJECT_OPEN: 'project:open',
   PROJECT_GET_INFO: 'project:get-info',
   PROJECT_LIST_RECENT: 'project:list-recent',
+  PROJECT_SELECT_FOLDER: 'project:select-folder',
 
   // ── CLI ──
   CLI_RUN: 'cli:run',
   CLI_CANCEL: 'cli:cancel',
   CLI_GET_HISTORY: 'cli:get-history',
+  CLI_CHECK: 'cli:check',
 
   // ── File ──
   FILE_READ: 'file:read',
@@ -130,6 +132,21 @@ export const CommandEventSchema = z.object({
 });
 
 export type CommandEvent = z.infer<typeof CommandEventSchema>;
+
+
+// ─── CLI Check ───────────────────────────────────────────
+
+export const CliCheckResultSchema = z.object({
+  resolved: z.boolean(),
+  command: z.string(),
+  argsPrefix: z.array(z.string()),
+  source: z.string(),
+  displayPath: z.string(),
+  spawnOk: z.boolean(),
+  spawnError: z.string().optional(),
+});
+
+export type CliCheckResult = z.infer<typeof CliCheckResultSchema>;
 
 // ─── File Schemas ─────────────────────────────────────────
 
@@ -302,12 +319,17 @@ export interface OpenAdabPreloadApi {
   getProjectInfo(): Promise<ProjectInfo | null>;
   listRecentProjects(): Promise<RecentProject[]>;
 
+  selectProjectFolder(title?: string): Promise<string | null>;
+
   // ── CLI ──
   runCli(request: CliRunRequest): Promise<CommandEvent>;
   cancelCli(request: CliCancelRequest): Promise<void>;
   getCliHistory(
     request?: TranscriptGetEventsRequest,
   ): Promise<CommandEvent[]>;
+
+  // ── CLI Check ──
+  checkCli(): Promise<CliCheckResult>;
 
   // ── File ──
   readFile(request: FileReadRequest): Promise<FileReadResponse>;

@@ -222,10 +222,11 @@ export function addRecentProject(
  */
 export async function showOpenProjectDialog(
   parentWindow: BrowserWindow | null,
+  title?: string,
 ): Promise<string | null> {
   const { dialog } = await import('electron');
   const options = {
-    title: 'Select OpenAdab Project Directory',
+    title: title ?? 'Select OpenAdab Project Directory',
     properties: ['openDirectory' as const],
   };
   const result = parentWindow

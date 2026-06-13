@@ -25,6 +25,7 @@ import type {
   FileListDirResponse,
   FileWatchRequest,
   TranscriptGetEventsRequest,
+  CliCheckResult,
   AgentStartSessionRequest,
   AgentSendMessageRequest,
   PermissionResponse,
@@ -49,6 +50,11 @@ const api: OpenAdabPreloadApi = {
     return ipcRenderer.invoke('project:list-recent');
   },
 
+  selectProjectFolder(title?: string): Promise<string | null> {
+    return ipcRenderer.invoke('project:select-folder', title);
+
+  },
+
   // ── CLI ──
   runCli(request: CliRunRequest): Promise<CommandEvent> {
     return ipcRenderer.invoke('cli:run', request);
@@ -62,6 +68,11 @@ const api: OpenAdabPreloadApi = {
     request?: TranscriptGetEventsRequest,
   ): Promise<CommandEvent[]> {
     return ipcRenderer.invoke('cli:get-history', request);
+  },
+
+  // ── CLI Check ──
+  checkCli(): Promise<CliCheckResult> {
+    return ipcRenderer.invoke('cli:check');
   },
 
   // ── File ──

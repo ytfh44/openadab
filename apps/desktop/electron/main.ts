@@ -48,6 +48,7 @@ import {
 
 /** Whether the app is running from source (unpackaged). */
 const isDev = !app.isPackaged;
+const WORKSPACE_ROOT = join(__dirname, '..', '..', '..', '..');
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -58,7 +59,10 @@ let currentProject: ProjectInfo | null = null;
 let transcriptStore: TranscriptStore | null = null;
 
 /** Singleton command runner for spawning openadab processes. */
-const commandRunner = new CommandRunner();
+const commandRunner = new CommandRunner({
+  isPackaged: !isDev,
+  workspaceRoot: WORKSPACE_ROOT,
+});
 
 /** Singleton agent supervisor for managing agent processes and sessions. */
 const agentSupervisor = new AgentSupervisor();
@@ -73,10 +77,10 @@ const fileWatchers = new Map<string, FSWatcher>();
  * Create the main application window with secure web preferences.
  *
  * Security defaults:
- * - `contextIsolation: true` �?preload scripts run in isolated world
- * - `nodeIntegration: false` �?renderer has no Node.js access
- * - `sandbox: true` �?renderer runs in OS sandbox (platform-dependent)
- * - `webSecurity: true` �?same-origin policy enforced
+ * - `contextIsolation: true` �?preload scripts run in isolated world
+ * - `nodeIntegration: false` �?renderer has no Node.js access
+ * - `sandbox: true` �?renderer runs in OS sandbox (platform-dependent)
+ * - `webSecurity: true` �?same-origin policy enforced
  */
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -202,7 +206,11 @@ function registerIpcHandlers(): void {
     return loadRecentProjects(await recentProjectsPath());
   });
 
-  // ── CLI handlers (real implementations �?Section 3) ──────
+  ipcMain.handle('project:select-folder', async (_event, title?: string) => {
+    return showOpenProjectDialog(mainWindow, title);
+  });
+
+  // ── CLI handlers (real implementations �?Section 3) ──────
   ipcMain.handle('cli:run', async (event, request) => {
     const parseResult = CliRunRequestSchema.safeParse(request);
     if (!parseResult.success) {
@@ -238,7 +246,12 @@ function registerIpcHandlers(): void {
     );
   });
 
-  // ── File handlers ────────────────────────────────
+  // ── CLI check handler ─────────────────────────────
+  ipcMain.handle('cli:check', async () => {
+    return commandRunner.check();
+  });
+
+
   ipcMain.handle('file:read', async (_event, request) => {
     if (!currentProject) {
       throw new Error('No project is open.');
@@ -295,7 +308,7 @@ function registerIpcHandlers(): void {
           return response;
         }
       } catch {
-        // File does not exist yet �?no conflict possible.
+        // File does not exist yet �?no conflict possible.
       }
     }
 
@@ -413,7 +426,7 @@ function registerIpcHandlers(): void {
     }
   });
 
-  // ── Transcript handlers (real implementations �?Section 3)
+  // ── Transcript handlers (real implementations �?Section 3)
   ipcMain.handle('transcript:get-events', async (_event, request) => {
     if (!transcriptStore) return [];
     const parseResult =
@@ -429,7 +442,7 @@ function registerIpcHandlers(): void {
     }
   });
 
-  // ── Agent handlers (real �?Section 11) ────────────────
+  // ── Agent handlers (real �?Section 11) ────────────────
   ipcMain.handle('agent:start-session', async (_event, request) => {
     if (!agentSupervisor.isConfigured()) {
       throw new Error('No agent configured. Configure an agent in the Agent Dock to get started.');
