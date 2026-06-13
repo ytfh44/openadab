@@ -75,3 +75,12 @@ adab/log.md
 adab/wiki/index.md
 adab/wiki/overview.md
 adab/wiki/contradictions.md
+
+# Sub-project (apps/*) build outputs
+apps/*/dist-electron/
+apps/*/renderer/dist/
+apps/*/e2e/screenshots/
+apps/*/.vite/
+
+# Vite cache (anywhere)
+.vite/

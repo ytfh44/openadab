@@ -1,0 +1,44 @@
+{
+  "name": "@openadab/desktop",
+  "version": "0.1.0",
+  "description": "OpenAdab Electron desktop GUI",
+  "type": "module",
+  "main": "./dist-electron/electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n renderer,electron \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:renderer": "vite",
+    "dev:electron": "electron .",
+    "build": "vite build && tsc -p tsconfig.electron.json",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest watch"
+  },
+  "keywords": [
+    "openadab",
+    "desktop",
+    "electron",
+    "fiction",
+    "workflow"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "concurrently": "^9.2.1",
+    "electron": "^34.5.8",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.6",
+    "wait-on": "^8.0.4"
+  }
+}
