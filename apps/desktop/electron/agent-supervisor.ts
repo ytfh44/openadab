@@ -39,6 +39,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { AcpClient } from "./acp-client.js";
 import { AgentLogger } from "./agent-logger.js";
+import { getInstallRoot, findBinary, getBundledSearchDirs } from "./resolve-bundled-binary.js";
 
 // ─── Permission Classification ─────────────────────────────
 
@@ -164,6 +165,29 @@ function formatToolCallPreview(tc: ToolCallUpdate): string {
   return `${title} ${input}`.trim();
 }
 
+
+/**
+ * Resolve the bundled opencode CLI binary when running in a packaged app.
+ *
+ * In a packaged (electron-builder) build, the NSIS installer downloads
+ * `opencode.exe` to `$INSTDIR` and the app can also ship one via
+ * `extraResources`.  This function searches those locations first.
+ *
+ * Falls back to the configured command (which itself may be a bare name
+ * resolved from PATH) when no bundled binary is found.
+ */
+function resolveOpencodeCommand(configuredCommand: string): string {
+  // Only search for bundled binary when using the default mode
+  if (!process.resourcesPath) return configuredCommand;
+
+  const installRoot = getInstallRoot();
+  const dirs = getBundledSearchDirs(installRoot);
+  const bundled = findBinary("opencode", dirs);
+  if (bundled) return bundled;
+
+  return configuredCommand;
+}
+
 // ─── Supervisor ────────────────────────────────────────────
 
 /**
@@ -244,7 +268,7 @@ export class AgentSupervisor {
     const sessionId = randomUUID();
     const effectiveConfig = {
       ...request,
-      agentCommand: request.agentCommand || this.config.agentCommand,
+      agentCommand: resolveOpencodeCommand(request.agentCommand || this.config.agentCommand),
       args: request.args.length > 0 ? request.args : this.config.args,
       cwd: request.cwd || this.config.cwd,
     };

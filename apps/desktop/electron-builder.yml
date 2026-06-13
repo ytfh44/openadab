@@ -1,0 +1,34 @@
+appId: com.openadab.desktop
+productName: OpenAdab
+copyright: "Copyright © 2026 OpenAdab"
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - dist-electron/**/*
+  - renderer/dist/**/*
+  - package.json
+
+extraResources:
+  - from: scripts/download-opencode.ps1
+    to: download-opencode.ps1
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  include: scripts/installer.nsh
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: OpenAdab

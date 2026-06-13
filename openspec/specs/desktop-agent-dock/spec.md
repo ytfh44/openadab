@@ -1,7 +1,7 @@
 # desktop-agent-dock Specification
 
 ## Purpose
-TBD - created by archiving change add-electron-desktop-gui. Update Purpose after archive.
+Defines the Agent Dock for managing agent sessions via ACP, including bundled opencode CLI resolution in packaged builds.
 ## Requirements
 ### Requirement: Agent Dock shall be optional and subordinate to the GUI workflow
 The desktop app SHALL remain fully usable without an agent configured or running.
@@ -26,14 +26,18 @@ The Agent Dock SHALL connect to OpenCode ACP by default where available and allo
 
 #### Scenario: Start default agent
 - **WHEN** the user starts the default agent
-- **THEN** the main process SHALL start or connect to the configured OpenCode ACP process
+- **THEN** the main process SHALL resolve the opencode CLI from bundled app resources (`$INSTDIR/`, `resources/cli/`, `resources/`) when the app is packaged and a bundled binary exists, falling back to the configured `agentCommand` or PATH
 - **AND** the session SHALL be listed with id, mode, status, and transcript
 
 #### Scenario: Agent command fails to spawn
-- **WHEN** the configured agent executable is missing or cannot be launched
+- **WHEN** no bundled binary exists and the configured agent executable is missing or cannot be launched from PATH
 - **THEN** the main process SHALL return or emit an error state before the renderer treats the session as active
 - **AND** exactly one failure event SHALL be logged for the attempted session
 
+#### Scenario: Bundled opencode in packaged app
+- **WHEN** the app is packaged and `opencode.exe` exists in `$INSTDIR` (downloaded by NSIS installer)
+- **THEN** the agent supervisor SHALL use the absolute path to `$INSTDIR/opencode.exe` as the agent command
+- **AND** this SHALL take precedence over the configured `agentCommand` default of `"opencode"`
 #### Scenario: Custom agent command
 - **WHEN** the user configures a custom agent command
 - **THEN** the command SHALL be stored as desktop app preference

@@ -1,16 +1,22 @@
 # desktop-cli-bridge Specification
 
 ## Purpose
-TBD - created by archiving change add-electron-desktop-gui. Update Purpose after archive.
+Defines the IPC bridge between the Electron main process and the OpenAdab CLI, including binary resolution in both development and packaged (NSIS) environments.
 ## Requirements
 ### Requirement: CLI bridge shall execute OpenAdab through managed child processes
 The desktop app SHALL run authoritative OpenAdab operations by resolving an executable OpenAdab CLI entrypoint, spawning it with argument arrays, and setting an explicit cwd for each command.
 
 #### Scenario: Resolve CLI executable
 - **WHEN** the desktop app starts in development, workspace, packaged, or globally installed mode
-- **THEN** the command runner SHALL resolve the CLI from an explicit configured path when present, then from the local workspace/package build output when present, then from `PATH`
+- **THEN** the command runner SHALL resolve the CLI from an explicit configured path when present, then from the local workspace/package build output when present, then from bundled app resources (`$INSTDIR/`, `resources/cli/`, `resources/`) when packaged, then from `PATH`
 - **AND** it SHALL preserve argument-array spawning for every resolution strategy
+- **AND** on Windows it SHALL search for `.exe`, `.cmd`, and `.bat` variants
+- **AND** resolution SHALL work with install paths containing spaces, CJK characters, or other Unicode code points
 
+#### Scenario: Resolve CLI in packaged app
+- **WHEN** the app is packaged (electron-builder NSIS install)
+- **THEN** the command runner SHALL search `$INSTDIR` (the directory containing `OpenAdab.exe`) for an `openadab` binary before checking `resources/cli/` and `resources/`
+- **AND** the full absolute path SHALL be used for spawning, not a bare command name
 #### Scenario: CLI executable missing
 - **WHEN** no executable OpenAdab CLI can be resolved
 - **THEN** a renderer command request SHALL produce one failed transcript event with stdout, stderr, timestamps, initiator, and a clear executable-resolution error

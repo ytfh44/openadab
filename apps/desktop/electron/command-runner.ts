@@ -8,6 +8,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { getInstallRoot } from './resolve-bundled-binary.js';
 import { dirname, extname, resolve } from 'node:path';
 import type { WebContents } from 'electron';
 import type {
@@ -139,15 +140,29 @@ const PATH_FALLBACK_COMMAND = 'openadab';
  * Searches for a bundled CLI binary in packaged app resources.
  */
 function findPackagedCliEntrypoint(resourcesPathOverride?: string): string | undefined {
-  const root = resourcesPathOverride ?? process.resourcesPath;
-  if (!root) return undefined;
-  const candidates = [
-    resolve(root, 'cli', 'openadab'),
-    resolve(root, 'cli', 'openadab.cmd'),
-    resolve(root, 'cli', 'openadab.bat'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
+  const resourcesRoot = resourcesPathOverride ?? process.resourcesPath;
+  const installRoot = resourcesPathOverride
+    ? dirname(resourcesPathOverride)
+    : getInstallRoot();
+
+  const searchDirs: string[] = [];
+  if (installRoot) searchDirs.push(installRoot);
+  if (resourcesRoot) {
+    searchDirs.push(
+      resolve(resourcesRoot, 'cli'),
+      resourcesRoot,
+    );
+  }
+
+  const names = process.platform === 'win32'
+    ? ['openadab.exe', 'openadab.cmd', 'openadab.bat', 'openadab']
+    : ['openadab'];
+
+  for (const dir of searchDirs) {
+    for (const name of names) {
+      const candidate = resolve(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
   }
   return undefined;
 }

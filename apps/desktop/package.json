@@ -14,7 +14,9 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest watch"
+    "test:watch": "vitest watch",
+    "package:win": "npm run build:renderer && npm run build:electron && electron-builder --win --x64",
+    "package:dir": "npm run build:renderer && npm run build:electron && electron-builder --win --x64 --dir"
   },
   "keywords": [
     "openadab",
@@ -37,6 +39,7 @@
     "@vitejs/plugin-react": "^4.5.0",
     "concurrently": "^9.2.1",
     "electron": "^34.5.8",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.9.3",
     "vite": "^6.3.5",
     "vitest": "^3.2.6",
