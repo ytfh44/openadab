@@ -32,3 +32,4 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: OpenAdab
+

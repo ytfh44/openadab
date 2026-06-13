@@ -1,7 +1,7 @@
 /**
  * Project Init Module — scaffolds a new OpenAdab project directory.
  */
-import { open, readFile, readdir, copyFile, unlink } from 'node:fs/promises';
+import { open, readFile, readdir, copyFile, unlink, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import YAML from 'yaml';
@@ -40,7 +40,7 @@ export interface InitOptions {
 export class ProjectInitializer {
   private readonly targetDir: string;
   private readonly lockPath: string;
-  private lockFd: { close: () => Promise<void> } | null = null;
+  private lockFd: FileHandle | null = null;
 
   /**
    * @param targetDir Absolute path to the target project root.
@@ -131,8 +131,9 @@ export class ProjectInitializer {
    */
   private async acquireLock(): Promise<void> {
     try {
-      this.lockFd = await open(this.lockPath, 'wx');
-      await this.lockFd.writeFile(`${String(process.pid)}\n`, 'utf-8');
+      const fd = await open(this.lockPath, 'wx');
+      this.lockFd = fd;
+      await fd.writeFile(`${String(process.pid)}\n`, 'utf-8');
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'EEXIST') {

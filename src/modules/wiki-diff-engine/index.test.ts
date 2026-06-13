@@ -587,26 +587,16 @@ describe('WikiDiffParser edge cases (refactor stress tests)', () => {
   });
 
   it('does not dedup two ops of different types with the same payload string', async () => {
-    // REGRESSION / PRE-EXISTING BUG EXPOSURE:
-    //
-    // The dedup key in `parse()` is built as
-    //   `${op.target}::${op.action}::${this.dedupPayload(op)}`
-    // but `WikiDiffOperation` has no `action` field — it has `type`.
-    // At runtime `op.action` is `undefined`, so the key collapses
-    // to `${target}::undefined::${payload}`. Two different op types
-    // whose payload serializes to the same string therefore collide
-    // and the second is wrongly flagged as a duplicate.
-    //
-    // We construct the collision: an `add_current_state` whose
-    // content is the same string as an `add_evidence` whose
-    // evidence is the same string. The schema-correct behaviour is
-    // to keep both ops; the current behaviour throws.
+    // Two different op types whose payload serializes to the same
+    // string must NOT be treated as duplicates because the dedup key
+    // includes the operation type.
     const markdown = `---\nchangeId: ch\n---\n\n` +
       `### [[a]]\nSource: s.md\n\n` +
       `#### Add to Current State\n- shared\n\n` +
       `### [[a]]\nSource: s.md\n\n` +
       `#### Add Evidence\n- shared\n`;
-    await expect(parser.parse(markdown)).rejects.toThrow(/Duplicate operation/);
+    const result = await parser.parse(markdown);
+    expect(result.operations).toHaveLength(2);
   });
 
   it('all seven section types can co-exist in a single block', async () => {

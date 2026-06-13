@@ -85,7 +85,7 @@ export class WikiDiffParser {
           // content (or different supporting fields) are not falsely treated
           // as duplicates. The spec ("Duplicate operation detection") calls
           // for an exact match on type, target AND content.
-          const dedupKey = `${op.target}::${op.action}::${this.dedupPayload(op)}`;
+          const dedupKey = `${op.target}::${op.type}::${this.dedupPayload(op)}`;
           if (seen.has(dedupKey)) {
             throw new WikiDiffParseError(`Duplicate operation detected for target ${op.target}`);
           }
@@ -1111,3 +1111,4 @@ export class WikiDiffApplier {
     return end;
   }
 }
+
