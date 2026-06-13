@@ -141,6 +141,36 @@ const DEFAULT_CONFIG: AgentConfig = {
   mode: "opencode-default",
 };
 
+function getToolCallTargetPaths(rawInput: unknown): string[] {
+  const paths: string[] = [];
+  if (!rawInput || typeof rawInput !== "object") {
+    return paths;
+  }
+  const obj = rawInput as Record<string, unknown>;
+  const pathKeys = ["path", "filepath", "target", "to", "file", "filename", "name", "dest", "destination"];
+  for (const key of Object.keys(obj)) {
+    if (pathKeys.includes(key.toLowerCase())) {
+      const val = obj[key];
+      if (typeof val === "string") {
+        paths.push(val);
+      }
+    }
+  }
+  return paths;
+}
+
+function isForbiddenPath(p: string): boolean {
+  const norm = p.replace(/\\/g, "/").toLowerCase();
+  return (
+    norm.startsWith("adab/wiki/") ||
+    norm.includes("/adab/wiki/") ||
+    norm === "adab/wiki" ||
+    norm.startsWith("adab/manuscript/") ||
+    norm.includes("/adab/manuscript/") ||
+    norm === "adab/manuscript"
+  );
+}
+
 /** Maps a `ToolCallUpdate` to an `AgentCapability` for permission routing. */
 function mapToolCallToCapability(tc: ToolCallUpdate): AgentCapability {
   const title = tc.title?.toLowerCase() ?? "";
@@ -292,11 +322,12 @@ export class AgentSupervisor {
       `Starting agent: ${effectiveConfig.agentCommand} ${effectiveConfig.args.join(" ")}`,
     );
 
+    let acpClient: AcpClient | null = null;
     try {
       const isCustom = this.config.mode === "custom-command";
       const initializeTimeoutMs = isCustom ? 15_000 : 30_000;
 
-      const acpClient = new AcpClient({
+      acpClient = new AcpClient({
         command: effectiveConfig.agentCommand,
         args: effectiveConfig.args,
         cwd: effectiveConfig.cwd || process.cwd(),
@@ -382,6 +413,9 @@ export class AgentSupervisor {
 
       return { sessionId };
     } catch (err) {
+      if (acpClient) {
+        try { acpClient.close(); } catch { /* ignore */ }
+      }
       const spawnFailedEvent: AgentSpawnFailedEvent = {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
@@ -659,6 +693,37 @@ export class AgentSupervisor {
     }
 
     const capability = mapToolCallToCapability(req.toolCall);
+
+    // Check for forbidden direct canon mutation
+    const title = req.toolCall.title?.toLowerCase() ?? "";
+    const kind = req.toolCall.kind;
+    const isWriteOrEdit =
+      kind === "edit" ||
+      kind === "delete" ||
+      kind === "move" ||
+      title.includes("write") ||
+      title.includes("edit") ||
+      title.includes("modify");
+
+    if (isWriteOrEdit) {
+      const paths = getToolCallTargetPaths(req.toolCall.rawInput);
+      for (const p of paths) {
+        if (isForbiddenPath(p)) {
+          this.emitAgentMessage(
+            sessionId,
+            "system",
+            `Direct modification of ${p} is forbidden. Please use Wiki Diff Review, sync, archive, or manuscript diff flow.`,
+          );
+          const rejectOpt = req.options.find(
+            (o) => o.kind === "reject_once" || o.kind === "reject_always",
+          );
+          return rejectOpt
+            ? { outcome: { outcome: "selected", optionId: rejectOpt.optionId } }
+            : { outcome: { outcome: "cancelled" } };
+        }
+      }
+    }
+
     const permissionId = randomUUID();
 
     // Auto-approve check

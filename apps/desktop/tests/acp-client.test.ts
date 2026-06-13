@@ -210,8 +210,9 @@ describe("AcpClient", () => {
       mockResolvers.initResolve!(defaultInitResponse());
       await startPromise;
 
+      const sessionPromise = client.newSession("/test");
       mockResolvers.newSessionResolve!({ sessionId: "s1" });
-      await client.newSession("/test");
+      await sessionPromise;
 
       const promptPromise = client.sendPrompt("s1", "Hello");
       mockResolvers.promptResolve!({ stopReason: "end_turn" });

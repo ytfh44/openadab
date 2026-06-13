@@ -22,6 +22,7 @@ let newSessionResolve: ((v: NewSessionResponse) => void) | null = null;
 let newSessionReject: ((e: Error) => void) | null = null;
 let sendPromptResolve: ((v: PromptResponse) => void) | null = null;
 let sendPromptReject: ((e: Error) => void) | null = null;
+let mockChildEmitter: ReturnType<typeof createMockChildEmitter> | null = null;
 
 let capturedCallbacks: {
   onSessionUpdate?: (n: SessionNotification) => void;
@@ -37,10 +38,13 @@ function resetMutable() {
   newSessionReject = null;
   sendPromptResolve = null;
   sendPromptReject = null;
+  mockChildEmitter = null;
   capturedCallbacks = {};
 }
 
 function createMockAcpClient() {
+  const child = createMockChildEmitter();
+  mockChildEmitter = child;
   return {
     start: vi.fn().mockImplementation(() => {
       return new Promise<InitializeResponse>((resolve, reject) => {
@@ -62,7 +66,7 @@ function createMockAcpClient() {
     }),
     cancel: vi.fn().mockResolvedValue(undefined),
     close: vi.fn(),
-    getChildProcess: vi.fn().mockReturnValue(createMockChildEmitter()),
+    getChildProcess: vi.fn().mockReturnValue(child),
     get initialized() {
       return true;
     },
@@ -139,6 +143,14 @@ function makeStartRequest(overrides: Record<string, unknown> = {}) {
     cwd: "/test/project",
     ...overrides,
   };
+}
+
+async function waitForResolver<T>(fn: () => T | null | undefined): Promise<T> {
+  while (true) {
+    const val = fn();
+    if (val) return val;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 function defaultInitResponse(): InitializeResponse {
@@ -233,8 +245,10 @@ describe("AgentSupervisor ACP session lifecycle", () => {
 
   async function startAndResolve() {
     const p = supervisor.startSession(makeStartRequest());
-    startResolve!(defaultInitResponse());
-    newSessionResolve!(defaultNewSessionResponse());
+    const resolveStart = await waitForResolver(() => startResolve);
+    resolveStart(defaultInitResponse());
+    const resolveNewSession = await waitForResolver(() => newSessionResolve);
+    resolveNewSession(defaultNewSessionResponse());
     return await p;
   }
 
@@ -256,13 +270,14 @@ describe("AgentSupervisor ACP session lifecycle", () => {
 
   it("handles initialize timeout", async () => {
     const p = supervisor.startSession(makeStartRequest());
-    startReject!(new Error("timed out after 30000ms"));
+    const rejectStart = await waitForResolver(() => startReject);
+    rejectStart(new Error("timed out after 30000ms"));
     await expect(p).rejects.toThrow("timed out");
   });
 
   it("handles process close event", async () => {
     await startAndResolve();
-    const child = vi.mocked(AcpClient).mock.results[0]?.value.getChildProcess();
+    const child = mockChildEmitter!;
     child.exitCode = 0;
     child.emit("close", 0, null);
     expect(sender.send).toHaveBeenCalledWith(
@@ -273,7 +288,8 @@ describe("AgentSupervisor ACP session lifecycle", () => {
 
   it("handles spawn failure", async () => {
     const p = supervisor.startSession(makeStartRequest());
-    startReject!(new Error("Spawn failed: ENOENT"));
+    const rejectStart = await waitForResolver(() => startReject);
+    rejectStart(new Error("Spawn failed: ENOENT"));
     await expect(p).rejects.toThrow("Spawn failed");
     expect(supervisor.getSessionStatus().status).toBe("none");
   });
@@ -295,8 +311,10 @@ describe("AgentSupervisor session update", () => {
       mode: "opencode-default",
     });
     const p = supervisor.startSession(makeStartRequest());
-    startResolve!(defaultInitResponse());
-    newSessionResolve!(defaultNewSessionResponse());
+    const resolveStart = await waitForResolver(() => startResolve);
+    resolveStart(defaultInitResponse());
+    const resolveNewSession = await waitForResolver(() => newSessionResolve);
+    resolveNewSession(defaultNewSessionResponse());
     await p;
   });
 
@@ -533,8 +551,10 @@ describe("AgentSupervisor ACP permission", () => {
       mode: "opencode-default",
     });
     const p = supervisor.startSession(makeStartRequest());
-    startResolve!(defaultInitResponse());
-    newSessionResolve!(defaultNewSessionResponse());
+    const resolveStart = await waitForResolver(() => startResolve);
+    resolveStart(defaultInitResponse());
+    const resolveNewSession = await waitForResolver(() => newSessionResolve);
+    resolveNewSession(defaultNewSessionResponse());
     await p;
   });
 
@@ -571,6 +591,93 @@ describe("AgentSupervisor ACP permission", () => {
     expect(sender.send).toHaveBeenCalledWith(
       "event:permission-request",
       expect.objectContaining({ capability: "run_cli" }),
+    );
+  });
+
+  it("automatically rejects direct modifications to adab/wiki/", async () => {
+    expect(capturedCallbacks.onPermissionRequest).toBeDefined();
+
+    const result = capturedCallbacks.onPermissionRequest!({
+      sessionId: "acp-session-123",
+      toolCall: {
+        toolCallId: "tc-write-wiki",
+        title: "write_file",
+        kind: "edit",
+        rawInput: { path: "adab/wiki/homepage.md", content: "hello" },
+      },
+      options: [
+        { kind: "allow_once", name: "Allow", optionId: "allow-1" },
+        { kind: "reject_once", name: "Deny", optionId: "reject-1" },
+      ],
+    });
+
+    // Should resolve synchronously to selected optionId: "reject-1"
+    expect(result).not.toBeInstanceOf(Promise);
+    expect((result as RequestPermissionResponse).outcome).toEqual({
+      outcome: "selected",
+      optionId: "reject-1",
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        role: "system",
+        content: expect.stringContaining("Direct modification of adab/wiki/homepage.md is forbidden"),
+      }),
+    );
+  });
+
+  it("automatically rejects direct modifications to adab/manuscript/", async () => {
+    expect(capturedCallbacks.onPermissionRequest).toBeDefined();
+
+    const result = capturedCallbacks.onPermissionRequest!({
+      sessionId: "acp-session-123",
+      toolCall: {
+        toolCallId: "tc-write-ms",
+        title: "edit_file",
+        kind: "edit",
+        rawInput: { filePath: "adab/manuscript/chapters/ch1.md", text: "hello" },
+      },
+      options: [
+        { kind: "allow_once", name: "Allow", optionId: "allow-1" },
+        { kind: "reject_once", name: "Deny", optionId: "reject-1" },
+      ],
+    });
+
+    expect(result).not.toBeInstanceOf(Promise);
+    expect((result as RequestPermissionResponse).outcome).toEqual({
+      outcome: "selected",
+      optionId: "reject-1",
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        role: "system",
+        content: expect.stringContaining("Direct modification of adab/manuscript/chapters/ch1.md is forbidden"),
+      }),
+    );
+  });
+
+  it("allows modifications to other paths (e.g. adab/changes/)", async () => {
+    expect(capturedCallbacks.onPermissionRequest).toBeDefined();
+
+    const result = capturedCallbacks.onPermissionRequest!({
+      sessionId: "acp-session-123",
+      toolCall: {
+        toolCallId: "tc-write-draft",
+        title: "write_file",
+        kind: "edit",
+        rawInput: { path: "adab/changes/draft-123.md", content: "hello" },
+      },
+      options: [
+        { kind: "allow_once", name: "Allow", optionId: "allow-1" },
+        { kind: "reject_once", name: "Deny", optionId: "reject-1" },
+      ],
+    });
+
+    expect(result).toBeInstanceOf(Promise);
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:permission-request",
+      expect.objectContaining({ capability: "write_artifact_draft" }),
     );
   });
 });
