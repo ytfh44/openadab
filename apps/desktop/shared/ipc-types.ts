@@ -45,6 +45,7 @@ export const IpcChannel = {
   AGENT_APPROVE_PERMISSION: 'agent:approve-permission',
   AGENT_DENY_PERMISSION: 'agent:deny-permission',
   AGENT_SPAWN_FAILED: 'agent:spawn-failed',
+  AGENT_HANDSHAKE_FAILED: 'agent:handshake-failed',
 
   // ── Events (main → renderer) ──
   EVENT_COMMAND_OUTPUT: 'event:command-output',
@@ -53,6 +54,7 @@ export const IpcChannel = {
   EVENT_AGENT_MESSAGE: 'event:agent-message',
   EVENT_PERMISSION_REQUEST: 'event:permission-request',
   EVENT_AGENT_SPAWN_FAILED: 'event:agent-spawn-failed',
+  EVENT_AGENT_HANDSHAKE_FAILED: 'event:agent-handshake-failed',
 } as const;
 
 export type IpcChannel = (typeof IpcChannel)[keyof typeof IpcChannel];
@@ -252,6 +254,7 @@ export const PermissionResponseSchema = z.object({
 export type PermissionResponse = z.infer<typeof PermissionResponseSchema>;
 
 export const AgentStartSessionRequestSchema = z.object({
+  /** Agent command to spawn. For 'opencode-default' mode, the agent SHALL support ACP (Agent Client Protocol) JSON-RPC 2.0 over stdio. */
   agentCommand: z.string(),
   args: z.array(z.string()).default([]),
   cwd: z.string(),
@@ -303,6 +306,15 @@ export const AgentSpawnFailedEventSchema = z.object({
 });
 
 export type AgentSpawnFailedEvent = z.infer<typeof AgentSpawnFailedEventSchema>;
+
+export const AgentHandshakeFailedEventSchema = z.object({
+  sessionId: z.string(),
+  error: z.string(),
+  reason: z.enum(['timeout', 'version_mismatch', 'spawn_error']),
+  timestamp: z.string(),
+});
+
+export type AgentHandshakeFailedEvent = z.infer<typeof AgentHandshakeFailedEventSchema>;
 
 // ─── Preload API Surface ──────────────────────────────────
 
@@ -372,6 +384,9 @@ export interface OpenAdabPreloadApi {
   onAgentSpawnFailed(
     callback: (event: AgentSpawnFailedEvent) => void,
   ): () => void;
+  onAgentHandshakeFailed(
+    callback: (event: AgentHandshakeFailedEvent) => void,
+  ): () => void;
 }
 
 // ─── Desktop Selection (Renderer State) ───────────────────
@@ -394,3 +409,4 @@ export const DesktopSelectionSchema = z.object({
 });
 
 export type DesktopSelection = z.infer<typeof DesktopSelectionSchema>;
+

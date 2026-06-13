@@ -24,7 +24,7 @@ export interface AgentConfigState {
 }
 
 const DEFAULT_OPECODE_COMMAND = 'opencode';
-const DEFAULT_OPECODE_ARGS = 'agent --acp';
+const DEFAULT_OPECODE_ARGS = 'acp';
 
 interface AgentConfigPanelProps {
   /** Current configuration state. */
@@ -148,7 +148,7 @@ const AgentConfigPanel: React.FC<AgentConfigPanelProps> = ({
           <input
             type="text"
             disabled={sessionActive}
-            placeholder="e.g. agent --acp --model sonnet"
+            placeholder="e.g. acp --model sonnet"
             value={config.args}
             onChange={(e) => update({ args: e.target.value })}
             style={inputStyle(sessionActive)}

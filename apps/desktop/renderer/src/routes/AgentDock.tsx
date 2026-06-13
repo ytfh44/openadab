@@ -29,7 +29,7 @@ interface AgentDockProps {
 const DEFAULT_CONFIG: AgentConfigState = {
   mode: 'opencode-default',
   agentCommand: 'opencode',
-  args: 'agent --acp',
+  args: 'acp',
   cwd: '',
   apiKey: '',
 };

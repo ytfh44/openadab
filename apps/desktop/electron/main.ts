@@ -160,7 +160,7 @@ function registerIpcHandlers(): void {
       currentProject = null;
       transcriptStore = null;
       agentLogger = null;
-      agentSupervisor.setLogger(null);
+      agentSupervisor.attachLogger(null);
       commandRunner.onCommandComplete = undefined;
       const result: ProjectOpenResult = { success: false, reason: validated.reason };
       return result;
@@ -172,7 +172,7 @@ function registerIpcHandlers(): void {
       currentProject = null;
       transcriptStore = null;
       agentLogger = null;
-      agentSupervisor.setLogger(null);
+      agentSupervisor.attachLogger(null);
       commandRunner.onCommandComplete = undefined;
       const result: ProjectOpenResult = { success: false, reason: 'not_a_project' };
       return result;
@@ -189,7 +189,7 @@ function registerIpcHandlers(): void {
 
     agentLogger = new AgentLogger(validated.projectRoot);
     await agentLogger.load();
-    agentSupervisor.setLogger(agentLogger);
+    agentSupervisor.attachLogger(agentLogger);
 
     const result: ProjectOpenResult = { success: true, project: currentProject };
     return result;
@@ -472,7 +472,7 @@ function registerIpcHandlers(): void {
     if (!parseResult.success) {
       throw new Error(`Invalid approve-permission request: ${parseResult.error.message}`);
     }
-    await agentSupervisor.approvePermission(parseResult.data);
+    await agentSupervisor.respondToPermission(parseResult.data.requestId, true);
   });
 
   ipcMain.handle('agent:deny-permission', async (_event, request) => {
@@ -480,7 +480,7 @@ function registerIpcHandlers(): void {
     if (!parseResult.success) {
       throw new Error(`Invalid deny-permission request: ${parseResult.error.message}`);
     }
-    await agentSupervisor.denyPermission(parseResult.data);
+    await agentSupervisor.respondToPermission(parseResult.data.requestId, false);
   });
 }
 
@@ -489,7 +489,7 @@ function registerIpcHandlers(): void {
 app.whenReady().then(async () => {
   registerIpcHandlers();
   mainWindow = createMainWindow();
-  agentSupervisor.setSender(mainWindow.webContents);
+  agentSupervisor.attachSender(mainWindow.webContents);
   await loadRenderer(mainWindow);
 
   app.on('activate', () => {
@@ -505,3 +505,5 @@ app.on('window-all-closed', () => {
     app.quit();
   }
 });
+
+

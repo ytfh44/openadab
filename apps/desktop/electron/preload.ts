@@ -34,6 +34,7 @@ import type {
   AgentMessageEvent,
   PermissionRequest,
   AgentSpawnFailedEvent,
+  AgentHandshakeFailedEvent,
 } from '../shared/ipc-types.js';
 
 const api: OpenAdabPreloadApi = {
@@ -222,6 +223,23 @@ const api: OpenAdabPreloadApi = {
     };
   },
 
+  onAgentHandshakeFailed(
+    callback: (event: AgentHandshakeFailedEvent) => void,
+  ): () => void {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      data: AgentHandshakeFailedEvent,
+    ): void => {
+      callback(data);
+    };
+    ipcRenderer.on('event:agent-handshake-failed', handler);
+    return () => {
+      ipcRenderer.removeListener('event:agent-handshake-failed', handler);
+    };
+  },
+
 };
 
 contextBridge.exposeInMainWorld('openadab', api);
+
+

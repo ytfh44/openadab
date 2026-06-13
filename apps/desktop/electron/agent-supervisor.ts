@@ -1,10 +1,10 @@
 /**
  * Agent process/session supervisor for the Electron main process.
  *
- * Spawns agent processes via `child_process.spawn()` using ACP (Agent Communication
- * Protocol) — simple JSON-based messaging over stdin/stdout. Manages session
- * lifecycle, permission routing between agent and renderer, and graceful degradation
- * when no agent is configured or the agent process fails.
+ * Spawns agent processes via `AcpClient` using the ACP (Agent Client Protocol)
+ * JSON-RPC 2.0 over stdio. Manages session lifecycle, permission routing
+ * between agent and renderer, and graceful degradation when no agent is
+ * configured or the agent process fails.
  *
  * Permission rules:
  * - Low-risk capabilities (`read_project_file`, `write_artifact_draft`) can be
@@ -15,10 +15,9 @@
  * - `run_cli` requires explicit approval each time.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { createInterface, type Interface } from 'node:readline';
-import type { WebContents } from 'electron';
+import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
+import type { WebContents } from "electron";
 import type {
   AgentStartSessionRequest,
   AgentSendMessageRequest,
@@ -27,29 +26,40 @@ import type {
   PermissionResponse,
   AgentCapability,
   AgentSpawnFailedEvent,
-} from '../shared/ipc-types.js';
-import { AgentLogger } from './agent-logger.js';
+} from "../shared/ipc-types.js";
+import type {
+  SessionNotification,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionUpdate,
+  ToolCall,
+  ToolCallUpdate,
+  ContentBlock,
+  PlanEntry,
+} from "@agentclientprotocol/sdk";
+import { AcpClient } from "./acp-client.js";
+import { AgentLogger } from "./agent-logger.js";
 
 // ─── Permission Classification ─────────────────────────────
 
 /** Capabilities that can be auto-approved after one per-session approval. */
 const LOW_RISK_CAPABILITIES: ReadonlySet<AgentCapability> = new Set([
-  'read_project_file',
-  'write_artifact_draft',
+  "read_project_file",
+  "write_artifact_draft",
 ]);
 
 /** Capabilities that mutate canon and ALWAYS require explicit user approval. */
 const CANON_MUTATION_CAPABILITIES: ReadonlySet<AgentCapability> = new Set([
-  'modify_wiki',
-  'modify_manuscript',
-  'apply_wiki_diff',
-  'sync_change',
-  'archive_change',
+  "modify_wiki",
+  "modify_manuscript",
+  "apply_wiki_diff",
+  "sync_change",
+  "archive_change",
 ]);
 
 /** Capabilities that always require explicit user approval each time. */
 const ALWAYS_REQUIRE_APPROVAL: ReadonlySet<AgentCapability> = new Set([
-  'run_cli',
+  "run_cli",
   ...CANON_MUTATION_CAPABILITIES,
 ]);
 
@@ -77,27 +87,37 @@ export function alwaysRequiresApproval(capability: AgentCapability): boolean {
 // ─── Session Model ─────────────────────────────────────────
 
 /** Possible states of an agent session. */
-export type AgentSessionStatus = 'starting' | 'running' | 'stopped' | 'error';
+export type AgentSessionStatus =
+  | "starting"
+  | "running"
+  | "stopped"
+  | "error";
 
-/** A pending permission request waiting for user response. */
-interface PendingPermission {
-  request: PermissionRequest;
-  resolve: (approved: boolean) => void;
+/** A pending permission request with promise resolvers. */
+interface PendingAcpPermission {
+  request: RequestPermissionRequest;
+  resolveResponse: (response: RequestPermissionResponse) => void;
+  rejectResponse: (err: Error) => void;
+  /** Our internal capability classification. */
+  capability: AgentCapability;
+  /** The renderer-facing permission request ID. */
+  requestId: string;
 }
 
 /** A single agent session tracked by the supervisor. */
 interface AgentSession {
   sessionId: string;
   status: AgentSessionStatus;
-  child: ChildProcess | null;
-  lineReader: Interface | null;
+  acpClient: AcpClient | null;
+  /** ACP sessionId returned by `newSession`. */
+  acpSessionId: string | null;
   config: AgentStartSessionRequest;
   startedAt: string;
   errorMessage?: string;
   /** Capabilities that have been explicitly approved this session. */
   approvedCapabilities: Set<AgentCapability>;
-  /** Pending permission requests awaiting user response. */
-  pendingPermissions: Map<string, PendingPermission>;
+  /** Pending ACP permission requests awaiting user response. */
+  pendingAcpPermissions: Map<string, PendingAcpPermission>;
   /** Whether lifecycle events (close/error) have already been handled. */
   settled: boolean;
 }
@@ -110,24 +130,46 @@ export interface AgentConfig {
   args: string[];
   cwd: string;
   apiKey?: string;
-  mode: 'opencode-default' | 'custom-command' | 'none';
+  mode: "opencode-default" | "custom-command" | "none";
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
-  agentCommand: 'opencode',
-  args: ['agent', '--acp'],
-  cwd: '',
-  mode: 'opencode-default',
+  agentCommand: "opencode",
+  args: ["acp"],
+  cwd: "",
+  mode: "opencode-default",
 };
+
+/** Maps a `ToolCallUpdate` to an `AgentCapability` for permission routing. */
+function mapToolCallToCapability(tc: ToolCallUpdate): AgentCapability {
+  const title = tc.title?.toLowerCase() ?? "";
+  const kind = tc.kind;
+  if (kind === "execute" || title.includes("bash") || title.includes("terminal")) {
+    return "run_cli";
+  }
+  if (kind === "edit" || kind === "delete" || kind === "move" || title.includes("write")) {
+    return "write_artifact_draft";
+  }
+  if (kind === "read" || kind === "search" || title.includes("read") || title.includes("grep") || title.includes("list")) {
+    return "read_project_file";
+  }
+  return "read_project_file";
+}
+
+/** Format a tool call for display in the permission request. */
+function formatToolCallPreview(tc: ToolCallUpdate): string {
+  const title = tc.title ?? "unknown";
+  const input =
+    tc.rawInput != null ? JSON.stringify(tc.rawInput) : "";
+  return `${title} ${input}`.trim();
+}
 
 // ─── Supervisor ────────────────────────────────────────────
 
 /**
- * Manages agent child processes, sessions, and permission routing.
+ * Manages agent child processes via ACP, sessions, and permission routing.
  *
- * Only one session can be active at a time. The supervisor communicates
- * with the renderer via `WebContents.send()` for events and coordinates
- * permission requests through a resolve/reject promise pattern.
+ * Only one session can be active at a time.
  */
 export class AgentSupervisor {
   /** Currently active session, if any. */
@@ -139,48 +181,43 @@ export class AgentSupervisor {
   /** Logger for agent events. */
   private logger: AgentLogger | null = null;
 
-  /** Reference to the main window's WebContents for sending events. */
+  /** Electron web contents for IPC events to the renderer. */
   private sender: WebContents | null = null;
 
-  // ── Public API ──────────────────────────────────────────
+  /** Mutating-command lock (shared with CommandRunner). */
+  private mutatingRunning = false;
 
-  /** Set the agent configuration. */
-  setConfig(config: AgentConfig): void {
-    this.config = config;
+  attachLogger(logger: AgentLogger | null): void {
+    this.logger = logger;
   }
 
-  /** Get the current agent configuration. */
+  attachSender(sender: WebContents): void {
+    this.sender = sender;
+  }
+
+  updateConfig(config: AgentConfig): void {
+    this.config = { ...config };
+  }
+
   getConfig(): AgentConfig {
     return { ...this.config };
   }
 
-  /** Set the logger instance (called when project is opened). */
-  setLogger(logger: AgentLogger | null): void {
-    this.logger = logger;
-  }
-
-  /** Set the sender for IPC events. */
-  setSender(sender: WebContents): void {
-    this.sender = sender;
-  }
-
-  /** Whether the agent is configured (mode is not 'none' and command is set). */
   isConfigured(): boolean {
     return (
-      this.config.mode !== 'none' &&
+      this.config.mode !== "none" &&
       this.config.agentCommand.trim().length > 0
     );
   }
 
-  /** Get current session status for the UI. */
   getSessionStatus(): {
     sessionId: string | null;
-    status: AgentSessionStatus | 'none';
+    status: AgentSessionStatus | "none";
     startedAt: string | null;
     errorMessage?: string;
   } {
     if (!this.session) {
-      return { sessionId: null, status: 'none', startedAt: null };
+      return { sessionId: null, status: "none", startedAt: null };
     }
     return {
       sessionId: this.session.sessionId,
@@ -191,16 +228,17 @@ export class AgentSupervisor {
   }
 
   /**
-   * Start a new agent session.
-   *
-   * Spawns the configured agent command as a child process, sets up
-   * stdin/stdout JSON line protocol, and begins reading agent messages.
+   * Start a new agent session via ACP.
    */
   async startSession(
     request: AgentStartSessionRequest,
   ): Promise<{ sessionId: string }> {
-    if (this.session && this.session.status !== 'stopped' && this.session.status !== 'error') {
-      throw new Error('An agent session is already active. Stop it first.');
+    if (
+      this.session &&
+      this.session.status !== "stopped" &&
+      this.session.status !== "error"
+    ) {
+      throw new Error("An agent session is already active. Stop it first.");
     }
 
     const sessionId = randomUUID();
@@ -213,304 +251,431 @@ export class AgentSupervisor {
 
     const session: AgentSession = {
       sessionId,
-      status: 'starting',
-      child: null,
-      lineReader: null,
+      status: "starting",
+      acpClient: null,
+      acpSessionId: null,
       config: effectiveConfig,
       startedAt: new Date().toISOString(),
       approvedCapabilities: new Set(),
-      pendingPermissions: new Map(),
+      pendingAcpPermissions: new Map(),
       settled: false,
     };
 
     this.session = session;
-    await this.logger?.logSessionEvent('session_start', sessionId, `Starting agent: ${effectiveConfig.agentCommand} ${effectiveConfig.args.join(' ')}`);
+    await this.logger?.logSessionEvent(
+      "session_start",
+      sessionId,
+      `Starting agent: ${effectiveConfig.agentCommand} ${effectiveConfig.args.join(" ")}`,
+    );
 
     try {
-      const child = spawn(effectiveConfig.agentCommand, effectiveConfig.args, {
+      const isCustom = this.config.mode === "custom-command";
+      const initializeTimeoutMs = isCustom ? 15_000 : 30_000;
+
+      const acpClient = new AcpClient({
+        command: effectiveConfig.agentCommand,
+        args: effectiveConfig.args,
         cwd: effectiveConfig.cwd || process.cwd(),
-        env: { ...process.env },
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
+        initializeTimeoutMs,
+        onSessionUpdate: (notification) => {
+          this.handleSessionUpdate(sessionId, notification);
+        },
+        onPermissionRequest: (req) => {
+          return this.handleAcpPermissionRequest(sessionId, req);
+        },
       });
 
-      session.child = child;
-      session.status = 'running';
+      // ACP initialize handshake
+      const initResponse = await acpClient.start();
+      this.emitAgentMessage(
+        sessionId,
+        "system",
+        `Agent connected: ${initResponse.agentInfo?.name ?? "unknown"} v${initResponse.agentInfo?.version ?? "?"} (protocol v${initResponse.protocolVersion})`,
+      );
 
-      // Set up line reader for stdout (ACP messages)
-      const lineReader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
-      session.lineReader = lineReader;
+      // Create ACP session
+      const newSessionResponse = await acpClient.newSession(
+        effectiveConfig.cwd || process.cwd(),
+      );
+      const acpSessionId = newSessionResponse.sessionId;
 
-      lineReader.on('line', (line: string) => {
-        this.handleAgentLine(sessionId, line);
-      });
+      session.acpClient = acpClient;
+      session.acpSessionId = acpSessionId;
+      session.status = "running";
 
-      // Handle stderr as system messages
-      if (child.stderr) {
-        const stderrReader = createInterface({ input: child.stderr, crlfDelay: Infinity });
-        stderrReader.on('line', (line: string) => {
-          this.emitAgentMessage(sessionId, 'system', line);
+      // Child process lifecycle events
+      const child = acpClient.getChildProcess();
+      if (child) {
+        child.on("close", (code, signal) => {
+          if (session.settled) return;
+          session.settled = true;
+          const reason = signal
+            ? `Process terminated by signal ${signal}`
+            : `Process exited with code ${code}`;
+          this.emitAgentMessage(sessionId, "system", reason);
+          if (session.status === "running") {
+            session.status = "stopped";
+            session.acpClient = null;
+          }
+          this.logger
+            ?.logSessionEvent("session_stop", sessionId, reason)
+            .catch(() => {});
         });
+
+        child.on("error", (err) => {
+          if (session.settled) return;
+          session.settled = true;
+          session.status = "error";
+          session.errorMessage = err.message;
+          session.acpClient = null;
+          this.emitAgentMessage(
+            sessionId,
+            "system",
+            `Agent error: ${err.message}`,
+          );
+          this.logger
+            ?.logSessionEvent("session_error", sessionId, err.message)
+            .catch(() => {});
+        });
+
+        // Forward stderr
+        if (child.stderr) {
+          const stderrReader = createInterface({
+            input: child.stderr,
+            crlfDelay: Infinity,
+          });
+          stderrReader.on("line", (line: string) => {
+            this.emitAgentMessage(sessionId, "system", line);
+          });
+        }
       }
 
-      child.on('close', (code, signal) => {
-        if (session.settled) return;
-        session.settled = true;
-        const reason = signal
-          ? `Process terminated by signal ${signal}`
-          : `Process exited with code ${code}`;
-        this.emitAgentMessage(sessionId, 'system', reason);
-        if (session.status === 'running') {
-          session.status = 'stopped';
-          session.child = null;
-          session.lineReader = null;
-        }
-        this.logger?.logSessionEvent('session_stop', sessionId, reason).catch(() => {});
-      });
-
-      child.on('error', (err) => {
-        if (session.settled) return;
-        session.settled = true;
-        session.status = 'error';
-        session.errorMessage = err.message;
-        session.child = null;
-        session.lineReader = null;
-        this.emitAgentMessage(sessionId, 'system', `Agent error: ${err.message}`);
-        this.logger?.logSessionEvent('session_error', sessionId, err.message).catch(() => {});
-      });
-
-      this.emitAgentMessage(sessionId, 'system', `Agent session started: ${effectiveConfig.agentCommand}`);
+      this.emitAgentMessage(
+        sessionId,
+        "system",
+        `Agent session started: ${effectiveConfig.agentCommand} (ACP session: ${acpSessionId})`,
+      );
 
       return { sessionId };
     } catch (err) {
-      // Surface spawn failure to renderer before marking session as error
       const spawnFailedEvent: AgentSpawnFailedEvent = {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
         timestamp: new Date().toISOString(),
       };
-      this.sender?.send('event:agent-spawn-failed', spawnFailedEvent);
+      this.sender?.send("event:agent-spawn-failed", spawnFailedEvent);
 
-      session.status = 'error';
-      session.errorMessage = err instanceof Error ? err.message : String(err);
-      this.emitAgentMessage(sessionId, 'system', `Failed to start agent: ${session.errorMessage}`);
-      await this.logger?.logSessionEvent('session_error', sessionId, session.errorMessage);
+      session.status = "error";
+      session.errorMessage =
+        err instanceof Error ? err.message : String(err);
+      this.emitAgentMessage(
+        sessionId,
+        "system",
+        `Failed to start agent: ${session.errorMessage}`,
+      );
+      await this.logger?.logSessionEvent(
+        "session_error",
+        sessionId,
+        session.errorMessage,
+      );
       this.session = null;
       throw err;
     }
   }
 
   /**
-   * Send a message to the active agent session.
+   * Send a message to the active agent session via ACP `session/prompt`.
    */
   async sendMessage(request: AgentSendMessageRequest): Promise<void> {
     const session = this.session;
     if (!session || session.sessionId !== request.sessionId) {
       throw new Error(`No active session with ID ${request.sessionId}`);
     }
-    if (!session.child || session.status !== 'running') {
-      throw new Error('Agent session is not running');
+    if (!session.acpClient || session.status !== "running") {
+      throw new Error("Agent session is not running");
+    }
+    if (!session.acpSessionId) {
+      throw new Error("No ACP session ID");
     }
 
-    const acpMessage = JSON.stringify({ type: 'message', content: request.message }) + '\n';
-    session.child.stdin!.write(acpMessage);
+    await session.acpClient.sendPrompt(
+      session.acpSessionId,
+      request.message,
+    );
   }
 
   /**
-   * Stop the active agent session.
+   * Stop the active agent session via ACP `session/cancel` + close.
    */
   async stopSession(sessionId: string): Promise<void> {
     const session = this.session;
-    if (!session || session.sessionId !== sessionId) {
-      return;
-    }
-
-    // Capture child reference before nullifying session.child below,
-    // so timeout callbacks hold a stable reference.
-    const child = session.child;
-
-    // Send graceful shutdown message over stdin
-    if (child?.stdin) {
-      try {
-        child.stdin.write(JSON.stringify({ type: 'shutdown' }) + '\n');
-      } catch {
-        // stdin may already be closed
-      }
-    }
-
-    // Schedule process termination escalation only for still-running children
-    if (child && child.exitCode === null && child.pid !== undefined) {
-      const sigtermTimer = setTimeout(() => {
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // Already gone
-        }
-        // Escalate to SIGKILL after grace period
-        const sigkillTimer = setTimeout(() => {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            // Already gone
-          }
-        }, 3000);
-        child.on('close', () => clearTimeout(sigkillTimer));
-      }, 2000);
-      child.on('close', () => clearTimeout(sigtermTimer));
-    }
-    session.status = 'stopped';
-    session.child = null;
-    if (session.lineReader) {
-      session.lineReader.close();
-      session.lineReader = null;
-    }
-
-    // Reject all pending permissions
-    for (const [id, pending] of session.pendingPermissions) {
-      pending.resolve(false);
-      session.pendingPermissions.delete(id);
-    }
-
-    await this.logger?.logSessionEvent('session_stop', sessionId, 'User stopped session');
-  }
-
-  /**
-   * Approve a pending permission request.
-   */
-  async approvePermission(response: PermissionResponse): Promise<void> {
-    const session = this.session;
-    if (!session) return;
-
-    const pending = session.pendingPermissions.get(response.requestId);
-    if (pending) {
-      // Track the approved capability for auto-approval
-      session.approvedCapabilities.add(pending.request.capability);
-      pending.resolve(true);
-      session.pendingPermissions.delete(response.requestId);
-      await this.logger?.logPermissionResponse(response, session.sessionId);
-    }
-  }
-
-  /**
-   * Deny a pending permission request.
-   */
-  async denyPermission(response: PermissionResponse): Promise<void> {
-    const session = this.session;
-    if (!session) return;
-
-    const pending = session.pendingPermissions.get(response.requestId);
-    if (pending) {
-      pending.resolve(false);
-      session.pendingPermissions.delete(response.requestId);
-      await this.logger?.logPermissionResponse(response, session.sessionId);
-    }
-  }
-
-  // ── Private: ACP Message Handling ───────────────────────
-
-  /** Parse and route an incoming line from the agent process. */
-  private handleAgentLine(sessionId: string, line: string): void {
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(line.trim()) as Record<string, unknown>;
-    } catch {
-      // Non-JSON line — emit as raw system message
-      this.emitAgentMessage(sessionId, 'system', line);
-      return;
-    }
-
-    const msgType = parsed.type as string | undefined;
-
-    switch (msgType) {
-      case 'message':
-        this.emitAgentMessage(sessionId, 'agent', (parsed.content as string) ?? line);
-        break;
-      case 'tool_call':
-        this.handleToolCall(sessionId, parsed);
-        break;
-      case 'permission_request':
-        this.handlePermissionRequest(sessionId, parsed);
-        break;
-      case 'status':
-        // Agent status update — forward as system message
-        this.emitAgentMessage(sessionId, 'system', `Status: ${JSON.stringify(parsed.status)}`);
-        break;
-      default:
-        this.emitAgentMessage(sessionId, 'system', line);
-    }
-  }
-
-  /** Handle a tool_call message from the agent. */
-  private async handleToolCall(
-    sessionId: string,
-    parsed: Record<string, unknown>,
-  ): Promise<void> {
-    const toolName = (parsed.tool as string) ?? 'unknown';
-    const args = parsed.args;
-    const success = (parsed.success as boolean) ?? true;
-    const error = parsed.error as string | undefined;
-    await this.logger?.logToolCall(toolName, args, sessionId, success, error);
-    this.emitAgentMessage(sessionId, 'system', `Tool call: ${toolName} ${success ? '✓' : '✗'}`);
-  }
-
-  /** Handle a permission_request message from the agent. */
-  private handlePermissionRequest(
-    sessionId: string,
-    parsed: Record<string, unknown>,
-  ): void {
-    const session = this.session;
     if (!session || session.sessionId !== sessionId) return;
 
-    const capability = (parsed.capability as AgentCapability) ?? 'read_project_file';
-    const scope = (Array.isArray(parsed.scope) ? parsed.scope : []) as string[];
-
-    const requestId = randomUUID();
-    const request: PermissionRequest = {
-      id: requestId,
-      requestedBy: 'agent',
-      capability,
-      scope,
-      commandPreview: parsed.commandPreview as string | undefined,
-      diffPreview: parsed.diffPreview as unknown,
-    };
-
-    // Check auto-approval rules
-    if (this.canAutoApprove(capability, session)) {
-      this.emitAgentMessage(
-        sessionId,
-        'system',
-        `Auto-approved: ${capability}`,
-      );
-      // Send approval back to agent process
-      this.sendApprovalToAgent(requestId, true);
-      this.logger?.logPermissionResponse(
-        { requestId, approved: true },
-        sessionId,
-      ).catch(() => {});
-      return;
+    const client = session.acpClient;
+    if (client && session.acpSessionId) {
+      try {
+        await client.cancel(session.acpSessionId);
+      } catch { /* ignore */ }
+      client.close();
     }
 
-    // Store pending and emit event to renderer
-    const promise = new Promise<boolean>((resolve) => {
-      session.pendingPermissions.set(requestId, { request, resolve });
-    });
-
-    this.logger?.logPermissionRequest(request, sessionId).catch(() => {});
-
-    // Emit to renderer for user decision
-    this.sender?.send('event:permission-request', request);
-
-    // Wait for user response asynchronously
-    promise.then((approved) => {
-      this.sendApprovalToAgent(requestId, approved);
-    }).catch(() => {
-      this.sendApprovalToAgent(requestId, false);
-    });
+    session.status = "stopped";
+    session.acpClient = null;
+    session.acpSessionId = null;
   }
 
   /**
-   * Determine whether a capability can be auto-approved for this session.
+   * Handle a user's response to a pending permission request.
+   * Called from the IPC handler (formerly approvePermission/denyPermission).
+   *
+   * @param requestId - The renderer-facing permission request ID.
+   * @param approved - Whether the user approved.
    */
+  respondToPermission(requestId: string, approved: boolean): void {
+    const session = this.session;
+    if (!session) return;
+
+    const pending = session.pendingAcpPermissions.get(requestId);
+    if (!pending) return;
+
+    session.pendingAcpPermissions.delete(requestId);
+
+    if (approved) {
+      session.approvedCapabilities.add(pending.capability);
+    }
+
+    // Find the matching option in the original request
+    const options = pending.request.options;
+    const targetKind = approved ? "allow_once" : "reject_once";
+    const fallbackKind = approved ? "allow_always" : "reject_always";
+    const chosenOpt =
+      options.find((o) => o.kind === targetKind) ??
+      options.find((o) => o.kind === fallbackKind);
+
+    if (chosenOpt) {
+      pending.resolveResponse({
+        outcome: { outcome: "selected" as const, optionId: chosenOpt.optionId },
+      });
+    } else {
+      pending.resolveResponse({
+        outcome: { outcome: "cancelled" as const },
+      });
+    }
+
+    this.logger
+      ?.logPermissionResponse({ requestId, approved }, session.sessionId)
+      .catch(() => {});
+  }
+
+  setMutatingRunning(running: boolean): void {
+    this.mutatingRunning = running;
+  }
+
+  // ── Private: ACP Notification Handling ──────────────────
+
+
+  private handleSessionUpdate(
+    sessionId: string,
+    notification: SessionNotification,
+  ): void {
+    const update: SessionUpdate = notification.update;
+    const updateType = (update as { sessionUpdate?: string }).sessionUpdate;
+
+    switch (updateType) {
+      // ── Content chunks ──────────────────────────────
+      case "user_message_chunk":
+      case "agent_message_chunk": {
+        const text = this.extractContentText(update);
+        if (text) {
+          this.emitAgentMessage(sessionId, "agent", text);
+        }
+        break;
+      }
+      case "agent_thought_chunk": {
+        const text = this.extractContentText(update);
+        if (text) {
+          this.emitAgentMessage(sessionId, "system", `[thought] ${text}`);
+        }
+        break;
+      }
+      // ── Tool calls ──────────────────────────────────
+      case "tool_call": {
+        const toolCall = update as unknown as ToolCall;
+        const toolName = toolCall.title ?? "unknown";
+        this.logger
+          ?.logToolCall(toolName, toolCall, sessionId, true, undefined)
+          .catch(() => {});
+        this.emitAgentMessage(
+          sessionId,
+          "system",
+          `Tool call: ${toolName} (id: ${toolCall.toolCallId})`,
+        );
+        break;
+      }
+      case "tool_call_update": {
+        const tcu = update as unknown as ToolCallUpdate;
+        this.emitAgentMessage(
+          sessionId,
+          "system",
+          `Tool call update: ${tcu.title ?? tcu.toolCallId}`,
+        );
+        break;
+      }
+      // ── Plans ───────────────────────────────────────
+      case "plan":
+      case "plan_update": {
+        const plan = update as unknown as { entries?: PlanEntry[] };
+        if (plan.entries && plan.entries.length > 0) {
+          for (const entry of plan.entries) {
+            const truncated = entry.content.length > 200
+              ? entry.content.slice(0, 200) + "..."
+              : entry.content;
+            this.emitAgentMessage(
+              sessionId,
+              "system",
+              `[plan ${entry.status}] ${truncated}`,
+            );
+          }
+        }
+        break;
+      }
+      case "plan_removed": {
+        this.emitAgentMessage(sessionId, "system", "Plan removed");
+        break;
+      }
+      // ── Metadata updates ────────────────────────────
+      case "available_commands_update": {
+        this.emitAgentMessage(sessionId, "system", "Available commands updated");
+        break;
+      }
+      case "current_mode_update": {
+        const modeUpdate = update as unknown as { modeId?: string };
+        this.emitAgentMessage(
+          sessionId,
+          "system",
+          `Mode switched to: ${modeUpdate.modeId ?? "unknown"}`,
+        );
+        break;
+      }
+      case "config_option_update": {
+        this.emitAgentMessage(sessionId, "system", "Config option updated");
+        break;
+      }
+      case "session_info_update": {
+        this.emitAgentMessage(sessionId, "system", "Session info updated");
+        break;
+      }
+      case "usage_update": {
+        const usage = update as unknown as { used?: number; size?: number };
+        const used = usage.used ?? 0;
+        const size = usage.size ?? 0;
+        const pct = size > 0 ? Math.round((used / size) * 100) : 0;
+        this.emitAgentMessage(
+          sessionId,
+          "system",
+          `Context: ${used}/${size} tokens (${pct}%)`,
+        );
+        break;
+      }
+      default:
+        this.emitAgentMessage(
+          sessionId,
+          "system",
+          `[${updateType ?? "unknown"}]`,
+        );
+    }
+  }
+
+  /**
+   * Extract text from a ContentBlock within a content-chunk update.
+   * Returns the text for `type: "text"` blocks, a placeholder for images/audio,
+   * the URI for resource links, or null if no content is present.
+   */
+  private extractContentText(
+    update: SessionUpdate,
+  ): string | null {
+    const chunk = update as unknown as { content?: ContentBlock };
+    const content = chunk.content;
+    if (!content) return null;
+
+    switch (content.type) {
+      case "text":
+        return (content as unknown as { text: string }).text;
+      case "image":
+        return "[image]";
+      case "audio":
+        return "[audio]";
+      case "resource_link":
+        return (content as unknown as { uri: string }).uri;
+      case "resource":
+        return "[embedded resource]";
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Handle an ACP `requestPermission` from the agent.
+   * Returns synchronously for auto-approved/auto-denied, or a Promise
+   * that resolves when the user responds.
+   */
+  private handleAcpPermissionRequest(
+    sessionId: string,
+    req: RequestPermissionRequest,
+  ): Promise<RequestPermissionResponse> | RequestPermissionResponse {
+    const session = this.session;
+    if (!session || session.sessionId !== sessionId) {
+      // Default deny: pick first reject option
+      const rejectOpt = req.options.find(
+        (o) => o.kind === "reject_once" || o.kind === "reject_always",
+      );
+      return rejectOpt
+        ? { outcome: { outcome: "selected", optionId: rejectOpt.optionId } }
+        : { outcome: { outcome: "cancelled" } };
+    }
+
+    const capability = mapToolCallToCapability(req.toolCall);
+    const permissionId = randomUUID();
+
+    // Auto-approve check
+    if (this.canAutoApprove(capability, session)) {
+      this.emitAgentMessage(sessionId, "system", `Auto-approved: ${capability}`);
+      const allowOpt = req.options.find(
+        (o) => o.kind === "allow_once" || o.kind === "allow_always",
+      );
+      session.approvedCapabilities.add(capability);
+      return allowOpt
+        ? { outcome: { outcome: "selected", optionId: allowOpt.optionId } }
+        : { outcome: { outcome: "cancelled" } };
+    }
+
+    // Requires user approval: emit to renderer and wait asynchronously
+    const rendererRequest: PermissionRequest = {
+      id: permissionId,
+      requestedBy: "agent",
+      capability,
+      scope: req.toolCall.title ? [req.toolCall.title] : [],
+      commandPreview: formatToolCallPreview(req.toolCall),
+    };
+
+    this.logger
+      ?.logPermissionRequest(rendererRequest, sessionId)
+      .catch(() => {});
+
+    return new Promise<RequestPermissionResponse>((resolve, reject) => {
+      session.pendingAcpPermissions.set(permissionId, {
+        request: req,
+        resolveResponse: resolve,
+        rejectResponse: reject,
+        capability,
+        requestId: permissionId,
+      });
+
+      // Emit to renderer for user decision
+      this.sender?.send("event:permission-request", rendererRequest);
+    });
+  }
+
   private canAutoApprove(
     capability: AgentCapability,
     session: AgentSession,
@@ -522,32 +687,11 @@ export class AgentSupervisor {
     return false;
   }
 
-  /**
-   * Send approval/denial back to the agent process over stdin.
-   */
-  private sendApprovalToAgent(requestId: string, approved: boolean): void {
-    const session = this.session;
-    if (!session?.child || session.status !== 'running') return;
-
-    const msg = JSON.stringify({
-      type: 'permission_response',
-      requestId,
-      approved,
-    }) + '\n';
-
-    try {
-      session.child.stdin!.write(msg);
-    } catch {
-      // Agent process may have exited
-    }
-  }
-
   // ── Private: Event Emission ─────────────────────────────
 
-  /** Emit an agent message event to the renderer. */
   private emitAgentMessage(
     sessionId: string,
-    role: 'agent' | 'system',
+    role: "agent" | "system",
     content: string,
   ): void {
     const event: AgentMessageEvent = {
@@ -556,14 +700,17 @@ export class AgentSupervisor {
       content,
       timestamp: new Date().toISOString(),
     };
-    this.logger?.log({
-      timestamp: Date.now(),
-      iso: event.timestamp,
-      event: 'message',
-      description: `[${role}] ${content.slice(0, 200)}`,
-      sessionId,
-      payload: event,
-    }).catch(() => {});
-    this.sender?.send('event:agent-message', event);
+    this.logger
+      ?.log({
+        timestamp: Date.now(),
+        iso: event.timestamp,
+        event: "message",
+        description: `[${role}] ${content.slice(0, 200)}`,
+        sessionId,
+        payload: event,
+      })
+      .catch(() => {});
+    this.sender?.send("event:agent-message", event);
   }
 }
+

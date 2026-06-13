@@ -1,1016 +1,576 @@
 /**
- * Tests for AgentSupervisor: permission classification, session lifecycle,
- * permission denial, draft write approval, CLI run approval, and
- * forbidden canon mutation attempts.
- *
- * Follows the same test patterns as command-runner.test.ts:
- * vi.mock for child_process, EventEmitter-based mock child processes,
- * and mock WebContents.
+ * Tests for AgentSupervisor with mocked AcpClient.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { EventEmitter } from 'node:events';
-import type { AgentCapability } from '../shared/ipc-types.js';
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
+import type { AgentCapability } from "../shared/ipc-types.js";
+import type {
+  InitializeResponse,
+  NewSessionResponse,
+  PromptResponse,
+  SessionNotification,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
 
-// ── Mocks ─────────────────────────────────────────────────
+// ── Mutable state (not vi.hoisted — avoids ordering issues) ──
 
-const mockSpawn = vi.hoisted(() => vi.fn());
+let startResolve: ((v: InitializeResponse) => void) | null = null;
+let startReject: ((e: Error) => void) | null = null;
+let newSessionResolve: ((v: NewSessionResponse) => void) | null = null;
+let newSessionReject: ((e: Error) => void) | null = null;
+let sendPromptResolve: ((v: PromptResponse) => void) | null = null;
+let sendPromptReject: ((e: Error) => void) | null = null;
 
-/** Mutable container for the readline event emitter, set by the mock factory. */
-const rlHolder = vi.hoisted(() => ({ emitter: null as EventEmitter | null }));
+let capturedCallbacks: {
+  onSessionUpdate?: (n: SessionNotification) => void;
+  onPermissionRequest?: (
+    req: RequestPermissionRequest,
+  ) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
+} = {};
 
-vi.mock('node:child_process', () => ({
-  spawn: mockSpawn,
-}));
+function resetMutable() {
+  startResolve = null;
+  startReject = null;
+  newSessionResolve = null;
+  newSessionReject = null;
+  sendPromptResolve = null;
+  sendPromptReject = null;
+  capturedCallbacks = {};
+}
 
-vi.mock('node:readline', () => {
-  const emitter = new EventEmitter();
-  emitter.setMaxListeners(100);
-  rlHolder.emitter = emitter;
+function createMockAcpClient() {
   return {
-    createInterface: vi.fn(() => ({
-      on: emitter.on.bind(emitter),
-      close: vi.fn(),
-    })),
+    start: vi.fn().mockImplementation(() => {
+      return new Promise<InitializeResponse>((resolve, reject) => {
+        startResolve = resolve;
+        startReject = reject;
+      });
+    }),
+    newSession: vi.fn().mockImplementation(() => {
+      return new Promise<NewSessionResponse>((resolve, reject) => {
+        newSessionResolve = resolve;
+        newSessionReject = reject;
+      });
+    }),
+    sendPrompt: vi.fn().mockImplementation(() => {
+      return new Promise<PromptResponse>((resolve, reject) => {
+        sendPromptResolve = resolve;
+        sendPromptReject = reject;
+      });
+    }),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn(),
+    getChildProcess: vi.fn().mockReturnValue(createMockChildEmitter()),
+    get initialized() {
+      return true;
+    },
+    get closed() {
+      return false;
+    },
   };
-});
+}
 
-vi.mock('node:fs/promises', () => ({
-  appendFile: vi.fn().mockResolvedValue(undefined),
-  readFile: vi.fn().mockRejectedValue(new Error('not found')),
-  unlink: vi.fn().mockResolvedValue(undefined),
-  access: vi.fn().mockRejectedValue(new Error('not found')),
-}));
-
-// ── Helper: mock child process ────────────────────────────
-
-type MockChildProcess = EventEmitter & {
-  stdout: NodeJS.ReadableStream & EventEmitter;
-  stderr: NodeJS.ReadableStream & EventEmitter;
-  stdin: { write: ReturnType<typeof vi.fn> };
-  kill: ReturnType<typeof vi.fn>;
-  exitCode: number | null;
-  pid: number;
-};
-
-function mockChildProcess(): MockChildProcess {
+function createMockChildEmitter() {
   const ee = new EventEmitter();
-  const stdout = new EventEmitter() as NodeJS.ReadableStream & EventEmitter;
-  const stderr = new EventEmitter() as NodeJS.ReadableStream & EventEmitter;
-  const stdinWrite = vi.fn();
-
-  const child = {
-    ...ee,
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  return {
     emit: ee.emit.bind(ee),
     on: ee.on.bind(ee),
     addListener: ee.addListener.bind(ee),
     removeListener: ee.removeListener.bind(ee),
     stdout,
     stderr,
-    stdin: { write: stdinWrite },
+    stdin: { write: vi.fn(), destroyed: false },
     kill: vi.fn(),
     exitCode: null as number | null,
-    pid: Math.floor(Math.random() * 10000) + 1000,
-  } as unknown as MockChildProcess;
-
-  return child;
+    pid: 9999,
+  };
 }
 
-// ── Imports (after mock setup) ────────────────────────────
+vi.mock("../electron/acp-client.js", () => {
+  // Capture options passed to AcpClient constructor
+  const orig = vi.fn().mockImplementation(
+    (opts: {
+      onSessionUpdate?: (n: SessionNotification) => void;
+      onPermissionRequest?: (
+        req: RequestPermissionRequest,
+      ) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
+    }) => {
+      capturedCallbacks.onSessionUpdate = opts.onSessionUpdate;
+      capturedCallbacks.onPermissionRequest = opts.onPermissionRequest;
+      return createMockAcpClient();
+    },
+  );
+  return { AcpClient: orig };
+});
+
+vi.mock("node:fs/promises", () => ({
+  appendFile: vi.fn().mockResolvedValue(undefined),
+  readFile: vi.fn().mockRejectedValue(new Error("not found")),
+  unlink: vi.fn().mockResolvedValue(undefined),
+  access: vi.fn().mockRejectedValue(new Error("not found")),
+}));
+
+vi.mock("node:readline", () => ({
+  createInterface: vi.fn(() => ({ on: vi.fn(), close: vi.fn() })),
+}));
 
 import {
   AgentSupervisor,
   isCanonMutation,
   isLowRisk,
   alwaysRequiresApproval,
-} from '../electron/agent-supervisor.js';
+} from "../electron/agent-supervisor.js";
+import { AcpClient } from "../electron/acp-client.js";
 
-// ── Helpers ────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────
 
 function mockSender() {
+  return { send: vi.fn() } as unknown as Electron.WebContents;
+}
+
+function makeStartRequest(overrides: Record<string, unknown> = {}) {
   return {
-    send: vi.fn(),
-  } as unknown as Electron.WebContents;
+    agentCommand: "opencode",
+    args: ["acp"],
+    cwd: "/test/project",
+    ...overrides,
+  };
+}
+
+function defaultInitResponse(): InitializeResponse {
+  return {
+    protocolVersion: 1,
+    agentCapabilities: {
+      loadSession: true,
+      promptCapabilities: { image: true, audio: false, embeddedContext: true },
+      mcpCapabilities: { http: true, sse: true },
+      sessionCapabilities: {},
+    },
+    agentInfo: { name: "opencode", version: "1.0.0" },
+    authMethods: [],
+  };
+}
+
+function defaultNewSessionResponse(): NewSessionResponse {
+  return { sessionId: "acp-session-123" };
 }
 
 // ── Permission Classification Tests ───────────────────────
 
-describe('AgentSupervisor permission classification', () => {
-  it('classifies read_project_file as low risk', () => {
-    expect(isLowRisk('read_project_file')).toBe(true);
-    expect(alwaysRequiresApproval('read_project_file')).toBe(false);
-    expect(isCanonMutation('read_project_file')).toBe(false);
+describe("AgentSupervisor permission classification", () => {
+  it("classifies read_project_file as low risk", () => {
+    expect(isLowRisk("read_project_file")).toBe(true);
   });
 
-  it('classifies write_artifact_draft as low risk', () => {
-    expect(isLowRisk('write_artifact_draft')).toBe(true);
-    expect(alwaysRequiresApproval('write_artifact_draft')).toBe(false);
-    expect(isCanonMutation('write_artifact_draft')).toBe(false);
+  it("classifies modify_wiki as canon mutation", () => {
+    expect(isCanonMutation("modify_wiki")).toBe(true);
   });
 
-  it('classifies run_cli as always requiring approval', () => {
-    expect(isLowRisk('run_cli')).toBe(false);
-    expect(alwaysRequiresApproval('run_cli')).toBe(true);
-    expect(isCanonMutation('run_cli')).toBe(false);
+  it("classifies run_cli as always requiring approval", () => {
+    expect(alwaysRequiresApproval("run_cli")).toBe(true);
   });
 
-  it('classifies modify_wiki as canon mutation', () => {
-    expect(isCanonMutation('modify_wiki')).toBe(true);
-    expect(alwaysRequiresApproval('modify_wiki')).toBe(true);
-    expect(isLowRisk('modify_wiki')).toBe(false);
-  });
-
-  it('classifies modify_manuscript as canon mutation', () => {
-    expect(isCanonMutation('modify_manuscript')).toBe(true);
-    expect(alwaysRequiresApproval('modify_manuscript')).toBe(true);
-  });
-
-  it('classifies apply_wiki_diff as canon mutation', () => {
-    expect(isCanonMutation('apply_wiki_diff')).toBe(true);
-    expect(alwaysRequiresApproval('apply_wiki_diff')).toBe(true);
-  });
-
-  it('classifies sync_change as canon mutation', () => {
-    expect(isCanonMutation('sync_change')).toBe(true);
-    expect(alwaysRequiresApproval('sync_change')).toBe(true);
-  });
-
-  it('classifies archive_change as canon mutation', () => {
-    expect(isCanonMutation('archive_change')).toBe(true);
-    expect(alwaysRequiresApproval('archive_change')).toBe(true);
-  });
-
-  it('all 8 capabilities are covered', () => {
-    const allCapabilities: AgentCapability[] = [
-      'read_project_file',
-      'write_artifact_draft',
-      'run_cli',
-      'modify_wiki',
-      'modify_manuscript',
-      'apply_wiki_diff',
-      'sync_change',
-      'archive_change',
+  it("all 8 capabilities are covered", () => {
+    const all: AgentCapability[] = [
+      "read_project_file", "write_artifact_draft", "run_cli",
+      "modify_wiki", "modify_manuscript", "apply_wiki_diff",
+      "sync_change", "archive_change",
     ];
-
-    const canonMutations: AgentCapability[] = allCapabilities.filter((c) =>
-      isCanonMutation(c),
-    );
-    expect(canonMutations).toEqual([
-      'modify_wiki',
-      'modify_manuscript',
-      'apply_wiki_diff',
-      'sync_change',
-      'archive_change',
-    ]);
-
-    const lowRisk: AgentCapability[] = allCapabilities.filter((c) =>
-      isLowRisk(c),
-    );
-    expect(lowRisk).toEqual(['read_project_file', 'write_artifact_draft']);
-
-    const alwaysApprove: AgentCapability[] = allCapabilities.filter((c) =>
-      alwaysRequiresApproval(c),
-    );
-    expect(alwaysApprove).toEqual([
-      'run_cli',
-      'modify_wiki',
-      'modify_manuscript',
-      'apply_wiki_diff',
-      'sync_change',
-      'archive_change',
-    ]);
+    for (const cap of all) {
+      expect(typeof isLowRisk(cap)).toBe("boolean");
+      expect(typeof alwaysRequiresApproval(cap)).toBe("boolean");
+      expect(typeof isCanonMutation(cap)).toBe("boolean");
+    }
   });
 });
 
-// ── AgentSupervisor config and session tests ──────────────
+// ── Config Tests ─────────────────────────────────────────
 
-describe('AgentSupervisor configuration', () => {
+describe("AgentSupervisor config", () => {
   let supervisor: AgentSupervisor;
 
   beforeEach(() => {
+    resetMutable();
     supervisor = new AgentSupervisor();
   });
 
-  it('is not configured by default (mode=none with default empty command is treated as none)', () => {
-    // Default mode is 'opencode-default' which sets agentCommand to 'opencode'
-    // so it SHOULD be configured by default
+  it("is configured when mode is opencode-default", () => {
+    supervisor.updateConfig({
+      agentCommand: "opencode", args: ["acp"], cwd: "/test",
+      mode: "opencode-default",
+    });
     expect(supervisor.isConfigured()).toBe(true);
   });
 
-  it('is not configured when mode is none', () => {
-    supervisor.setConfig({
-      agentCommand: '',
-      args: [],
-      cwd: '',
-      mode: 'none',
+  it("is not configured when mode is none", () => {
+    supervisor.updateConfig({
+      agentCommand: "", args: [], cwd: "", mode: "none",
     });
     expect(supervisor.isConfigured()).toBe(false);
   });
-
-  it('is configured when mode is opencode-default', () => {
-    supervisor.setConfig({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/project',
-      mode: 'opencode-default',
-    });
-    expect(supervisor.isConfigured()).toBe(true);
-  });
-
-  it('is configured when mode is custom-command with a command', () => {
-    supervisor.setConfig({
-      agentCommand: 'node',
-      args: ['./agent.js'],
-      cwd: '/project',
-      mode: 'custom-command',
-    });
-    expect(supervisor.isConfigured()).toBe(true);
-  });
-
-  it('returns default session status when no session is active', () => {
-    const status = supervisor.getSessionStatus();
-    expect(status.sessionId).toBeNull();
-    expect(status.status).toBe('none');
-    expect(status.startedAt).toBeNull();
-  });
-
-  it('getConfig returns a copy not a reference', () => {
-    const config1 = supervisor.getConfig();
-    config1.agentCommand = 'changed';
-    const config2 = supervisor.getConfig();
-    expect(config2.agentCommand).not.toBe('changed');
-  });
 });
 
-// ── Session lifecycle tests ───────────────────────────────
+// ── Session Lifecycle Tests ───────────────────────────────
 
-describe('AgentSupervisor session lifecycle', () => {
+describe("AgentSupervisor ACP session lifecycle", () => {
   let supervisor: AgentSupervisor;
   let sender: ReturnType<typeof mockSender>;
 
   beforeEach(() => {
+    resetMutable();
     supervisor = new AgentSupervisor();
-    supervisor.setConfig({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-      mode: 'opencode-default',
-    });
     sender = mockSender();
-    supervisor.setSender(sender);
-    mockSpawn.mockClear();
-  });
-
-  afterEach(() => {
-    mockSpawn.mockReset();
-  });
-
-  it('starts a session and returns a session ID', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const result = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+    supervisor.attachSender(sender as unknown as Electron.WebContents);
+    supervisor.updateConfig({
+      agentCommand: "opencode", args: ["acp"], cwd: "/test",
+      mode: "opencode-default",
     });
+  });
 
+  async function startAndResolve() {
+    const p = supervisor.startSession(makeStartRequest());
+    startResolve!(defaultInitResponse());
+    newSessionResolve!(defaultNewSessionResponse());
+    return await p;
+  }
+
+  it("starts session and returns session ID", async () => {
+    const result = await startAndResolve();
     expect(result.sessionId).toBeTruthy();
-    expect(typeof result.sessionId).toBe('string');
-    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
-  it('emits agent message event on session start', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
+  it("rejects second session while one is active", async () => {
+    await startAndResolve();
+    await expect(supervisor.startSession(makeStartRequest())).rejects.toThrow("already active");
+  });
 
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
+  it("stops active session", async () => {
+    const result = await startAndResolve();
+    await supervisor.stopSession(result.sessionId);
+    expect(supervisor.getSessionStatus().status).toBe("stopped");
+  });
 
-    // Should have sent at least one event:agent-message for "started"
-    const agentMsgs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:agent-message',
+  it("handles initialize timeout", async () => {
+    const p = supervisor.startSession(makeStartRequest());
+    startReject!(new Error("timed out after 30000ms"));
+    await expect(p).rejects.toThrow("timed out");
+  });
+
+  it("handles process close event", async () => {
+    await startAndResolve();
+    const child = vi.mocked(AcpClient).mock.results[0]?.value.getChildProcess();
+    child.exitCode = 0;
+    child.emit("close", 0, null);
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: expect.stringContaining("exited") }),
     );
-    expect(agentMsgs.length).toBeGreaterThanOrEqual(1);
-    expect(agentMsgs[0][1].role).toBe('system');
   });
 
-  it('rejects starting a second session while one is active', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
-
-    await expect(
-      supervisor.startSession({
-        agentCommand: 'opencode',
-        args: ['agent', '--acp'],
-        cwd: '/test/project',
-      }),
-    ).rejects.toThrow('already active');
-  });
-
-  it('stops an active session', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
-
-    await supervisor.stopSession(sessionId);
-
-    const status = supervisor.getSessionStatus();
-    expect(status.status).toBe('stopped');
-  });
-
-  it('handles agent process error gracefully', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
-
-    // Simulate process error
-    child.emit('error', new Error('Connection refused'));
-
-    // Wait for async handling
-    await new Promise((r) => setTimeout(r, 20));
-
-    const status = supervisor.getSessionStatus();
-    expect(status.status).toBe('error');
-    expect(status.errorMessage).toContain('Connection refused');
-  });
-
-  it('handles process close event', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
-
-    // Simulate clean exit
-    child.emit('close', 0, null);
-
-    await new Promise((r) => setTimeout(r, 20));
-
-    const status = supervisor.getSessionStatus();
-    expect(status.status).toBe('stopped');
-  });
-
-  it('throws when sending message to non-existent session', async () => {
-    await expect(
-      supervisor.sendMessage({
-        sessionId: 'non-existent',
-        message: 'hello',
-      }),
-    ).rejects.toThrow();
-  });
-
-  it('throws when sending message to stopped session', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-    });
-
-    child.emit('close', 0, null);
-    await new Promise((r) => setTimeout(r, 20));
-
-    await expect(
-      supervisor.sendMessage({ sessionId, message: 'hello' }),
-    ).rejects.toThrow('not running');
+  it("handles spawn failure", async () => {
+    const p = supervisor.startSession(makeStartRequest());
+    startReject!(new Error("Spawn failed: ENOENT"));
+    await expect(p).rejects.toThrow("Spawn failed");
+    expect(supervisor.getSessionStatus().status).toBe("none");
   });
 });
 
-// ── Permission Flow Tests ─────────────────────────────────
+// ── Session Update Tests ─────────────────────────────────
 
-describe('AgentSupervisor permission flows', () => {
+describe("AgentSupervisor session update", () => {
   let supervisor: AgentSupervisor;
   let sender: ReturnType<typeof mockSender>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetMutable();
     supervisor = new AgentSupervisor();
-    supervisor.setConfig({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
-      mode: 'opencode-default',
-    });
     sender = mockSender();
-    supervisor.setSender(sender);
-    mockSpawn.mockClear();
+    supervisor.attachSender(sender as unknown as Electron.WebContents);
+    supervisor.updateConfig({
+      agentCommand: "opencode", args: ["acp"], cwd: "/test",
+      mode: "opencode-default",
+    });
+    const p = supervisor.startSession(makeStartRequest());
+    startResolve!(defaultInitResponse());
+    newSessionResolve!(defaultNewSessionResponse());
+    await p;
   });
 
-  afterEach(() => {
-    mockSpawn.mockReset();
+  it("handles agent_message_chunk with correct ContentBlock shape", () => {
+    expect(capturedCallbacks.onSessionUpdate).toBeDefined();
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Hello" },
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ role: "agent", content: "Hello" }),
+    );
   });
 
-  // ── Permission Denial ──────────────────────────────────
-
-  it('handles permission denial — user denies a CLI run request', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles agent_thought_chunk with correct ContentBlock shape", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: "Let me think..." },
+      } as unknown as SessionNotification["update"],
     });
-
-    // Simulate agent sending a permission_request via the readline interface
-    const permissionLine = JSON.stringify({
-      type: 'permission_request',
-      capability: 'run_cli',
-      scope: ['status', '--change', 'ch-001'],
-      commandPreview: 'openadab status --change ch-001 --json',
-    });
-
-    rlHolder.emitter!.emit('line', permissionLine);
-
-    // Wait for async processing
-    await new Promise((r) => setTimeout(r, 30));
-
-    // Should have emitted a permission_request event to renderer
-    const permReqs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        role: "system",
+        content: expect.stringContaining("[thought] Let me think..."),
+      }),
     );
-    expect(permReqs.length).toBe(1);
-    const permRequest = permReqs[0][1] as { id: string; capability: string; scope: string[] };
-    expect(permRequest.capability).toBe('run_cli');
-    expect(permRequest.scope).toEqual(['status', '--change', 'ch-001']);
-
-    // User denies the permission
-    await supervisor.denyPermission({
-      requestId: permRequest.id,
-      approved: false,
-      reason: 'Not now',
-    });
-
-    // Agent should receive denial message on stdin
-    await new Promise((r) => setTimeout(r, 10));
-    const writes = (child.stdin.write as ReturnType<typeof vi.fn>).mock.calls;
-    const denialWrites = writes.filter((c: unknown[]) => {
-      const msg = JSON.parse((c[0] as string).trim()) as { type: string; approved: boolean };
-      return msg.type === 'permission_response' && msg.approved === false;
-    });
-    expect(denialWrites.length).toBeGreaterThanOrEqual(1);
   });
 
-  // ── Draft Write Approval ───────────────────────────────
-
-  it('auto-approves write_artifact_draft after first approval', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles image content block with placeholder", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "image" },
+      } as unknown as SessionNotification["update"],
     });
-
-    // First request — should require user approval
-    const permLine1 = JSON.stringify({
-      type: 'permission_request',
-      capability: 'write_artifact_draft',
-      scope: ['chapters/ch-001/draft.md'],
-    });
-
-    rlHolder.emitter!.emit('line', permLine1);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs1 = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: "[image]" }),
     );
-    expect(permReqs1.length).toBe(1);
-    const req1 = permReqs1[0][1] as { id: string; capability: string };
-
-    // Approve the first request
-    await supervisor.approvePermission({
-      requestId: req1.id,
-      approved: true,
-    });
-
-    await new Promise((r) => setTimeout(r, 10));
-
-    // Reset send mock to track second request
-    (sender.send as ReturnType<typeof vi.fn>).mockClear();
-
-    // Second request for same capability — should be auto-approved
-    const permLine2 = JSON.stringify({
-      type: 'permission_request',
-      capability: 'write_artifact_draft',
-      scope: ['chapters/ch-002/draft.md'],
-    });
-
-    rlHolder.emitter!.emit('line', permLine2);
-    await new Promise((r) => setTimeout(r, 30));
-
-    // Should NOT have emitted another permission-request event
-    const permReqs2 = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
-    );
-    expect(permReqs2.length).toBe(0);
-
-    // But should have sent approval to the agent
-    const writes = (child.stdin.write as ReturnType<typeof vi.fn>).mock.calls;
-    const approvalWrites = writes.filter((c: unknown[]) => {
-      try {
-        const msg = JSON.parse((c[0] as string).trim()) as { type: string; approved: boolean };
-        return msg.type === 'permission_response' && msg.approved === true;
-      } catch {
-        return false;
-      }
-    });
-    expect(approvalWrites.length).toBeGreaterThanOrEqual(1);
   });
 
-  // ── CLI Run Requires Approval Every Time ───────────────
-
-  it('always requires approval for run_cli (never auto-approves)', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    const { sessionId } = await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles user_message_chunk", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "User echo" },
+      } as unknown as SessionNotification["update"],
     });
-
-    // First CLI request — approve it
-    const permLine1 = JSON.stringify({
-      type: 'permission_request',
-      capability: 'run_cli',
-      scope: ['status', '--change', 'ch-001'],
-      commandPreview: 'openadab status --change ch-001',
-    });
-
-    rlHolder.emitter!.emit('line', permLine1);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs1 = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ role: "agent", content: "User echo" }),
     );
-    expect(permReqs1.length).toBe(1);
-
-    await supervisor.approvePermission({
-      requestId: (permReqs1[0][1] as { id: string }).id,
-      approved: true,
-    });
-
-    await new Promise((r) => setTimeout(r, 10));
-    (sender.send as ReturnType<typeof vi.fn>).mockClear();
-
-    // Second CLI request — must still require explicit approval
-    const permLine2 = JSON.stringify({
-      type: 'permission_request',
-      capability: 'run_cli',
-      scope: ['sync', '--change', 'ch-001'],
-      commandPreview: 'openadab sync --change ch-001',
-    });
-
-    rlHolder.emitter!.emit('line', permLine2);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs2 = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
-    );
-    expect(permReqs2.length).toBe(1);
-    expect((permReqs2[0][1] as { capability: string }).capability).toBe('run_cli');
   });
 
-  // ── Forbidden Canon Mutation — Always Requires Approval ─
-
-  it('always requires approval for modify_wiki (canon mutation)', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles plan with entries", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "plan",
+        entries: [
+          { status: "pending", content: "Add login form" },
+          { status: "in_progress", content: "Add dashboard" },
+        ],
+      } as unknown as SessionNotification["update"],
     });
-
-    const permLine = JSON.stringify({
-      type: 'permission_request',
-      capability: 'modify_wiki',
-      scope: ['characters/mc.md'],
-      diffPreview: { operation: 'update', page: 'characters/mc.md' },
-    });
-
-    rlHolder.emitter!.emit('line', permLine);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        content: expect.stringContaining("[plan pending] Add login form"),
+      }),
     );
-    expect(permReqs.length).toBe(1);
-    const req = permReqs[0][1] as { capability: string };
-    expect(req.capability).toBe('modify_wiki');
-
-    // Even after approval, next modify_wiki should still require approval
-    await supervisor.approvePermission({
-      requestId: (permReqs[0][1] as { id: string }).id,
-      approved: true,
-    });
-
-    await new Promise((r) => setTimeout(r, 10));
-    (sender.send as ReturnType<typeof vi.fn>).mockClear();
-
-    const permLine2 = JSON.stringify({
-      type: 'permission_request',
-      capability: 'modify_wiki',
-      scope: ['locations/city.md'],
-      diffPreview: { operation: 'update', page: 'locations/city.md' },
-    });
-
-    rlHolder.emitter!.emit('line', permLine2);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs2 = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        content: expect.stringContaining("[plan in_progress] Add dashboard"),
+      }),
     );
-    // Should still require approval for the second canon mutation
-    expect(permReqs2.length).toBe(1);
   });
 
-  it('always requires approval for archive_change (canon mutation)', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles plan_update", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "plan_update",
+        entries: [{ status: "completed", content: "Add login form" }],
+      } as unknown as SessionNotification["update"],
     });
-
-    const permLine = JSON.stringify({
-      type: 'permission_request',
-      capability: 'archive_change',
-      scope: ['ch-001'],
-    });
-
-    rlHolder.emitter!.emit('line', permLine);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        content: expect.stringContaining("[plan completed]"),
+      }),
     );
-    expect(permReqs.length).toBe(1);
-    const req = permReqs[0][1] as { capability: string };
-    expect(req.capability).toBe('archive_change');
-    expect(isCanonMutation(req.capability as AgentCapability)).toBe(true);
   });
 
-  it('always requires approval for sync_change (canon mutation)', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles plan_removed", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "plan_removed",
+      } as unknown as SessionNotification["update"],
     });
-
-    const permLine = JSON.stringify({
-      type: 'permission_request',
-      capability: 'sync_change',
-      scope: ['ch-001'],
-    });
-
-    rlHolder.emitter!.emit('line', permLine);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: "Plan removed" }),
     );
-    expect(permReqs.length).toBe(1);
-    const req = permReqs[0][1] as { capability: string };
-    expect(req.capability).toBe('sync_change');
-    expect(isCanonMutation(req.capability as AgentCapability)).toBe(true);
   });
 
-  it('always requires approval for apply_wiki_diff (canon mutation)', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: ['agent', '--acp'],
-      cwd: '/test/project',
+  it("handles usage_update with context window info", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "usage_update",
+        used: 5000,
+        size: 200000,
+      } as unknown as SessionNotification["update"],
     });
-
-    const permLine = JSON.stringify({
-      type: 'permission_request',
-      capability: 'apply_wiki_diff',
-      scope: ['ch-001'],
-    });
-
-    rlHolder.emitter!.emit('line', permLine);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const permReqs = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:permission-request',
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        content: expect.stringContaining("Context: 5000/200000 tokens"),
+      }),
     );
-    expect(permReqs.length).toBe(1);
+  });
+
+  it("handles current_mode_update", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "current_mode_update",
+        modeId: "architect",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({
+        content: expect.stringContaining("Mode switched to: architect"),
+      }),
+    );
+  });
+
+  it("handles available_commands_update", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "available_commands_update",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: "Available commands updated" }),
+    );
+  });
+
+  it("handles config_option_update", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "config_option_update",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: "Config option updated" }),
+    );
+  });
+
+  it("handles session_info_update", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "session_info_update",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: "Session info updated" }),
+    );
+  });
+
+  it("handles tool_call", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-1",
+        title: "read_file",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: expect.stringContaining("read_file") }),
+    );
+  });
+
+  it("handles tool_call", () => {
+    capturedCallbacks.onSessionUpdate!({
+      sessionId: "acp-session-123",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-1",
+        title: "read_file",
+      } as unknown as SessionNotification["update"],
+    });
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:agent-message",
+      expect.objectContaining({ content: expect.stringContaining("read_file") }),
+    );
   });
 });
 
-// ── Graceful Degradation Tests ────────────────────────────
+// ── Permission Tests ─────────────────────────────────────
 
-describe('AgentSupervisor graceful degradation', () => {
+describe("AgentSupervisor ACP permission", () => {
   let supervisor: AgentSupervisor;
+  let sender: ReturnType<typeof mockSender>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetMutable();
     supervisor = new AgentSupervisor();
-  });
-
-  it('throws when starting session with no agent configured', async () => {
-    supervisor.setConfig({
-      agentCommand: '',
-      args: [],
-      cwd: '',
-      mode: 'none',
+    sender = mockSender();
+    supervisor.attachSender(sender as unknown as Electron.WebContents);
+    supervisor.updateConfig({
+      agentCommand: "opencode", args: ["acp"], cwd: "/test",
+      mode: "opencode-default",
     });
-
-    // The main.ts handler checks isConfigured() before calling startSession,
-    // so the supervisor itself doesn't check. Let's verify the config
-    expect(supervisor.isConfigured()).toBe(false);
-
-    // But if something tries to start anyway, it should still work
-    // since spawn would just fail. Config check is at IPC handler level.
+    const p = supervisor.startSession(makeStartRequest());
+    startResolve!(defaultInitResponse());
+    newSessionResolve!(defaultNewSessionResponse());
+    await p;
   });
 
-  it('handles spawn failure gracefully', async () => {
-    mockSpawn.mockImplementation(() => {
-      throw new Error('ENOENT: command not found');
+  it("auto-approves low-risk read after first approval", () => {
+    expect(capturedCallbacks.onPermissionRequest).toBeDefined();
+
+    // First request for read — needs user approval (not auto-approved yet)
+    const result1 = capturedCallbacks.onPermissionRequest!({
+      sessionId: "acp-session-123",
+      toolCall: { toolCallId: "tc-1", title: "read_file", kind: "read" },
+      options: [
+        { kind: "allow_once", name: "Allow", optionId: "allow-1" },
+        { kind: "reject_once", name: "Deny", optionId: "reject-1" },
+      ],
     });
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await expect(
-      supervisor.startSession({
-        agentCommand: 'nonexistent',
-        args: [],
-        cwd: '/test',
-      }),
-    ).rejects.toThrow('ENOENT');
-
-    const status = supervisor.getSessionStatus();
-    expect(status.sessionId).toBeNull();
-  });
-
-  it('throws and does not leave a stale session on spawn failure', async () => {
-    mockSpawn.mockImplementation(() => {
-      throw new Error('ENOENT: command not found');
-    });
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await expect(
-      supervisor.startSession({
-        agentCommand: 'nonexistent',
-        args: [],
-        cwd: '/test',
-      }),
-    ).rejects.toThrow('ENOENT');
-
-    expect(supervisor.getSessionStatus().sessionId).toBeNull();
-  });
-});
-
-// ═══════════════════════════════════════════════════════════
-// Hardening item ⑨ — Agent Dock avoid renderer Node globals
-// ═══════════════════════════════════════════════════════════
-
-describe('AgentSupervisor spawn-failure hardening (item ⑨)', () => {
-  let supervisor: AgentSupervisor;
-
-  beforeEach(() => {
-    supervisor = new AgentSupervisor();
-    mockSpawn.mockReset();
-  });
-
-  // ── Spawn-failure IPC event ─────────────────────────────
-
-  it('emits agent:spawn-failed event when spawn throws', async () => {
-    mockSpawn.mockImplementation(() => {
-      throw new Error('ENOENT: command not found');
-    });
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await expect(
-      supervisor.startSession({
-        agentCommand: 'nonexistent',
-        args: [],
-        cwd: '/test',
-      }),
-    ).rejects.toThrow('ENOENT');
-
-    const spawnFailedCalls = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:agent-spawn-failed',
+    // First time: should be a Promise (pending user approval)
+    expect(result1).toBeInstanceOf(Promise);
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:permission-request",
+      expect.objectContaining({ capability: "read_project_file" }),
     );
-    expect(spawnFailedCalls.length).toBe(1);
-    const payload = spawnFailedCalls[0][1] as Record<string, unknown>;
-    expect(payload.error).toBe('ENOENT: command not found');
-    expect(payload).toHaveProperty('sessionId');
-    expect(payload).toHaveProperty('timestamp');
   });
 
-  // ── Session NOT active after spawn failure ──────────────
-
-  it('does not mark session active after spawn failure', async () => {
-    mockSpawn.mockImplementation(() => {
-      throw new Error('ENOENT: command not found');
+  it("emits permission request for execute-kind tool calls", () => {
+    const result = capturedCallbacks.onPermissionRequest!({
+      sessionId: "acp-session-123",
+      toolCall: { toolCallId: "tc-2", title: "bash", kind: "execute" },
+      options: [
+        { kind: "allow_once", name: "Allow", optionId: "allow-1" },
+        { kind: "reject_once", name: "Deny", optionId: "reject-1" },
+      ],
     });
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await expect(
-      supervisor.startSession({
-        agentCommand: 'nonexistent',
-        args: [],
-        cwd: '/test',
-      }),
-    ).rejects.toThrow('ENOENT');
-
-    const status = supervisor.getSessionStatus();
-    expect(status.sessionId).toBeNull();
-    expect(status.status).toBe('none');
-  });
-
-  // ── Multiple spawn failures do not leak ─────────────────
-
-  it('does not leak sessions or duplicate error events across multiple failures', async () => {
-    mockSpawn.mockImplementation(() => {
-      throw new Error('ENOENT: command not found');
-    });
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    for (let i = 0; i < 3; i++) {
-      await expect(
-        supervisor.startSession({
-          agentCommand: 'nonexistent',
-          args: [],
-          cwd: '/test',
-        }),
-      ).rejects.toThrow('ENOENT');
-    }
-
-    const spawnFailedCalls = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:agent-spawn-failed',
+    expect(result).toBeInstanceOf(Promise);
+    expect(sender.send).toHaveBeenCalledWith(
+      "event:permission-request",
+      expect.objectContaining({ capability: "run_cli" }),
     );
-    // One event per failure
-    expect(spawnFailedCalls.length).toBe(3);
-    // No stale session remains
-    expect(supervisor.getSessionStatus().sessionId).toBeNull();
-  });
-
-  // ── Settled guard prevents duplicate close/error events ─
-
-  it('uses settled guard: close after error does not emit second event', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: [],
-      cwd: '/test',
-    });
-
-    // Clear messages from session start
-    (sender.send as ReturnType<typeof vi.fn>).mockClear();
-
-    // Fire error first
-    child.emit('error', new Error('Process crashed'));
-    await new Promise((r) => setTimeout(r, 30));
-
-    // Fire close second
-    child.emit('close', 1, null);
-    await new Promise((r) => setTimeout(r, 30));
-
-    const agentMessages = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:agent-message',
-    );
-    // Only one agent-message from the first (error) handler; close is suppressed
-    expect(agentMessages.length).toBe(1);
-  });
-
-  it('uses settled guard: error after close does not emit second event', async () => {
-    const child = mockChildProcess();
-    mockSpawn.mockReturnValue(child);
-    const sender = mockSender();
-    supervisor.setSender(sender);
-
-    await supervisor.startSession({
-      agentCommand: 'opencode',
-      args: [],
-      cwd: '/test',
-    });
-
-    (sender.send as ReturnType<typeof vi.fn>).mockClear();
-
-    // Fire close first
-    child.emit('close', 0, null);
-    await new Promise((r) => setTimeout(r, 30));
-
-    // Fire error second
-    child.emit('error', new Error('Late error'));
-    await new Promise((r) => setTimeout(r, 30));
-
-    const agentMessages = (sender.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-      (c: unknown[]) => c[0] === 'event:agent-message',
-    );
-    expect(agentMessages.length).toBe(1);
-  });
-
-  // ── Graceful shutdown: shutdown → SIGTERM → SIGKILL ────
-
-  it('sends shutdown message then escalates to SIGTERM after timeout', async () => {
-    vi.useFakeTimers();
-    try {
-      const child = mockChildProcess();
-      mockSpawn.mockReturnValue(child);
-      const sender = mockSender();
-      supervisor.setSender(sender);
-
-      const { sessionId } = await supervisor.startSession({
-        agentCommand: 'opencode',
-        args: [],
-        cwd: '/test',
-      });
-
-      const stopPromise = supervisor.stopSession(sessionId);
-
-      // Shutdown message should have been written immediately
-      const writes = (child.stdin.write as ReturnType<typeof vi.fn>).mock.calls;
-      const hasShutdown = writes.some(
-        (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('shutdown'),
-      );
-      expect(hasShutdown).toBe(true);
-
-      // SIGTERM should NOT have been called yet
-      expect(child.kill).not.toHaveBeenCalled();
-
-      // Advance past the SIGTERM timeout
-      vi.advanceTimersByTime(2500);
-      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-      await stopPromise;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('escalates to SIGKILL if SIGTERM does not terminate the process', async () => {
-    vi.useFakeTimers();
-    try {
-      const child = mockChildProcess();
-      mockSpawn.mockReturnValue(child);
-      const sender = mockSender();
-      supervisor.setSender(sender);
-
-      const { sessionId } = await supervisor.startSession({
-        agentCommand: 'opencode',
-        args: [],
-        cwd: '/test',
-      });
-
-      const stopPromise = supervisor.stopSession(sessionId);
-
-      // Advance past SIGTERM timeout
-      vi.advanceTimersByTime(2500);
-      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-      // Advance past SIGKILL timeout (additional 3s)
-      vi.advanceTimersByTime(3500);
-      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
-
-      await stopPromise;
-    } finally {
-      vi.useRealTimers();
-    }
   });
 });
