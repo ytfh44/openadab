@@ -103,15 +103,21 @@ describe('CommandDefLoader', () => {
 });
 
 describe('OpencodeAdapter', () => {
-  it('generates one SKILL.md per command', () => {
+  it('generates one SKILL.md per command with YAML frontmatter', () => {
     const adapter = new OpencodeAdapter();
     const files = adapter.generate(sampleCommands);
     expect(files).toHaveLength(2);
     expect(files[0].path).toBe('.agents/skills/adab-draft/SKILL.md');
+    // YAML frontmatter
+    expect(files[0].content).toContain('---');
+    expect(files[0].content).toContain('name: adab-draft');
+    expect(files[0].content).toContain('description: Use when you need to Write chapter draft. Triggered by /adab:draft for writing tasks.');
+    // Body content
     expect(files[0].content).toContain('/adab:draft');
     expect(files[0].content).toContain('Change ID');
     expect(files[0].content).toContain('openadab context pack');
   });
+
 
   it('includes parameter documentation', () => {
     const adapter = new OpencodeAdapter();

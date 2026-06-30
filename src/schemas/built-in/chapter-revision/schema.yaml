@@ -86,6 +86,6 @@ artifacts:
         - no duplicate operations
 
 apply:
-  requires: [revision, wiki-diff]
+  requires: [wiki-diff, revision]
   target: manuscript/chapters/{{chapter}}.md
   action: copy
