@@ -24,7 +24,7 @@
  *      source checkout without rebuilding.
  *   4. Return the first candidate that actually exists on disk.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,6 +40,14 @@ const MAX_PARENT_HOPS = 16;
  * Filename whose presence marks the OpenAdab package root.
  */
 const PACKAGE_MARKER = 'package.json';
+
+/**
+ * Package name expected in the marker `package.json`.  Checking the name
+ * prevents the upward walk from accepting an unrelated `package.json`
+ * in some ancestor directory (e.g. a stray one in a user's home
+ * directory) as the OpenAdab root.
+ */
+const PACKAGE_NAME = 'openadab';
 
 /**
  * Environment variable consulted when the upward `package.json` walk
@@ -59,10 +67,19 @@ const ROOT_ENV_VAR = 'OPENADAB_ROOT';
  * @param startDir Absolute directory to start searching from.
  * @returns The package root directory, or `null` when not found.
  */
+function isOpenAdabPackageRoot(dir: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, PACKAGE_MARKER), 'utf-8')) as { name?: unknown };
+    return parsed.name === PACKAGE_NAME;
+  } catch {
+    return false;
+  }
+}
+
 function findPackageRoot(startDir: string): string | null {
   let current = resolve(startDir);
   for (let i = 0; i < MAX_PARENT_HOPS; i++) {
-    if (existsSync(join(current, PACKAGE_MARKER))) {
+    if (isOpenAdabPackageRoot(current)) {
       return current;
     }
     const parent = dirname(current);
@@ -112,7 +129,7 @@ function firstExisting(root: string, candidates: string[], sourceFirst: boolean)
  * @returns `true` when source-first ordering should be used.
  */
 function preferSourceTree(): boolean {
-  const env = process.env['NODE_ENV'];
+  const env = process.env.NODE_ENV;
   if (env === undefined) {
     return false;
   }
@@ -177,8 +194,8 @@ export function resolveBuiltInSchemasDir(metaUrl: string): string {
   ], sourceFirst);
   if (found === null) {
     throw new Error(
-      `Could not locate built-in schemas directory under package root: <...>. ` +
-      `Expected one of: <...>/schemas/built-in or <...>/src/schemas/built-in.`
+      `Could not locate built-in schemas directory under package root: ${root}. ` +
+      `Expected one of: ${join(root, 'schemas', 'built-in')} or ${join(root, 'src', 'schemas', 'built-in')}.`
     );
   }
   return found;
@@ -207,8 +224,8 @@ export function resolveCommandsDir(metaUrl: string): string {
   ], sourceFirst);
   if (found === null) {
     throw new Error(
-      `Could not locate commands directory under package root: <...>. ` +
-      `Expected one of: <...>/commands or <...>/src/commands.`
+      `Could not locate commands directory under package root: ${root}. ` +
+      `Expected one of: ${join(root, 'commands')} or ${join(root, 'src', 'commands')}.`
     );
   }
   return found;

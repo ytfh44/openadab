@@ -22,7 +22,7 @@ describe('resolveBuiltInSchemasDir', () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'openadab-rp-schemas-'));
-    writeFileSync(join(tempDir, 'package.json'), '{"name":"openadab-fixture"}');
+    writeFileSync(join(tempDir, 'package.json'), '{"name":"openadab"}');
   });
 
   afterEach(() => {
@@ -70,15 +70,15 @@ describe('resolveBuiltInSchemasDir', () => {
     mkdirSync(dirname(modulePath), { recursive: true });
     const url = pathToFileURL(modulePath).href;
 
-    const prevNodeEnv = process.env['NODE_ENV'];
-    process.env['NODE_ENV'] = 'development';
+    const prevNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'development';
     try {
       expect(resolveBuiltInSchemasDir(url)).toBe(join(tempDir, 'src', 'schemas', 'built-in'));
     } finally {
       if (prevNodeEnv === undefined) {
-        delete process.env['NODE_ENV'];
+        delete process.env.NODE_ENV;
       } else {
-        process.env['NODE_ENV'] = prevNodeEnv;
+        process.env.NODE_ENV = prevNodeEnv;
       }
     }
   });
@@ -96,15 +96,15 @@ describe('resolveBuiltInSchemasDir', () => {
       mkdirSync(dirname(modulePath), { recursive: true });
       const url = pathToFileURL(modulePath).href;
 
-      const prevRoot = process.env['OPENADAB_ROOT'];
-      process.env['OPENADAB_ROOT'] = envRoot;
+      const prevRoot = process.env.OPENADAB_ROOT;
+      process.env.OPENADAB_ROOT = envRoot;
       try {
         expect(resolveBuiltInSchemasDir(url)).toBe(join(envRoot, 'schemas', 'built-in'));
       } finally {
         if (prevRoot === undefined) {
-          delete process.env['OPENADAB_ROOT'];
+          delete process.env.OPENADAB_ROOT;
         } else {
-          process.env['OPENADAB_ROOT'] = prevRoot;
+          process.env.OPENADAB_ROOT = prevRoot;
         }
       }
     } finally {
@@ -132,7 +132,7 @@ describe('resolveCommandsDir', () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'openadab-rp-commands-'));
-    writeFileSync(join(tempDir, 'package.json'), '{"name":"openadab-fixture"}');
+    writeFileSync(join(tempDir, 'package.json'), '{"name":"openadab"}');
   });
 
   afterEach(() => {
