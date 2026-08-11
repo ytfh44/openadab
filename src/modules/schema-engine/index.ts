@@ -3,7 +3,7 @@
  */
 import { existsSync } from 'node:fs';
 import { readdir, readFile, copyFile } from 'node:fs/promises';
-import { join , dirname } from 'node:path';
+import { join , dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import YAML from 'yaml';
@@ -14,6 +14,34 @@ import type { ValidationResult } from '../../schemas/types.js';
 import { SchemaValidationError, CycleDetectedError, UnresolvedVariableError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
 import { resolveBuiltInSchemasDir } from '../../utils/resource-paths.js';
+
+/**
+ * Validate a schema name before it is joined onto a filesystem path.
+ *
+ * `schema fork <base> <name>` passes user input straight through to
+ * `join()` without any boundary check, so a name containing `..` or a path
+ * separator could copy arbitrary directories in (base name) or write
+ * outside `adab/schemas/` (new name). The check is purely lexical, mirroring
+ * `assertChangeDirSafe` in utils/path.ts, and rejects empty, absolute, and
+ * separator-bearing names.
+ *
+ * @param name The schema name to validate.
+ * @param what Human-readable description used in the error message
+ *             (e.g. "Base schema name").
+ * @throws {SchemaValidationError} When the name is empty, absolute, or
+ *         contains `..`, `/`, `\`, or NUL.
+ */
+function assertSchemaNameSafe(name: string, what: string): void {
+  if (name.length === 0) {
+    throw new SchemaValidationError(`${what} is empty`);
+  }
+  if (isAbsolute(name)) {
+    throw new SchemaValidationError(`${what} escapes the schema directory: ${name}`);
+  }
+  if (name.includes('..') || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    throw new SchemaValidationError(`${what} escapes the schema directory: ${name}`);
+  }
+}
 
 /**
  * Loads and validates schema YAML from a directory.
@@ -135,6 +163,10 @@ export class SchemaLoader {
    *                                  exists in the destination.
    */
   async forkSchema(baseName: string, newName: string): Promise<void> {
+    // SC-11: reject traversal / absolute / separator-bearing names before
+    // they are joined onto the built-in or project schema directories.
+    assertSchemaNameSafe(baseName, 'Base schema name');
+    assertSchemaNameSafe(newName, 'New schema name');
     const builtInDir = resolveBuiltInSchemasDir(import.meta.url);
     const srcDir = join(builtInDir, baseName);
     if (!(await fileExists(srcDir))) {

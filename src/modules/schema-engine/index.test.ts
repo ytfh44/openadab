@@ -1,7 +1,7 @@
 /**
  * Unit tests for the Schema Engine module.
  */
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -85,6 +85,66 @@ describe('SchemaLoader', () => {
   it('forkSchema throws for non-existent base schema', async () => {
     const loader = new SchemaLoader(tempDir);
     await expect(loader.forkSchema('nonexistent', 'my-copy')).rejects.toBeInstanceOf(SchemaValidationError);
+  });
+});
+
+describe('SchemaLoader.forkSchema — path traversal guard', () => {
+  let tempDir: string;
+  let builtInDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'openadab-fork-guard-'));
+    builtInDir = join(tempDir, 'built-in');
+    mkdirSync(join(builtInDir, 'chapter-draft', 'templates'), { recursive: true });
+    writeFileSync(
+      join(builtInDir, 'chapter-draft', 'schema.yaml'),
+      'name: chapter-draft\nversion: 1\nartifacts: []\n',
+      'utf-8'
+    );
+    vi.spyOn(resourcePaths, 'resolveBuiltInSchemasDir').mockReturnValue(builtInDir);
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('rejects a base name with traversal and writes nothing outside the built-in dir', async () => {
+    const loader = new SchemaLoader(join(tempDir, 'schemas'));
+    await expect(loader.forkSchema('../evil', 'x')).rejects.toBeInstanceOf(SchemaValidationError);
+    // Without the guard, join(builtInDir, '../evil') would land in tempDir.
+    expect(existsSync(join(tempDir, 'evil'))).toBe(false);
+  });
+
+  it('rejects a new name with traversal and writes nothing outside the schemas dir', async () => {
+    const loader = new SchemaLoader(join(tempDir, 'schemas'));
+    await expect(loader.forkSchema('chapter-draft', '../evil')).rejects.toBeInstanceOf(SchemaValidationError);
+    // Without the guard, join(schemaDir, '../evil') would land in tempDir.
+    expect(existsSync(join(tempDir, 'evil'))).toBe(false);
+    // The destination directory must not be created at all.
+    expect(existsSync(join(tempDir, 'schemas'))).toBe(false);
+  });
+
+  it('rejects absolute and separator-bearing names', async () => {
+    const loader = new SchemaLoader(join(tempDir, 'schemas'));
+    await expect(loader.forkSchema('/etc/passwd', 'x')).rejects.toBeInstanceOf(SchemaValidationError);
+    await expect(loader.forkSchema('chapter-draft', '/tmp/evil')).rejects.toBeInstanceOf(SchemaValidationError);
+    await expect(loader.forkSchema('chapter/draft', 'x')).rejects.toBeInstanceOf(SchemaValidationError);
+    await expect(loader.forkSchema('chapter-draft', 'evil\\name')).rejects.toBeInstanceOf(SchemaValidationError);
+  });
+
+  it('rejects empty names', async () => {
+    const loader = new SchemaLoader(join(tempDir, 'schemas'));
+    await expect(loader.forkSchema('', 'x')).rejects.toBeInstanceOf(SchemaValidationError);
+    await expect(loader.forkSchema('chapter-draft', '')).rejects.toBeInstanceOf(SchemaValidationError);
+  });
+
+  it('still forks normally when both names are valid', async () => {
+    const schemaDir = join(tempDir, 'schemas');
+    const loader = new SchemaLoader(schemaDir);
+    await loader.forkSchema('chapter-draft', 'my-fork');
+    expect(existsSync(join(schemaDir, 'my-fork', 'templates'))).toBe(true);
+    expect(readFileSync(join(schemaDir, 'my-fork', 'schema.yaml'), 'utf-8')).toContain('forked_from: chapter-draft');
   });
 });
 

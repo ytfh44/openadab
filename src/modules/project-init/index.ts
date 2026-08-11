@@ -78,7 +78,18 @@ export class ProjectInitializer {
 
     await this.acquireLock();
     try {
-      const isFullInit = await fileExists(adabDir) && await fileExists(configPath);
+      // A project counts as fully initialized only when config.yaml exists
+      // AND built-in schemas have actually been copied into adab/schemas/.
+      // The older scaffold order wrote config.yaml before copying schemas,
+      // so a crash in between left a state (config.yaml present, schemas
+      // empty/missing) that the plain existence check treated as fully
+      // initialized — permanently bricking recovery. config.yaml is now
+      // written last, and this check additionally lets the config-present /
+      // schemas-missing state fall through to the half-init recovery path.
+      const isFullInit =
+        (await fileExists(adabDir)) &&
+        (await fileExists(configPath)) &&
+        (await this.hasCopiedSchemas(adabDir));
       if (isFullInit) {
         throw new AdabError(
           `Project already initialized: ${adabDir} exists. Use \`openadab update\` to refresh schemas and host adapters.`,
@@ -112,12 +123,17 @@ export class ProjectInitializer {
   private async scaffoldAll(adabDir: string, options: InitOptions, safe: boolean): Promise<void> {
     await this.scaffoldDirectories(adabDir);
     await this.createDefaultWikiTemplates(adabDir, safe);
-    await this.createDefaultConfig(adabDir, options.schema ?? 'chapter-draft');
+    // config.yaml is deliberately written LAST: it is the marker file the
+    // half-init recovery path keys on (config.yaml present + schemas copied
+    // => fully initialized). If any earlier fallible step throws — notably
+    // copyBuiltInSchemas — the crash leaves config.yaml missing, so the next
+    // `init` recovers instead of reporting PROJECT_ALREADY_INITIALIZED.
     await this.copyBuiltInSchemas(adabDir, safe);
     await this.updateGitignore();
     await this.createLogMd(adabDir, safe);
     await this.createEmptyIndexFiles(adabDir, safe);
     await this.generateHostAdapters(options.host, adabDir, safe);
+    await this.createDefaultConfig(adabDir, options.schema ?? 'chapter-draft', safe);
   }
 
   /**
@@ -280,7 +296,30 @@ created: ${now}
     }
   }
 
-  private async createDefaultConfig(adabDir: string, schema: string): Promise<void> {
+  /**
+   * Detect whether built-in schemas have been copied into `adab/schemas/`.
+   *
+   * `scaffoldDirectories` always creates `adab/schemas/` (with a
+   * `.gitkeep`), so directory existence alone cannot distinguish a
+   * half-init from a full init. A project counts as fully initialized only
+   * when at least one schema directory has actually been copied; config.yaml
+   * present but schemas missing/empty means an earlier init crashed between
+   * the config write and the schema copy, and must be recoverable.
+   *
+   * @param adabDir Absolute path to the `adab/` directory.
+   * @returns `true` when at least one schema directory exists under
+   *          `adab/schemas/`.
+   */
+  private async hasCopiedSchemas(adabDir: string): Promise<boolean> {
+    const schemasDir = join(adabDir, 'schemas');
+    if (!(await fileExists(schemasDir))) {
+      return false;
+    }
+    const entries = await readdir(schemasDir, { withFileTypes: true });
+    return entries.some((e) => e.isDirectory());
+  }
+
+  private async createDefaultConfig(adabDir: string, schema: string, safe = false): Promise<void> {
     const config = {
       schema,
       version: 1,
@@ -302,7 +341,16 @@ created: ${now}
         backupOnOverwrite: false,
       },
     };
-    await atomicWriteFile(join(adabDir, 'config.yaml'), YAML.stringify(config, { indent: 2, lineWidth: 0 }));
+    // PI-1: in safe mode (half-init recovery) a pre-existing config.yaml is
+    // user content — never clobber it, even though config.yaml is normally
+    // the marker that distinguishes full-init from half-init.
+    const content = YAML.stringify(config, { indent: 2, lineWidth: 0 });
+    const configPath = join(adabDir, 'config.yaml');
+    if (safe) {
+      await this.writeIfMissing(configPath, content);
+    } else {
+      await atomicWriteFile(configPath, content);
+    }
   }
 
   private async copyBuiltInSchemas(adabDir: string, safe = false): Promise<void> {

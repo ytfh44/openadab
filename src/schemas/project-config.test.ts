@@ -112,6 +112,30 @@ describe("ProjectConfigSchema", () => {
     expect(result.project.title).toBe("Untitled Novel");
   });
 
+  it("preserves unknown nested keys inside project/context/archive", () => {
+    const input = {
+      schema: "chapter-draft",
+      project: {
+        title: "Test",
+        customNote: "keep me",
+      },
+      context: {
+        maxTokens: 18000,
+        customFlag: true,
+      },
+      archive: {
+        backupOnOverwrite: false,
+        retentionDays: 30,
+      },
+    };
+    const result = ProjectConfigSchema.parse(input);
+    // Unknown nested keys must survive the parse (config set round-trip
+    // would otherwise silently strip them from config.yaml).
+    expect((result.project as unknown as { customNote?: string }).customNote).toBe("keep me");
+    expect((result.context as unknown as { customFlag?: boolean }).customFlag).toBe(true);
+    expect((result.archive as unknown as { retentionDays?: number }).retentionDays).toBe(30);
+  });
+
   it("rejects non-boolean archive.backupOnOverwrite", () => {
     const input = {
       schema: "chapter-draft",

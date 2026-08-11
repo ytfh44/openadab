@@ -44,6 +44,25 @@ describe('ProjectInitializer — half-initialized recovery', () => {
     expect(existsSync(join(tempDir, 'adab', 'config.yaml'))).toBe(true);
   });
 
+  it('recovers when config.yaml exists but schemas are missing (crash between config write and schema copy)', async () => {
+    // Simulates the pre-fix crash window: an init that wrote config.yaml
+    // (then the marker of a full init) but died before copying built-in
+    // schemas. The old isFullInit check treated this state as fully
+    // initialized and permanently blocked recovery.
+    const adabDir = join(tempDir, 'adab');
+    mkdirSync(adabDir, { recursive: true });
+    writeFileSync(join(adabDir, 'config.yaml'), 'schema: chapter-draft\n', 'utf-8');
+    const initializer = new ProjectInitializer(tempDir);
+    // Should NOT throw PROJECT_ALREADY_INITIALIZED - recovery proceeds.
+    await expect(initializer.init()).resolves.toBeUndefined();
+    // The pre-existing config.yaml is user content (PI-1): left untouched.
+    expect(readFileSync(join(adabDir, 'config.yaml'), 'utf-8')).toBe('schema: chapter-draft\n');
+    // Missing schemas are filled in by the recovery scaffold.
+    const schemasDir = join(adabDir, 'schemas');
+    expect(existsSync(schemasDir)).toBe(true);
+    expect(readdirSync(schemasDir).some((e) => e !== '.gitkeep')).toBe(true);
+  });
+
   it('still throws when adab/ exists AND config.yaml is present (fully initialized)', async () => {
     const initializer = new ProjectInitializer(tempDir);
     await initializer.init();

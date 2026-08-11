@@ -211,6 +211,26 @@ describe('ConfigWriter.set — nested path edge cases', () => {
     expect(loaded.project.title).toBe('New Title');
   });
 
+  it('preserves unknown nested keys when set() rewrites config.yaml', async () => {
+    // Regression: unknown keys inside the nested objects (project, context,
+    // archive) used to be stripped on parse, so ANY `config set` silently
+    // deleted a user's custom nested key from config.yaml.
+    const configPath = join(tempDir, 'adab', 'config.yaml');
+    writeFileSync(
+      configPath,
+      'schema: chapter-draft\nproject:\n  title: T\n  customNote: keep-me\narchive:\n  backupOnOverwrite: false\n',
+      'utf-8'
+    );
+    const writer = new ConfigWriter(tempDir);
+    await writer.set('archive.backupOnOverwrite', true);
+    const raw = readFileSync(configPath, 'utf-8');
+    expect(raw).toContain('customNote: keep-me');
+    const loader = new ConfigLoader(tempDir);
+    const loaded = await loader.load();
+    expect((loaded.project as unknown as { customNote?: string }).customNote).toBe('keep-me');
+    expect(loaded.archive.backupOnOverwrite).toBe(true);
+  });
+
   it('writes a numeric value', async () => {
     const writer = new ConfigWriter(tempDir);
     await writer.set('context.maxTokens', 99999);
