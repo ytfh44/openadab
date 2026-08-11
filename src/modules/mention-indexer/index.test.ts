@@ -12,7 +12,10 @@ import { MentionIndexer } from './index.js';
 
 
 describe('MentionIndexer', () => {
-  function setupIndexer(pages: { path: string; frontmatter: Record<string, unknown>; body: string }[]) {
+  function setupIndexer(
+    pages: { path: string; frontmatter: Record<string, unknown>; body: string }[],
+    caseSensitive = true,
+  ) {
     const root = mkdtempSync(join(tmpdir(), 'openadab-mi-'));
     const wikiEngine = {
       listPages: vi.fn().mockResolvedValue(pages.map((p) => p.path)),
@@ -23,7 +26,7 @@ describe('MentionIndexer', () => {
       }),
     } as unknown as WikiEngine;
 
-    const indexer = new MentionIndexer(root, wikiEngine);
+    const indexer = new MentionIndexer(root, wikiEngine, caseSensitive);
     return { root, indexer, wikiEngine };
   }
 
@@ -45,6 +48,34 @@ describe('MentionIndexer', () => {
     await indexer.indexAll();
     const file = join(root, 'manuscript.md');
     writeFileSync(file, 'Alicia walked into the room.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('Alice')).toBe(true);
+  });
+
+  it('case-insensitive mode matches differently-cased source text', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ], false);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    // Lowercase in the source, capitalised in the frontmatter: the
+    // `i`-flag pattern matches, but the matched text must be normalized
+    // the same way as the lookup keys or the mention is silently dropped.
+    writeFileSync(file, 'alice walked into the room.');
+    const results = await indexer.scanFile(file);
+    expect(results.has('Alice')).toBe(true);
+  });
+
+  it('flexible-whitespace alias matches irregular spacing in source', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character', aliases: ['the stranger'] }, body: '' },
+    ]);
+    await indexer.indexAll();
+    const file = join(root, 'manuscript.md');
+    // Double space in the source for the single-space alias: the pattern
+    // matches via `\s+?`, but the matched text must be whitespace-
+    // normalized before the map lookup or the mention is dropped.
+    writeFileSync(file, 'the  stranger appeared at the door.');
     const results = await indexer.scanFile(file);
     expect(results.has('Alice')).toBe(true);
   });
@@ -369,6 +400,30 @@ describe('MentionIndexer', () => {
     writeFileSync(file, '流浪者在街上走。');
     const results = await indexer.scanFile(file);
     expect(results.has('流浪者')).toBe(true);
+  });
+
+  it('CJK prefix: longer alias wins over the shorter prefix (and vice versa when alone)', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'a.md', frontmatter: { name: '流浪', type: 'character' }, body: '' },
+      { path: 'b.md', frontmatter: { name: '流浪者', type: 'character' }, body: '' },
+    ]);
+    await indexer.indexAll();
+
+    // Source contains the longer alias: 流浪者 must get the mention and
+    // the shorter prefix 流浪 must NOT be credited for text that belongs
+    // to the longer alias.
+    const longFile = join(root, 'long.md');
+    writeFileSync(longFile, '流浪者出现了。');
+    const longResults = await indexer.scanFile(longFile);
+    expect(longResults.has('流浪者')).toBe(true);
+    expect(longResults.has('流浪')).toBe(false);
+
+    // Source contains only the shorter alias: it is credited as usual.
+    const shortFile = join(root, 'short.md');
+    writeFileSync(shortFile, '流浪出现了。');
+    const shortResults = await indexer.scanFile(shortFile);
+    expect(shortResults.has('流浪')).toBe(true);
+    expect(shortResults.has('流浪者')).toBe(false);
   });
 
   it('ASCII part of mixed alias still requires word boundary', async () => {

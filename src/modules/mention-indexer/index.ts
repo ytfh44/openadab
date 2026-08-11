@@ -71,10 +71,11 @@ const EntityEntrySchema = z.object({
 export const MentionsIndexSchema = z.record(z.string(), EntityEntrySchema);
 
 /**
- * Compiled regex pattern for an entity.
+ * Compiled regex pattern used to scan source lines.  A single combined
+ * pattern covers every entity; the entity for a match is resolved from
+ * the matched text via {@link MentionIndexer.aliasToEntities}.
  */
 interface CompiledPattern {
-  entity: string;
   regex: RegExp;
 }
 
@@ -122,7 +123,7 @@ function escapeRegex(value: string): string {
  * should wrap the variant.  Mixed CJK + ASCII aliases are split on
  * whitespace and each segment is evaluated independently so that the
  * CJK pieces match as substrings while the ASCII pieces remain
- * word-boundary constrained.  Segments are joined by an optional
+ * word-boundary constrained.  Segments are joined by a one-or-more
  * whitespace matcher so multi-word aliases such as `the stranger`
  * or `流浪者 Alice` match regardless of the spacing in the source.
  *
@@ -141,7 +142,7 @@ function buildVariantSubPattern(alias: string): string {
     }
     return `(?:\\b${escapedSeg}\\b)`;
   });
-  return subPatterns.join('\\s*?');
+  return subPatterns.join('\\s+?');
 }
 
 /**
@@ -206,32 +207,77 @@ export class MentionIndexer {
   /**
    * Refresh the {@link aliasToEntities} lookup table.  Called automatically
    * from {@link buildEntityRegistry}; exposed for tests that mutate the
-   * registry directly.
+   * registry directly.  Keys are normalized via {@link normalizeLookupKey}
+   * (whitespace-collapsed, and lowercased when matching is case-insensitive)
+   * so they stay in sync with the matched text in {@link scanFile}.
    */
   private refreshAliasMap(): void {
     this.aliasToEntities.clear();
     for (const [name, entry] of this.entityRegistry) {
       for (const alias of entry.aliases) {
-        const trimmed = alias.trim();
-        if (trimmed.length === 0) {
+        const key = this.normalizeLookupKey(alias);
+        if (key.length === 0) {
           continue;
         }
-        if (!this.aliasToEntities.has(trimmed)) {
-          this.aliasToEntities.set(trimmed, new Set());
+        if (!this.aliasToEntities.has(key)) {
+          this.aliasToEntities.set(key, new Set());
         }
-        this.aliasToEntities.get(trimmed)!.add(name);
+        this.aliasToEntities.get(key)!.add(name);
       }
     }
   }
 
   /**
+   * Normalize an alias (or the text matched by a compiled pattern) to
+   * its lookup key in {@link aliasToEntities}.
+   *
+   * Trims and collapses runs of whitespace to a single space so that a
+   * flexible-whitespace match (e.g. `the  stranger` for the alias
+   * `the stranger`) resolves to the same key; when matching is
+   * case-insensitive the key is additionally lowercased so that
+   * `alice` resolves to the alias `Alice`.  Both sides of the lookup
+   * are normalized identically — keys here, matched text in
+   * {@link scanFile} — so the two call sites must stay in sync.
+   *
+   * @param value Raw alias or matched text.
+   * @returns Normalized lookup key.
+   */
+  private normalizeLookupKey(value: string): string {
+    const collapsed = value.replace(/\s+/g, ' ').trim();
+    return this.caseSensitive ? collapsed : collapsed.toLowerCase();
+  }
+
+  /**
    * Re-derive `compiledPatterns` from the current entity registry.
+   *
+   * Every entity's variant sub-patterns are combined into a single
+   * alternation, deduplicated, and ordered longest-first.  A single
+   * combined pattern (rather than one per entity) is required for
+   * correct CJK prefix resolution: with per-entity patterns the
+   * shorter alias `流浪` would match inside the longer alias
+   * `流浪者` and get credited for it, while the combined
+   * `流浪者|流浪` prefers the longer match and resolves it through
+   * {@link aliasToEntities}.  The pattern length is used as a proxy
+   * for the unmatched source length — a longer escaped pattern
+   * corresponds to a longer literal, and for ASCII variants the
+   * `\b` wrappers add a constant per segment so the correlation
+   * still holds for mixed scripts.
    */
   private rebuildCompiledPatterns(): void {
-    this.compiledPatterns = [];
-    for (const [name, entry] of this.entityRegistry) {
-      this.compiledPatterns.push({ entity: name, regex: this.buildRegexPattern(entry) });
+    const variants = new Set<string>();
+    for (const [, entry] of this.entityRegistry) {
+      for (const alias of entry.aliases) {
+        const variant = buildVariantSubPattern(alias);
+        if (variant.length > 0) {
+          variants.add(variant);
+        }
+      }
     }
+    const pattern = [...variants].sort((a, b) => b.length - a.length).join('|');
+    const flags = this.caseSensitive ? 'g' : 'gi';
+    this.compiledPatterns = [
+      { regex: pattern.length === 0 ? new RegExp('(?!)', flags) : new RegExp(pattern, flags) },
+    ];
   }
 
   /**
@@ -241,7 +287,11 @@ export class MentionIndexer {
    * regex characters.  Each alias is split on whitespace and each
    * segment is evaluated independently for CJK content so that mixed
    * scripts (e.g. `流浪者 Alice`) get word boundaries only on the
-   * ASCII part.  The resulting pattern matches any of the variants.
+   * ASCII part.  The resulting pattern matches any of the variants;
+   * variants are ordered longest-first so that when two aliases of
+   * the same entity overlap (e.g. the CJK prefix pair `流浪` /
+   * `流浪者`) the longer one is preferred.  Pattern length is used
+   * as a proxy for the unmatched source length.
    *
    * @param entity Entity registry entry.
    * @returns Compiled RegExp with global flag.
@@ -249,7 +299,8 @@ export class MentionIndexer {
   buildRegexPattern(entity: EntityEntry): RegExp {
     const variants = entity.aliases
       .map((v) => buildVariantSubPattern(v))
-      .filter((p) => p.length > 0);
+      .filter((p) => p.length > 0)
+      .sort((a, b) => b.length - a.length);
     const pattern = variants.join('|');
     if (pattern.length === 0) {
       // No usable variant — return a regex that never matches.
@@ -290,7 +341,7 @@ export class MentionIndexer {
         let match: RegExpExecArray | null;
         while ((match = regex.exec(line)) !== null) {
           const matchedText = match[0];
-          const candidateEntities = this.aliasToEntities.get(matchedText);
+          const candidateEntities = this.aliasToEntities.get(this.normalizeLookupKey(matchedText));
           if (!candidateEntities) {
             continue;
           }
