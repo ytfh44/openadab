@@ -78,7 +78,7 @@ function stripFencedCode(text: string): string {
       }
       out.push(line);
     } else {
-      const closeMatch = new RegExp(`^\\\s*${fenceChar}{${String(fenceLen)},}\\s*$`).exec(trimmed);
+      const closeMatch = new RegExp(`^\\s*${fenceChar}{${String(fenceLen)},}\\s*$`).exec(trimmed);
       if (closeMatch) {
         inFence = false;
         fenceChar = '';
@@ -217,6 +217,12 @@ export function extractWikiLinks(content: string): string[] {
  * intentionally not recognised, matching the spec's "Exact heading
  * text" contract.
  *
+ * Heading-pattern lines inside fenced code blocks (``` or ~~~,
+ * following the same fence rules as `stripFencedCode`) do not
+ * terminate the section — only real top-level headings do. Without
+ * this, a code sample containing a `## …` line silently truncated
+ * the section at that line.
+ *
  * trailing HTML comments (e.g. `## Heading <!-- note -->`) are
  * tolerated by the matching pattern, so documentation-style annotations
  * on a heading do not prevent the section from being recognised.
@@ -258,7 +264,33 @@ export function extractSectionsByHeading(content: string, heading: string): stri
   }
 
   let endIndex = lines.length;
+  // Track fenced code blocks (same rules as `stripFencedCode`: opener
+  // is ≥3 backticks/tildes with ≤3 leading spaces, closer is the same
+  // char repeated ≥ opener length) so heading-looking lines inside a
+  // fence do not truncate the section. The heading that started this
+  // scan is real (the scan before it was at top level), so only the
+  // terminator loop needs fence tracking.
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLen = 0;
   for (let i = startIndex + 1; i < lines.length; i++) {
+    const trimmed = lines[i].replace(/^\s*/, '');
+    if (inFence) {
+      const closeMatch = new RegExp(`^\\s*${fenceChar}{${String(fenceLen)},}\\s*$`).exec(trimmed);
+      if (closeMatch) {
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+      }
+      continue;
+    }
+    const openMatch = /^( {0,3})(`{3,}|~{3,})/.exec(trimmed);
+    if (openMatch) {
+      inFence = true;
+      fenceChar = openMatch[2][0];
+      fenceLen = openMatch[2].length;
+      continue;
+    }
     const lineMatch = /^(#{1,6})\s/.exec(lines[i]);
     if (lineMatch && lineMatch[1].length <= headingLevel) {
       endIndex = i;

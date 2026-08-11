@@ -227,4 +227,75 @@ Content
 `;
     expect(extractSectionsByHeading(input, 'Target')).toBe('Content\n');
   });
+
+  it('does not truncate at heading-like lines inside a backtick-fenced code block', () => {
+    // Regression: the terminator scan used to match ANY `## …` line,
+    // so a code sample containing a heading-looking line silently
+    // truncated the section at that line.
+    const input = `## Target
+Intro text
+
+\`\`\`
+const x = 1;
+## Fake Heading
+still inside the code block
+\`\`\`
+
+More content
+## Other
+Other content
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe(
+      'Intro text\n\n```\nconst x = 1;\n## Fake Heading\nstill inside the code block\n```\n\nMore content'
+    );
+  });
+
+  it('does not truncate at heading-like lines inside a tilde-fenced code block', () => {
+    const input = `## Target
+~~~js
+## Fake Heading
+~~~
+Real content
+## Other
+Other content
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe(
+      '~~~js\n## Fake Heading\n~~~\nReal content'
+    );
+  });
+
+  it('treats heading-like lines inside an unterminated fence as section content (fence runs to EOF)', () => {
+    const input = `## Target
+\`\`\`
+## Fake Heading
+never closed
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe('```\n## Fake Heading\nnever closed\n');
+  });
+
+  it('a real heading after a closed fence still terminates the section', () => {
+    const input = `## Target
+\`\`\`
+## Fake Heading
+\`\`\`
+## Other
+Other content
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe(
+      '```\n## Fake Heading\n```'
+    );
+  });
+
+  it('a longer fence closer than the opener still closes the fence', () => {
+    const input = `## Target
+\`\`\`\`
+## Fake Heading
+\`\`\`\`\`
+## Other
+Other content
+`;
+    expect(extractSectionsByHeading(input, 'Target')).toBe(
+      '````\n## Fake Heading\n`````'
+    );
+  });
 });

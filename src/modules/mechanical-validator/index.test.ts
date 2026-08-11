@@ -758,4 +758,107 @@ describe('MechanicalValidator', () => {
       expect(result.errors.some((e) => e.includes('Wiki link check failed'))).toBe(false);
     });
   });
+
+  // ===== MV-DEDUP: frontmatter/word-count checks run exactly once per artifact =====
+  // validateArtifact used to call frontmatterPresent + wordCount directly
+  // AND again inside schemaCompliance, so a missing-frontmatter artifact
+  // reported two identical errors (and read the file twice). The fix
+  // drops the outer calls; these tests pin the single-pass output.
+  describe('validateArtifact — single-pass frontmatter/word-count (dedup regression)', () => {
+    it('missing frontmatter yields exactly one "Frontmatter missing" error', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'draft', generates: 'draft.md', requires: [], validation: { mechanical: ['frontmatterPresent'] } },
+            { id: 'wiki-diff', generates: 'wiki-diff.md', requires: [] },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), 'No frontmatter here.');
+      const result = await validator.validateArtifact(changeDir, 'draft');
+      expect(result.passed).toBe(false);
+      expect(result.errors.filter((e) => e.includes('Frontmatter missing'))).toHaveLength(1);
+    });
+
+    it('a below-minimum word count yields exactly one warning (no duplicated warnings)', async () => {
+      const { root, validator } = setupValidator();
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), '---\ntitle: X\n---\n\nshort.');
+      const result = await validator.validateArtifact(changeDir, 'draft');
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings.filter((w) => w.includes('below minimum'))).toHaveLength(1);
+    });
+
+    it('validateChange aggregate contains each frontmatter error exactly once', async () => {
+      const { root, validator } = setupValidator({
+        schema: {
+          name: 'test',
+          version: 1,
+          artifacts: [
+            { id: 'draft', generates: 'draft.md', requires: [], validation: { mechanical: ['frontmatterPresent'] } },
+          ],
+        },
+      });
+      const changeDir = join(root, 'change');
+      mkdirSync(changeDir, { recursive: true });
+      writeFileSync(join(changeDir, 'draft.md'), 'No frontmatter here.');
+      const results = await validator.validateChange(changeDir);
+      const all = results.find((r) => r.artifactId === 'all');
+      expect(all).toBeDefined();
+      expect(all!.errors.filter((e) => e.includes('Frontmatter missing'))).toHaveLength(1);
+    });
+  });
+
+  // ===== MV-DEPS: validateDependencies enforces the done-requires-done invariant =====
+  describe('validateDependencies', () => {
+    const depSchema: SchemaDef = {
+      name: 'test',
+      version: 1,
+      artifacts: [
+        { id: 'draft', generates: 'draft.md', requires: [] },
+        { id: 'wiki-diff', generates: 'wiki-diff.md', requires: ['draft'] },
+      ],
+    };
+
+    it('fails when a done artifact has a required dependency that is not done', async () => {
+      const { validator } = setupValidator({ schema: depSchema });
+      const result = await validator.validateDependencies({ draft: 'blocked', 'wiki-diff': 'done' });
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes("'wiki-diff'") && e.includes("'draft'"))).toBe(true);
+    });
+
+    it('passes for an all-done dependency chain', async () => {
+      const { validator } = setupValidator({ schema: depSchema });
+      const result = await validator.validateDependencies({ draft: 'done', 'wiki-diff': 'done' });
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+    });
+
+    it('does NOT error for a ready artifact whose dependency is still blocked', async () => {
+      const { validator } = setupValidator({ schema: depSchema });
+      const result = await validator.validateDependencies({ draft: 'blocked', 'wiki-diff': 'ready' });
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+    });
+
+    it('does NOT error for a blocked artifact whose dependency is done', async () => {
+      const { validator } = setupValidator({ schema: depSchema });
+      const result = await validator.validateDependencies({ draft: 'done', 'wiki-diff': 'blocked' });
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+    });
+
+    it('still fails when a required dependency is absent from the manifest entirely', async () => {
+      const { validator } = setupValidator({ schema: depSchema });
+      const result = await validator.validateDependencies({ 'wiki-diff': 'done' });
+      expect(result.passed).toBe(false);
+      expect(result.errors.some((e) => e.includes('not present in the change manifest'))).toBe(true);
+    });
+  });
 });

@@ -10,9 +10,9 @@ import YAML from 'yaml';
 import { ProjectConfigSchema } from '../../schemas/project-config.js';
 import type { SchemaDef, ArtifactDef } from '../../schemas/schema-def.js';
 import type { ValidationResult, ProjectConfig } from '../../schemas/types.js';
+import { TargetNotFoundError } from '../../utils/errors.js';
 import { safeReadFile, fileExists } from '../../utils/fs.js';
 import { extractFrontmatter, extractWikiLinks } from '../../utils/markdown.js';
-import { TargetNotFoundError } from '../../utils/errors.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 
@@ -70,7 +70,11 @@ export class MechanicalValidator {
    * Validate a single artifact in a change directory.
    *
    * Runs all applicable checks: file existence, frontmatter, word count,
-   * and wiki-link validity (for wiki-diff artifacts).
+   * and wiki-link validity (for wiki-diff artifacts). Frontmatter and
+   * word-count checks run exactly once per artifact, inside
+   * `schemaCompliance`, so their errors/warnings are not duplicated in
+   * the result (a single missing-frontmatter artifact used to report
+   * two identical errors and read the file twice).
    *
    * @param changeDir  Absolute path to the change directory.
    * @param artifactId Artifact identifier.
@@ -86,20 +90,9 @@ export class MechanicalValidator {
       return { artifactId, passed: false, errors, warnings };
     }
 
-    const frontmatter = await this.frontmatterPresent(changeDir, artifactId);
-    if (!frontmatter.passed) {
-      errors.push(...frontmatter.errors);
-    }
-
-    const wordCount = await this.wordCount(changeDir, artifactId);
-    if (wordCount.warnings.length > 0) {
-      warnings.push(...wordCount.warnings);
-    }
-
     const schemaCompliance = await this.schemaCompliance(changeDir, artifactId);
-    if (!schemaCompliance.passed) {
-      errors.push(...schemaCompliance.errors);
-    }
+    errors.push(...schemaCompliance.errors);
+    warnings.push(...schemaCompliance.warnings);
 
     const wikiLinks = await this.wikiLinkValidity(changeDir, artifactId);
     if (!wikiLinks.passed) {
@@ -264,10 +257,13 @@ export class MechanicalValidator {
   async frontmatterPresent(changeDir: string, artifactId: string): Promise<ValidationResult> {
     const schema = await this.getSchema();
     const art = schema ? schema.artifacts.find((a) => a.id === artifactId) : undefined;
-    if (!art?.validation?.mechanical?.includes('frontmatterPresent')) {
+    if (!art) {
       return { artifactId, passed: true, errors: [], warnings: [] };
     }
-    const fileName = art?.generates ?? `${artifactId}.md`;
+    if (!(art.validation?.mechanical?.includes('frontmatterPresent') ?? false)) {
+      return { artifactId, passed: true, errors: [], warnings: [] };
+    }
+    const fileName = art.generates;
     const filePath = join(changeDir, fileName);
     const raw = await safeReadFile(filePath);
     if (raw === null) {
@@ -593,7 +589,10 @@ export class MechanicalValidator {
       const maxMatch = /maxWords:(\d+)/.exec(rule);
       if (maxMatch) {rules.maxWords = parseInt(maxMatch[1], 10);}
       const fieldMatch = /requireField:(\w[\w-]*)/.exec(rule);
-      if (fieldMatch) {rules.requiredFields!.push(fieldMatch[1]);}
+      if (fieldMatch) {
+        rules.requiredFields ??= [];
+        rules.requiredFields.push(fieldMatch[1]);
+      }
       if (rule === 'requireNonEmpty' || rule === 'requireNonEmpty:true') {
         rules.requireNonEmpty = true;
       } else if (rule === 'requireNonEmpty:false') {
@@ -607,7 +606,11 @@ export class MechanicalValidator {
    * Validate that all artifact dependencies in the schema are satisfied by the change manifest.
    *
    * For each artifact in the schema, checks that every dependency listed in `requires`
-   * is present in the manifest's artifact list.
+   * is present in the manifest's artifact list, and that a `done` artifact never has a
+   * required dependency that is not itself `done` (a hand-edited manifest could violate
+   * the cascade `ChangeManifest` normally maintains — see `handleArtifactDeletion`'s
+   * `=== 'done'` convention). A blocked/ready artifact with a non-done dependency is
+   * fine: it simply has not become ready yet.
    *
    * @param manifestArtifacts Mapping of artifact IDs to their statuses from the change manifest.
    * @returns Validation result indicating whether all dependencies are satisfied.
@@ -622,6 +625,12 @@ export class MechanicalValidator {
       for (const req of art.requires) {
         if (!(req in manifestArtifacts)) {
           errors.push(`Artifact '${art.id}' requires '${req}' which is not present in the change manifest`);
+          continue;
+        }
+        if (manifestArtifacts[art.id] === 'done' && manifestArtifacts[req] !== 'done') {
+          errors.push(
+            `Artifact '${art.id}' is done but its required dependency '${req}' is not done (status: '${manifestArtifacts[req]}')`
+          );
         }
       }
     }
