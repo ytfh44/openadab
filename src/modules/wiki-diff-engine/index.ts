@@ -346,16 +346,24 @@ class AddKnowledgeTimelineStrategy implements OperationStrategy {
  * split on the longest " are now " suffix, then take the substring
  * *after the last* " and " in the remaining prefix. This guarantees
  * that the related entity is exactly the final conjunction operand.
+ *
+ * The section is processed one line at a time: every "… are now …"
+ * sentence in the section produces its own operation.  A whole-section
+ * regex would let the greedy prefix absorb every earlier sentence up
+ * to the LAST " are now " and silently drop them.
  */
 class UpdateRelationshipStrategy implements OperationStrategy {
   readonly sectionName = 'Update Relationship';
 
   parse(section: string, context: ParseContext): WikiDiffOperation[] {
     const ops: WikiDiffOperation[] = [];
-    const areNowMatch = /^(.*)\s+are\s+now\s+(.+)$/s.exec(section);
-    if (areNowMatch !== null) {
-      const head = areNowMatch[1] ?? '';
-      const tail = (areNowMatch[2] ?? '').trim();
+    for (const rawLine of section.split('\n')) {
+      const line = rawLine.trim();
+      if (line === '') {continue;}
+      const areNowMatch = /^(.*)\s+are\s+now\s+(.+)$/.exec(line);
+      if (areNowMatch === null) {continue;}
+      const head = areNowMatch[1];
+      const tail = areNowMatch[2].trim();
       const lastAnd = head.lastIndexOf(' and ');
       if (lastAnd >= 0) {
         const relatedEntity = head.slice(lastAnd + ' and '.length).trim();
@@ -547,6 +555,13 @@ export class WikiDiffApplier {
    * `draft-ch-012` into `adab/changes/draft-ch-012/wiki-diff.md` and
    * passing the parsed document here.
    *
+   * if an operation throws mid-apply (e.g.
+   * `WIKI_DIFF_TYPE_MISMATCH` from `applyUpdateField`), the batch is
+   * aborted and a failed {@link ApplyResult} is returned instead of
+   * letting the exception escape — the batch window is always closed
+   * via `finally`, so `endBatch()` runs and the engine's batch mode
+   * never sticks.
+   *
    * @param document Parsed wiki-diff document.
    * @param dryRun   If true, do not write any files.
    * @returns Result describing applied / would-be changes.
@@ -583,56 +598,86 @@ export class WikiDiffApplier {
     // one disk read for stats purposes.
     const pageCache = new Map<string, Awaited<ReturnType<WikiEngine['readPage']>>>();
 
+    let applyFailed = false;
     if (!dryRun) {
       this.wikiEngine.beginBatch();
     }
-    for (const op of document.operations) {
-      try {
-        const staleWarning = await this.checkIdempotency(op, pageCache);
-        if (staleWarning !== null) {warnings.push(staleWarning);}
-      } catch (err) {
-        console.warn('[WikiDiffApplier] Idempotency check failed:', err instanceof Error ? err.message : String(err));
-      }
-
-      // dry-run and apply share the same stat-accumulation
-      // logic.  The `accumulateChangeStats` helper handles both the
-      // `update_thread_status` "status: x→y" detail and the basic
-      // entry counter.
-      await this.accumulateChangeStats(op, pageChangeCounts, modifiedPages);
-      if (op.type === 'flag_contradiction') {
-        contradictionsFlagged++;
-      }
-
-      if (!dryRun) {
-        // Apply the operation
-        switch (op.type) {
-          case 'add_current_state':
-            await this.applyAddCurrentState(op);
-            break;
-          case 'add_knowledge_timeline':
-            await this.applyAddKnowledgeTimeline(op);
-            break;
-          case 'update_relationship':
-            await this.applyUpdateRelationship(op);
-            break;
-          case 'update_thread_status':
-            await this.applyUpdateThreadStatus(op);
-            break;
-          case 'add_evidence':
-            await this.applyAddEvidence(op);
-            break;
-          case 'flag_contradiction':
-            await this.applyFlagContradiction(op);
-            break;
-          case 'update_field':
-            await this.applyUpdateField(op);
-            break;
+    // The batch window must ALWAYS be closed.  A per-operation failure
+    // is converted into a failed ApplyResult below, but the outer
+    // try/finally guarantees `endBatch()` runs on every exit path so
+    // the engine's batch mode never sticks (a stuck batch would leave
+    // the wiki index stale until some unrelated call happens to end
+    // the batch).
+    try {
+      for (const op of document.operations) {
+        try {
+          const staleWarning = await this.checkIdempotency(op, pageCache);
+          if (staleWarning !== null) {warnings.push(staleWarning);}
+        } catch (err) {
+          console.warn('[WikiDiffApplier] Idempotency check failed:', err instanceof Error ? err.message : String(err));
         }
+
+        // dry-run and apply share the same stat-accumulation
+        // logic.  The `accumulateChangeStats` helper handles both the
+        // `update_thread_status` "status: x→y" detail and the basic
+        // entry counter.
+        await this.accumulateChangeStats(op, pageChangeCounts, modifiedPages);
+        if (op.type === 'flag_contradiction') {
+          contradictionsFlagged++;
+        }
+
+        if (!dryRun) {
+          // Apply the operation.  A throw here (e.g. a field type
+          // mismatch that slipped past validation, or an I/O failure)
+          // aborts the remaining batch; the failure result below
+          // reports 0 counts, mirroring the validation-failure path,
+          // so the failed operation's stats are not reported.
+          try {
+            switch (op.type) {
+              case 'add_current_state':
+                await this.applyAddCurrentState(op);
+                break;
+              case 'add_knowledge_timeline':
+                await this.applyAddKnowledgeTimeline(op);
+                break;
+              case 'update_relationship':
+                await this.applyUpdateRelationship(op);
+                break;
+              case 'update_thread_status':
+                await this.applyUpdateThreadStatus(op);
+                break;
+              case 'add_evidence':
+                await this.applyAddEvidence(op);
+                break;
+              case 'flag_contradiction':
+                await this.applyFlagContradiction(op);
+                break;
+              case 'update_field':
+                await this.applyUpdateField(op);
+                break;
+            }
+          } catch (err) {
+            errors.push(`Failed to apply ${op.type} on ${op.target}: ${err instanceof Error ? err.message : String(err)}`);
+            applyFailed = true;
+            break;
+          }
+        }
+      }
+    } finally {
+      if (!dryRun) {
+        await this.wikiEngine.endBatch();
       }
     }
 
-    if (!dryRun) {
-      await this.wikiEngine.endBatch();
+    if (applyFailed) {
+      return {
+        success: false,
+        operationsApplied: 0,
+        pagesModified: 0,
+        contradictionsFlagged: 0,
+        summary: `Application failed with ${String(errors.length)} error(s): ${errors.join('; ')}`,
+        warnings,
+      };
     }
 
     const parts: string[] = [];
@@ -710,6 +755,9 @@ export class WikiDiffApplier {
    * Validate a single operation.
    *
    * Ensures the target page exists and the source citation is present.
+   * For `update_field` operations, also checks that the value type
+   * matches the existing frontmatter field type so that dry-run reports
+   * a type mismatch instead of only discovering it mid-apply.
    *
    * @param op Operation to validate.
    * @throws {TargetNotFoundError} If the target wiki page does not exist.
@@ -723,6 +771,38 @@ export class WikiDiffApplier {
     }
     if (op.source === '') {
       throw new MissingSourceError('Every wiki-diff operation must cite a manuscript or raw source path');
+    }
+    if (op.type === 'update_field') {
+      // Surface field type mismatches at validation time so dry-run
+      // reports them like any other validation error; the runtime check
+      // in `applyUpdateField` remains as defense in depth in case the
+      // page changes between validation and apply.
+      const page = await this.wikiEngine.readPage(op.target);
+      this.assertFieldTypeMatches(op, page.frontmatter[op.field]);
+    }
+  }
+
+  /**
+   * Assert that an `update_field` operation's value type matches the
+   * existing frontmatter field type.
+   *
+   * Shared by {@link validateOperation} (so dry-run reports mismatches)
+   * and {@link applyUpdateField} (defense in depth).  A missing field
+   * (`undefined` / `null`) always accepts the new value.
+   *
+   * @param op       Update-field operation being checked.
+   * @param existing Current value of the field, or `undefined`/`null`.
+   * @throws {AdabError} `WIKI_DIFF_TYPE_MISMATCH` on type mismatch.
+   */
+  private assertFieldTypeMatches(op: Extract<WikiDiffOperation, { type: 'update_field' }>, existing: unknown): void {
+    if (existing === undefined || existing === null) {return;}
+    const existingType = typeof existing;
+    const newType = typeof op.value;
+    if (existingType !== newType) {
+      throw new AdabError(
+        `Type mismatch for field '${op.field}' in ${op.target}: existing type is ${existingType}, but new value has type ${newType}`,
+        'WIKI_DIFF_TYPE_MISMATCH',
+      );
     }
   }
 
@@ -793,11 +873,21 @@ export class WikiDiffApplier {
     const page = await this.wikiEngine.readPage(op.target);
     let body = page.body;
     const section = extractSectionsByHeading(body, 'Current State');
+    const entry = `- ${op.content}`;
+    // Idempotency: if the exact bullet already exists in the section, a
+    // re-apply must not append a duplicate.  `last_updated` is still
+    // refreshed on the no-op path (same convention as
+    // `applyUpdateThreadStatus`).
+    if (section !== null && this.sectionHasEntry(section, entry)) {
+      page.frontmatter.last_updated = op.source;
+      await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
+      return;
+    }
     if (section !== null) {
       const insertIndex = this.sectionInsertionPoint(body, section);
-      body = `${body.slice(0, insertIndex)}\n- ${op.content}\n${body.slice(insertIndex)}`;
+      body = `${body.slice(0, insertIndex)}\n${entry}\n${body.slice(insertIndex)}`;
     } else {
-      body += `\n## Current State\n\n- ${op.content}\n`;
+      body += `\n## Current State\n\n${entry}\n`;
     }
     page.frontmatter.last_updated = op.source;
     await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
@@ -811,6 +901,15 @@ export class WikiDiffApplier {
     let body = page.body;
     const section = extractSectionsByHeading(body, 'Knowledge Timeline');
     const row = `| ${op.chapter} | ${op.knowledge} |`;
+    // Idempotency: if a row with the same chapter + knowledge already
+    // exists in the table, a re-apply must not append a duplicate.
+    // `last_updated` is still refreshed on the no-op path (same
+    // convention as `applyUpdateThreadStatus`).
+    if (section !== null && this.sectionHasEntry(section, row)) {
+      page.frontmatter.last_updated = op.source;
+      await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, body);
+      return;
+    }
     if (section !== null) {
       const insertIndex = this.sectionInsertionPoint(body, section);
       body = `${body.slice(0, insertIndex)}\n${row}\n${body.slice(insertIndex)}`;
@@ -1067,21 +1166,33 @@ export class WikiDiffApplier {
   private async applyUpdateField(op: Extract<WikiDiffOperation, { type: 'update_field' }>): Promise<void> {
     const page = await this.wikiEngine.readPage(op.target);
     const existing = page.frontmatter[op.field];
-    if (existing !== undefined && existing !== null) {
-      const existingType = typeof existing;
-      const newType = typeof op.value;
-      if (existingType !== newType) {
-        throw new AdabError(
-          `Type mismatch for field '${op.field}' in ${op.target}: existing type is ${existingType}, but new value has type ${newType}`,
-          'WIKI_DIFF_TYPE_MISMATCH',
-        );
-      }
-    }
+    this.assertFieldTypeMatches(op, existing);
     page.frontmatter[op.field] = op.value;
     // `last_updated` is ALWAYS refreshed, even when the field
     // value is unchanged.
     page.frontmatter.last_updated = op.source;
     await this.wikiEngine.writePage(op.target, { ...page.frontmatter }, page.body);
+  }
+
+  /**
+   * Whether `entry` (a formatted `- …` bullet or `| … |` table row)
+   * already appears among the lines of a section.  Shared by the
+   * idempotency checks in {@link applyAddCurrentState} and
+   * {@link applyAddKnowledgeTimeline}; lines are compared trimmed so
+   * minor surrounding whitespace does not defeat the match.
+   *
+   * @param section Section text as returned by
+   *   {@link extractSectionsByHeading} (un-trimmed).
+   * @param entry   Formatted entry line to look for.
+   * @returns True if a matching line exists in the section.
+   */
+  private sectionHasEntry(section: string, entry: string): boolean {
+    for (const line of section.split('\n')) {
+      if (line.trim() === entry) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

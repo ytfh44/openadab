@@ -569,6 +569,38 @@ describe('WikiEngine', () => {
       // At least one explained status should be present
       expect(raw).toContain('Status: explained');
     });
+
+    // sectionRegex must tolerate CRLF line endings.  A literal `\n`
+    // requirement never matches a `## desc\r\n` heading, so the probe
+    // would find no unresolved section and a resolved op would be
+    // appended as a duplicate `## …` section instead of updating the
+    // existing entry in place.
+    it('resolves an existing unresolved entry in place on a CRLF file (no duplicate section)', async () => {
+      const path = join(tempDir, 'adab', 'wiki', 'contradictions.md');
+      const lf = `# Contradictions\n\n## Mara knows the secret\n- **characters/mara**: does not know\n- Status: unresolved\n`;
+      writeFileSync(path, lf.replace(/\n/g, '\r\n'), 'utf-8');
+
+      const resolveDiff = [
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: 'Mara knows the secret',
+          sources: [{ page: 'ch-003', claim: 'now knows' }],
+          status: 'explained' as const,
+        },
+      ];
+      await engine.updateContradictions(resolveDiff);
+
+      const raw = readFileSync(path, 'utf-8');
+      // The existing section must have been updated in place: exactly
+      // one `## …` section, now resolved, with no duplicate appended.
+      const sections = raw.match(/## Mara knows the secret/g) ?? [];
+      expect(sections).toHaveLength(1);
+      expect(raw).toContain('Status: explained');
+      expect(raw).toContain('- Resolution:');
+      expect(raw).not.toContain('Status: unresolved');
+    });
   });
 
   describe('checkSystemPages', () => {

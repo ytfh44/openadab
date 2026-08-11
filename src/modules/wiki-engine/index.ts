@@ -633,9 +633,13 @@ export class WikiEngine {
     // that matches the description, not just the first.
     for (const op of resolvedOps) {
       const escapedDesc = op.description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      // Match the section heading and its content up to the next heading or EOF
+      // Match the section heading and its content up to the next heading
+      // or EOF.  `\r?\n` tolerates CRLF files: a literal `\n` never
+      // matches the `## desc\r\n` heading of a CRLF file, so the probe
+      // below would find no unresolved section and a resolved op would
+      // be appended as a duplicate instead of updating in place.
       const sectionRegex = new RegExp(
-        `(## ${escapedDesc}\\n)((?:\\n|.)*?)(?=\\n## |$)`,
+        `(## ${escapedDesc}\\r?\\n)((?:\\r?\\n|.)*?)(?=\\r?\\n## |$)`,
         'g',
       );
       // First, determine whether there is at least one unresolved match;

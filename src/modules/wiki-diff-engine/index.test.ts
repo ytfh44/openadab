@@ -366,6 +366,18 @@ describe('WikiDiffParser edge cases (refactor stress tests)', () => {
       .toBe('allies and confidants');
   });
 
+  it('parses every "are now" sentence in a multi-sentence section', async () => {
+    // A section with several relationship sentences must produce one
+    // operation per sentence.  The previous whole-section regex with the
+    // `s` flag let the greedy prefix absorb everything up to the LAST
+    // " are now ", silently dropping the earlier sentence.
+    const markdown = `---\nchangeId: ch\n---\n\n### [[a]]\nSource: s.md\n\n#### Update Relationship\nMara and Lin are now allies\nMara and Bob are now rivals\n`;
+    const doc = await parser.parse(markdown);
+    expect(doc.operations).toHaveLength(2);
+    expect(doc.operations[0]).toMatchObject({ relatedEntity: 'Lin', relationship: 'allies' });
+    expect(doc.operations[1]).toMatchObject({ relatedEntity: 'Bob', relationship: 'rivals' });
+  });
+
   // === Update Thread Status ===
 
   it('produces no op when Status: line is absent (evidence-only block)', async () => {
@@ -1110,5 +1122,95 @@ describe('WikiDiffApplier', () => {
     expect(afterSecond).toBe(afterFirst);
     expect((afterSecond.match(/^- first clue$/gm) ?? []).length).toBe(1);
     expect((afterSecond.match(/^## Evidence$/gm) ?? []).length).toBe(1);
+  });
+
+  it('reports update_field type mismatch as a validation failure in dry-run', async () => {
+    writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\nage: 30\n---\n\n# Mara\n`);
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'update_field' as const, target: 'characters/mara.md', source: 'manuscript/chapters/ch-012.md', field: 'age', value: 'thirty' },
+      ],
+    };
+    const result = await applier.apply(doc, true);
+    expect(result.success).toBe(false);
+    expect(result.summary).toContain('Type mismatch');
+    // dry-run must not have written anything
+    const page = await wikiEngine.readPage('characters/mara.md');
+    expect(page.frontmatter.age).toBe(30);
+  });
+
+  it('returns a failed ApplyResult for update_field type mismatch (no throw, no stuck batch)', async () => {
+    writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\nage: 30\n---\n\n# Mara\n`);
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'update_field' as const, target: 'characters/mara.md', source: 'manuscript/chapters/ch-012.md', field: 'age', value: 'thirty' },
+      ],
+    };
+    const result = await applier.apply(doc, false);
+    expect(result.success).toBe(false);
+    expect(result.operationsApplied).toBe(0);
+    expect(result.pagesModified).toBe(0);
+    expect(result.summary).toContain('Type mismatch');
+    // endBatch() must have run — batch mode must not be left on.
+    expect((wikiEngine as unknown as { batchMode: boolean }).batchMode).toBe(false);
+  });
+
+  it('aborts cleanly when an operation fails mid-apply and endBatch still runs', async () => {
+    // A directory at the target path passes `fileExists` (validation)
+    // but fails inside the apply switch (`readPage` on a directory
+    // yields no content), so the failure occurs after validation
+    // succeeded, mid-batch.
+    mkdirSync(join(root, 'adab', 'wiki', 'characters', 'mara.md'), { recursive: true });
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'add_current_state' as const, target: 'characters/mara.md', source: 'manuscript/chapters/ch-012.md', content: 'New state' },
+      ],
+    };
+    const result = await applier.apply(doc, false);
+    expect(result.success).toBe(false);
+    expect(result.summary).toContain('Application failed');
+    // endBatch() must have run despite the mid-batch failure.
+    expect((wikiEngine as unknown as { batchMode: boolean }).batchMode).toBe(false);
+  });
+
+  it('re-applying the same add_current_state op does not duplicate the bullet', async () => {
+    writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\nlast_updated: manuscript/chapters/ch-012.md\n---\n\n# Mara\n`);
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'add_current_state' as const, target: 'characters/mara.md', source: 'manuscript/chapters/ch-012.md', content: 'Mara now knows the east gate was opened from inside.' },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+    // Re-apply the same op — the bullet must not be appended a second time.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+    // With `last_updated` already equal to the source, the no-op write is
+    // byte-identical (same convention as update_thread_status).
+    expect(afterSecond).toBe(afterFirst);
+    const occurrences = (afterSecond.match(/- Mara now knows the east gate was opened from inside\./g) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it('re-applying the same add_knowledge_timeline op does not duplicate the row', async () => {
+    writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\nlast_updated: manuscript/chapters/ch-012.md\n---\n\n# Mara\n`);
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'add_knowledge_timeline' as const, target: 'characters/mara.md', source: 'manuscript/chapters/ch-012.md', chapter: 'ch-012', knowledge: 'east gate opened from inside' },
+      ],
+    };
+    await applier.apply(doc, false);
+    const afterFirst = readFileSync(join(root, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+    // Re-apply the same op — the row must not be appended a second time.
+    await applier.apply(doc, false);
+    const afterSecond = readFileSync(join(root, 'adab', 'wiki', 'characters', 'mara.md'), 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+    const occurrences = (afterSecond.match(/\| ch-012 \| east gate opened from inside \|/g) ?? []).length;
+    expect(occurrences).toBe(1);
   });
 });
