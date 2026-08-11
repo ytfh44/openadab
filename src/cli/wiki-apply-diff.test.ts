@@ -15,9 +15,9 @@ import { join } from 'node:path';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createMinimalProject } from '../../tests/integration/fixture.js';
 import { WikiDiffApplier } from '../modules/wiki-diff-engine/index.js';
 
-import { createMinimalProject } from '../../tests/integration/fixture.js';
 
 import { createProgram, resolveApplyDryRun } from './index.js';
 
@@ -76,6 +76,9 @@ describe('CLI wiki apply-diff dryRun integration', () => {
     diffPath = scaffold.diffPath;
 
     applySpy = vi.spyOn(WikiDiffApplier.prototype, 'apply');
+    // vi.spyOn on an already-spied method returns the same spy without
+    // resetting it, so call history would accumulate across tests.
+    applySpy.mockClear();
     applySpy.mockResolvedValue({
       success: true,
       operationsApplied: 1,
@@ -90,11 +93,11 @@ describe('CLI wiki apply-diff dryRun integration', () => {
     const originalCwd = process.cwd();
     process.chdir(projectRoot);
 
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       return undefined as unknown as never;
-    }) as never);
+    }));
     const originalExitCode = process.exitCode;
     process.exitCode = undefined;
 
@@ -104,7 +107,9 @@ describe('CLI wiki apply-diff dryRun integration', () => {
       const applyDiffCmd = wikiCmd?.commands.find((c) => c.name() === 'apply-diff');
       expect(applyDiffCmd).toBeDefined();
 
-      const applyOption = applyDiffCmd?.options.find((o) => o.long === '--apply');
+      const applyOption = applyDiffCmd?.options.find((o) => o.long === '--apply') as
+        | { conflictsWith: string[] }
+        | undefined;
       if (applyOption !== undefined) {
         applyOption.conflictsWith = [];
       }
@@ -155,6 +160,7 @@ describe('CLI wiki apply-diff conflict detection', () => {
     diffPath = scaffold.diffPath;
 
     applySpy = vi.spyOn(WikiDiffApplier.prototype, 'apply');
+    applySpy.mockClear();
     applySpy.mockResolvedValue({
       success: true,
       operationsApplied: 1,
@@ -170,29 +176,31 @@ describe('CLI wiki apply-diff conflict detection', () => {
     process.chdir(projectRoot);
 
     const stderrLines: string[] = [];
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const errorSpy = vi.spyOn(console, 'error').mockImplementation((msg: unknown) => {
       stderrLines.push(String(msg));
     });
     const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
       stderrLines.push(String(chunk));
       return true;
-    }) as never);
+    }));
 
-    let capturedExitCode: number | null = null;
+    // Boxed so TypeScript cannot narrow the captured value to its
+    // initial `null` (assignments inside the mocked closure are not
+    // tracked by control-flow analysis).
+    const exitCapture: { code: number | null } = { code: null };
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number | string | null) => {
       if (typeof code === 'number') {
-        capturedExitCode = code;
+        exitCapture.code = code;
       } else if (typeof code === 'string') {
-        capturedExitCode = Number(code);
+        exitCapture.code = Number(code);
       } else {
-        capturedExitCode = 1;
+        exitCapture.code = 1;
       }
-      throw new Error(`__test_exit:${String(capturedExitCode)}`);
-    }) as never);
+      throw new Error(`__test_exit:${String(exitCapture.code)}`);
+    }));
 
     const originalExitCode = process.exitCode;
-    process.exitCode = undefined;
 
     try {
       const program = createProgram();
@@ -211,8 +219,8 @@ describe('CLI wiki apply-diff conflict detection', () => {
           throw err;
         }
       }
-      if (capturedExitCode === null && process.exitCode !== undefined && process.exitCode !== originalExitCode) {
-        capturedExitCode = process.exitCode;
+      if (exitCapture.code === null && process.exitCode !== undefined && process.exitCode !== originalExitCode) {
+        exitCapture.code = Number(process.exitCode);
       }
     } finally {
       process.chdir(originalCwd);
@@ -223,8 +231,8 @@ describe('CLI wiki apply-diff conflict detection', () => {
       process.exitCode = originalExitCode;
     }
 
-    expect(capturedExitCode).not.toBeNull();
-    expect(capturedExitCode).not.toBe(0);
+    expect(exitCapture.code).not.toBeNull();
+    expect(exitCapture.code).not.toBe(0);
     expect(applySpy).not.toHaveBeenCalled();
     const combined = stderrLines.join('\n').toLowerCase();
     expect(combined).toMatch(/--apply|--dry-run|conflict/);
