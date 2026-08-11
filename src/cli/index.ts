@@ -765,9 +765,10 @@ export function createProgram(): Command {
         // printed the per-artifact diagnostics; the non-zero exit
         // code is the only thing the shell wrapper needs.
         if (options.json === true) {
+          const failedCount = results.filter((r) => !r.passed).length;
           process.exitCode = handleError(
             new AdabError(
-              `Validation failed for ${changeId}: ${results.filter((r) => !r.passed).length} artifact(s) with errors`,
+              `Validation failed for ${changeId}: ${String(failedCount)} artifact(s) with errors`,
               'VALIDATION_ERROR',
             ),
             { json: true },
@@ -792,7 +793,9 @@ export function createProgram(): Command {
         const projectRoot = resolveProjectRoot();
         await ensureProjectConfig(projectRoot);
         const wikiEngine = new WikiEngine(projectRoot);
-        const result = await wikiEngine.generateIndex();
+        // generateIndex returns void; the JSON envelope below is the
+        // minimal success shape (no result payload to report).
+        await wikiEngine.generateIndex();
         // Resolve the on-disk path of the regenerated index so the
         // JSON consumer can confirm what was written.  In human mode
         // the spinner.succeed line already conveys success; we still
@@ -801,12 +804,7 @@ export function createProgram(): Command {
         const indexPath = join(projectRoot, 'adab', 'wiki', 'index.md');
         spinner.succeed(chalk.green(`Wiki index regenerated: ${indexPath}`));
         if (isJson) {
-          // `result` is whatever the wiki engine returned (an object
-          // describing the TOC or pages touched).  Fall back to a
-          // minimal envelope when the engine has nothing to report.
-          const payload = result !== undefined && result !== null
-            ? { success: true, indexPath, result }
-            : { success: true, indexPath };
+          const payload = { success: true, indexPath };
           output(payload, { json: true });
         } else {
           console.log(chalk.blue(`Index file: ${indexPath}`));
@@ -1024,6 +1022,10 @@ export function createProgram(): Command {
       try {
         const projectRoot = resolveProjectRoot();
         await ensureProjectConfig(projectRoot);
+        // Guard the change id before it is joined onto `adab/changes/`:
+        // the manifest read below must not escape the project boundary
+        // (SyncEngine.sync re-checks, but only after this read).
+        assertChangeDirSafe(projectRoot, String(options.change));
         // Validate/pack against the schema the change was created under
         // (from its manifest), not the currently ACTIVE schema — a change
         // created under an older schema would otherwise be validated
