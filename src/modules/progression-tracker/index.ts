@@ -2,8 +2,8 @@
  * Progression Tracker — parses continuity reports and wiki-diffs to build a
  * timeline of entity state changes, stored in `adab/index/progressions.json`.
  */
-import { join } from 'node:path';
 import { stat } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import glob from 'fast-glob';
 
@@ -437,7 +437,7 @@ export class ProgressionTracker {
       }
     }
     for (const newEv of newEvents) {
-      if (newEventSet.has(newEv) === false) {continue;}
+      if (!newEventSet.has(newEv)) {continue;}
       for (const oldEv of existingEvents) {
         if (oldEv.entity === newEv.entity && oldEv.type === newEv.type && newEv.type !== 'thread_status') {
           if (this.isContradictory(oldEv, newEv)) {
@@ -486,9 +486,23 @@ export class ProgressionTracker {
     for (const ch of existingChapters) {
       chapterMap.set(ch.chapter, ch);
     }
-    for (const newCh of newChapters) {
-      // H6: Replace prior entries when re-processing an edited chapter
-      chapterMap.set(newCh.chapter, { chapter: newCh.chapter, events: [...newCh.events] });
+    // A chapter's events can come from multiple source files
+    // (continuity-report.md AND wiki-diff.md).  Replacing the cached entry
+    // with only the changed files' events (the old merge loop) silently
+    // dropped the untouched files' events for the chapter: the
+    // `.last-progression-indexed` cutoff advances, so the untouched file was
+    // never rescanned.  Rebuild each affected chapter from ALL of its source
+    // files instead; chapters untouched by any changed file keep their
+    // cached events.  A deleted source file is no longer matched by the glob,
+    // so a rebuilt chapter naturally drops its stale events as well.
+    const affected = new Set(newChapters.map((ch) => ch.chapter));
+    if (affected.size > 0) {
+      const fullChapters = await this.collectEventsFromChanges();
+      for (const fullCh of fullChapters) {
+        if (affected.has(fullCh.chapter)) {
+          chapterMap.set(fullCh.chapter, { chapter: fullCh.chapter, events: [...fullCh.events] });
+        }
+      }
     }
 
     const chapters = Array.from(chapterMap.values());
@@ -551,7 +565,7 @@ export class ProgressionTracker {
    * enemies, trusts ↔ distrusts/betrayed, loves ↔ hates, etc.).
    */
   private isRelationshipContradictory(a: ProgressionEvent, b: ProgressionEvent): boolean {
-    const opposites: Array<[string, string]> = [
+    const opposites: [string, string][] = [
       ['allies', 'enemies'],
       ['allies', 'rivals'],
       ['trusts', 'distrusts'],
@@ -585,7 +599,7 @@ export class ProgressionTracker {
    * empty ↔ full, etc.).
    */
   private isStateContradictory(a: ProgressionEvent, b: ProgressionEvent): boolean {
-    const stateOpposites: Array<[string, string]> = [
+    const stateOpposites: [string, string][] = [
       ['destroyed', 'repaired'],
       ['destroyed', 'restored'],
       ['destroyed', 'rebuilt'],
@@ -662,10 +676,10 @@ export class ProgressionTracker {
   private buildThreadStatusChains(
     existing: ProgressionEvent[],
     incoming: ProgressionEvent[],
-  ): Map<string, Array<{ ev: ProgressionEvent; isBackward: boolean }>> {
+  ): Map<string, { ev: ProgressionEvent; isBackward: boolean }[]> {
     const all = [...existing, ...incoming].filter((ev) => ev.type === 'thread_status');
     all.sort((a, b) => this.extractChapterNumber(a.chapter) - this.extractChapterNumber(b.chapter));
-    const byEntity = new Map<string, Array<{ ev: ProgressionEvent; isBackward: boolean }>>();
+    const byEntity = new Map<string, { ev: ProgressionEvent; isBackward: boolean }[]>();
     for (const ev of all) {
       const list = byEntity.get(ev.entity);
       const prev = list === undefined ? undefined : list[list.length - 1];

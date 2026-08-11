@@ -448,7 +448,7 @@ describe('ProgressionTracker', () => {
       for (let i = 0; i < 15; i++) {
         lines.push(`- Fact number ${i + 1}`);
       }
-      writeFileSync(file, lines.join('\n') + '\n');
+      writeFileSync(file, `${lines.join('\n')}\n`);
       const events = await tracker.parseWikiDiff(file);
       expect(events.length).toBe(1);
       expect(events[0].change).toContain('Fact number 15');
@@ -457,7 +457,7 @@ describe('ProgressionTracker', () => {
     it('stops at next `####` sub-heading', async () => {
       const { root, tracker } = setupTracker();
       const file = join(root, 'wiki-diff.md');
-      writeFileSync(file, [
+      writeFileSync(file, `${[
         '---', 'changeId: ch-010', '---', '',
         '### [[characters/Alice]]', '',
         '#### Add to Current State',
@@ -465,7 +465,7 @@ describe('ProgressionTracker', () => {
         '- second',
         '#### Add Evidence',
         '- third',
-      ].join('\n') + '\n');
+      ].join('\n')}\n`);
       const events = await tracker.parseWikiDiff(file);
       const knowledge = events.find((e) => e.type === 'knowledge');
       expect(knowledge).toBeDefined();
@@ -475,14 +475,14 @@ describe('ProgressionTracker', () => {
     it('stops at next `###` entity heading', async () => {
       const { root, tracker } = setupTracker();
       const file = join(root, 'wiki-diff.md');
-      writeFileSync(file, [
+      writeFileSync(file, `${[
         '---', 'changeId: ch-010', '---', '',
         '### [[characters/Alice]]', '',
         '#### Add to Current State',
         '- first',
         '### [[characters/Bob]]',
         '- should not be captured',
-      ].join('\n') + '\n');
+      ].join('\n')}\n`);
       const events = await tracker.parseWikiDiff(file);
       const aliceEvents = events.filter((e) => e.entity === 'Alice');
       expect(aliceEvents.length).toBe(1);
@@ -716,6 +716,75 @@ describe('ProgressionTracker', () => {
       // tolerance on the upper bound).
       expect(cache!.mtimeMs).toBeGreaterThanOrEqual(tBefore);
       expect(cache!.mtimeMs).toBeLessThanOrEqual(tAfter + 5_000);
+    });
+  });
+
+  // ----- Incremental update must rebuild edited chapters from ALL source files -----
+  describe('incrementalUpdate multi-source merge', () => {
+    it('keeps continuity-report events when only wiki-diff.md is edited', async () => {
+      const { root, tracker } = setupTracker();
+      const changesDir = join(root, 'adab', 'changes', 'ch-005');
+      mkdirSync(changesDir, { recursive: true });
+      writeFileSync(join(changesDir, 'continuity-report.md'),
+        '## Character Knowledge\n- Mara now knows the truth\n');
+      const wikiDiff = join(changesDir, 'wiki-diff.md');
+      writeFileSync(wikiDiff,
+        `---\nchangeId: ch-005\n---\n\n### [[threads/Quest]]\n\n#### Update Thread Status\nStatus: open\n`);
+      const now = new Date();
+      utimesSync(join(changesDir, 'continuity-report.md'), now, now);
+      utimesSync(wikiDiff, now, now);
+
+      // First run indexes both sources of ch-005.
+      const firstRun = await runIncrementalAndRead(root, tracker);
+      const firstCh005 = firstRun.find((c) => c.chapter === 'ch-005');
+      expect(firstCh005?.events.length).toBe(2);
+
+      // Edit ONLY the wiki-diff; the continuity-report keeps its old mtime,
+      // so it falls below the cutoff of the second run.
+      writeFileSync(wikiDiff,
+        `---\nchangeId: ch-005\n---\n\n### [[threads/Quest]]\n\n#### Update Thread Status\nStatus: advanced\n`);
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(wikiDiff, later, later);
+
+      // Second run must keep the continuity-report events for ch-005 and
+      // pick up the edited wiki-diff events.
+      const secondRun = await runIncrementalAndRead(root, tracker);
+      const ch005 = secondRun.find((c) => c.chapter === 'ch-005');
+      expect(ch005?.events.length).toBe(2);
+      expect(ch005?.events.some((e) => e.type === 'knowledge' && e.entity === 'Mara')).toBe(true);
+      expect(ch005?.events.some((e) => e.type === 'thread_status' && e.to === 'advanced')).toBe(true);
+    });
+
+    it('keeps cached events for chapters untouched by the edited files', async () => {
+      const { root, tracker } = setupTracker();
+      const ch001Dir = join(root, 'adab', 'changes', 'ch-001');
+      mkdirSync(ch001Dir, { recursive: true });
+      writeFileSync(join(ch001Dir, 'continuity-report.md'),
+        '## Character Knowledge\n- Mara now knows the truth\n');
+      const ch002Dir = join(root, 'adab', 'changes', 'ch-002');
+      mkdirSync(ch002Dir, { recursive: true });
+      const ch002Report = join(ch002Dir, 'continuity-report.md');
+      writeFileSync(ch002Report,
+        '## Character Knowledge\n- Bob now knows the secret\n');
+      const now = new Date();
+      utimesSync(join(ch001Dir, 'continuity-report.md'), now, now);
+      utimesSync(ch002Report, now, now);
+
+      // First run indexes both chapters.
+      await runIncrementalAndRead(root, tracker);
+
+      // Edit only ch-002 and re-run; ch-001 must keep its cached events.
+      writeFileSync(ch002Report,
+        '## Character Knowledge\n- Bob now knows the secret\n- Bob knows the map location\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(ch002Report, later, later);
+
+      const chapters = await runIncrementalAndRead(root, tracker);
+      const ch001 = chapters.find((c) => c.chapter === 'ch-001');
+      expect(ch001?.events.length).toBe(1);
+      expect(ch001?.events[0].entity).toBe('Mara');
+      const ch002 = chapters.find((c) => c.chapter === 'ch-002');
+      expect(ch002?.events.length).toBe(2);
     });
   });
 });
