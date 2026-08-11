@@ -128,6 +128,37 @@ export async function resolveWikiPage(projectRoot: string, pagePath: string): Pr
 }
 
 /**
+ * Validate that a change directory name stays within the project boundary.
+ *
+ * Rejects empty names, absolute paths, parent-directory traversal (`..`),
+ * and any separator characters. The check is purely lexical — the resolved
+ * path is also compared to the expected `changes/` parent to defend against
+ * platforms where `..` does not collapse (e.g. Windows with mixed
+ * separators).
+ *
+ * @param projectRoot Absolute path to the project root.
+ * @param changeDir   Change directory name supplied by the caller.
+ * @throws {AdabError} with code `PATH_TRAVERSAL` if the name is unsafe.
+ */
+export function assertChangeDirSafe(projectRoot: string, changeDir: string): void {
+  if (changeDir.length === 0) {
+    throw new AdabError('Change directory name is empty', 'PATH_TRAVERSAL');
+  }
+  if (isAbsolute(changeDir)) {
+    throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
+  }
+  if (changeDir.includes('..') || changeDir.includes('/') || changeDir.includes('\\') || changeDir.includes('\0')) {
+    throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
+  }
+  const expected = join(projectRoot, 'adab', 'changes', changeDir);
+  const resolvedExpected = resolve(expected);
+  const changesRoot = resolve(join(projectRoot, 'adab', 'changes')) + sep;
+  if (!resolvedExpected.startsWith(changesRoot)) {
+    throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
+  }
+}
+
+/**
  * Build the absolute path of a manuscript chapter under
  * `<projectRoot>/adab/manuscript/chapters/`. No boundary check; this
  * helper is for trusted, schema-derived IDs.

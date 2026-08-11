@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { describe, it, expect, vi } from 'vitest';
 
+import type { SchemaDef } from '../../schemas/schema-def.js';
 import { AdabError, WikiDiffParseError } from '../../utils/errors.js';
 import type { ContextPacker } from '../context-packer/index.js';
 import type { MechanicalValidator } from '../mechanical-validator/index.js';
@@ -11,7 +12,6 @@ import type { MentionIndexer } from '../mention-indexer/index.js';
 import type { ProgressionTracker } from '../progression-tracker/index.js';
 import type { WikiDiffParser, WikiDiffApplier } from '../wiki-diff-engine/index.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
-import type { SchemaDef } from '../../schemas/schema-def.js';
 
 import { SyncEngine } from './index.js';
 
@@ -829,6 +829,38 @@ describe('SyncEngine', () => {
 
       const report = await engine.sync('draft-ch-001');
       expect(report.changeId).toBe('draft-ch-001');
+    });
+  });
+
+  // ==================== PATH: changeDir boundary validation ====================
+  describe('PATH: changeDir boundary validation', () => {
+    it('rejects parent-directory traversal with PATH_TRAVERSAL before any IO', async () => {
+      const { engine, wikiDiffParser, wikiDiffApplier, mentionIndexer } = setupSyncEngine({ manifestStatus: 'in_progress' });
+      await expect(engine.sync('../../escape')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+      await expect(engine.sync('draft-ch-001/../..')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+      // Guard fires before manifest load / any engine step — nothing outside
+      // the project boundary is read or written.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(wikiDiffParser.parse).not.toHaveBeenCalled();
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(wikiDiffApplier.apply).not.toHaveBeenCalled();
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mentionIndexer.incrementalIndex).not.toHaveBeenCalled();
+    });
+
+    it('rejects absolute, empty, and separator-containing changeDirs', async () => {
+      const { engine } = setupSyncEngine({ manifestStatus: 'in_progress' });
+      await expect(engine.sync('/etc/passwd')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+      await expect(engine.sync('')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+      await expect(engine.sync('sub\\dir')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+      await expect(engine.sync('sub/dir')).rejects.toMatchObject({ code: 'PATH_TRAVERSAL' });
+    });
+
+    it('still syncs a well-formed changeDir (guard does not break the happy path)', async () => {
+      const { engine } = setupSyncEngine({ manifestStatus: 'in_progress' });
+      const report = await engine.sync('draft-ch-001');
+      expect(report.changeId).toBe('draft-ch-001');
+      expect(report.indexesRegenerated.length).toBeGreaterThan(0);
     });
   });
 });

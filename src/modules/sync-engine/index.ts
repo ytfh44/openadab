@@ -12,6 +12,7 @@ import type { SchemaDef } from '../../schemas/schema-def.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';
 import { AdabError, ConfigValidationError, WikiDiffParseError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, fileExists } from '../../utils/fs.js';
+import { assertChangeDirSafe } from '../../utils/path.js';
 import type { ContextPacker } from '../context-packer/index.js';
 import { LogWriter } from '../log/index.js';
 import type { MechanicalValidator } from '../mechanical-validator/index.js';
@@ -164,8 +165,10 @@ export class SyncEngine {
    * @returns Structured sync report.
    * @throws {AdabError} If validation fails or a required step errors.
    * @throws {WikiDiffParseError} If `wiki-diff.md` is malformed.
+   * @throws {AdabError} With code `PATH_TRAVERSAL` if `changeDir` escapes the project boundary.
    */
   async sync(changeDir: string, full = false): Promise<SyncReport> {
+    assertChangeDirSafe(this.projectRoot, changeDir);
     const changePath = join(this.projectRoot, 'adab', 'changes', changeDir);
     const manifestPath = join(changePath, '.openadab.yaml');
 

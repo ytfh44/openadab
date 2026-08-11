@@ -6,11 +6,13 @@
  * Commander-based CLI wrapper. This module is compiled to dist/index.js
  * which the package.json `bin` field points to.
  */
-import { createProgram, run } from './cli/index.js';
+import { createProgram, handleUncaughtError, run } from './cli/index.js';
 import { isMain } from './utils/is-main.js';
 
 export { createProgram, run };
 
 if (isMain(import.meta.url)) {
-  void run();
+  void run().catch((err: unknown) => {
+    process.exitCode = handleUncaughtError(err);
+  });
 }

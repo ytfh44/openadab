@@ -94,6 +94,21 @@ function handleError(err: unknown, options?: GlobalOptions): number {
 }
 
 /**
+ * Handle an error that escaped the Commander action handlers — the
+ * rejection surfaced by the top-level `void run().catch(...)` in the
+ * entry point. Routes through the same formatting and exit-code logic
+ * as {@link handleError}; `--json` is detected from the raw argv so the
+ * structured error envelope is still emitted when the failing command
+ * never reached its action handler.
+ *
+ * @param err The error that escaped.
+ * @returns Process exit code (1 for error, 2 for usage error).
+ */
+export function handleUncaughtError(err: unknown): number {
+  return handleError(err, { json: process.argv.includes('--json') });
+}
+
+/**
  * Maximum number of parent-directory hops the project-root search
  * will attempt.  Mirrors {@link findPackageRoot}'s cap and is
  * generous enough to handle a CLI invoked from a sub-directory of a
@@ -391,7 +406,12 @@ export function createProgram(): Command {
     .addHelpText('after', '\nExample:\n  openadab schema list')
     .action(async (options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
+      try {
+        await ensureProjectConfig(projectRoot);
+      } catch (err) {
+        process.exitCode = handleError(err, { json: options.json === true });
+        return;
+      }
       const schemaDir = join(projectRoot, 'adab', 'schemas');
       let activeSchema = '';
       try {
@@ -511,9 +531,9 @@ export function createProgram(): Command {
     .addHelpText('after', '\nExample:\n  openadab new chapter ch-001')
     .action(async (type: string, id: string, options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const configLoader = new ConfigLoader(projectRoot);
       try {
+        await ensureProjectConfig(projectRoot);
+        const configLoader = new ConfigLoader(projectRoot);
         await configLoader.load();
         const schemaName = configLoader.getActiveSchema();
         const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
@@ -548,21 +568,25 @@ export function createProgram(): Command {
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab status --change ch-001 --json')
     .action(async (options: Record<string, unknown>) => {
-      const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const changeDir = join(projectRoot, 'adab', 'changes', String(options.change));
-      const manifestManager = new ManifestManager();
-      const changeManifest = await manifestManager.readManifest(changeDir);
-      const schemaName = changeManifest.schema;
-      const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
-      const schemaLoader = new SchemaLoader(schemaDir);
-      const schema = await schemaLoader.load();
-      const graph = new ArtifactGraph(schema);
-      const status = await graph.toJson(changeDir);
-      if (options.json !== true) {
-        console.log(chalk.blue(`Status for change ${String(options.change)}:`));
+      try {
+        const projectRoot = resolveProjectRoot();
+        await ensureProjectConfig(projectRoot);
+        const changeDir = join(projectRoot, 'adab', 'changes', String(options.change));
+        const manifestManager = new ManifestManager();
+        const changeManifest = await manifestManager.readManifest(changeDir);
+        const schemaName = changeManifest.schema;
+        const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
+        const schemaLoader = new SchemaLoader(schemaDir);
+        const schema = await schemaLoader.load();
+        const graph = new ArtifactGraph(schema);
+        const status = await graph.toJson(changeDir);
+        if (options.json !== true) {
+          console.log(chalk.blue(`Status for change ${String(options.change)}:`));
+        }
+        output(status, { json: options.json === true });
+      } catch (err) {
+        process.exitCode = handleError(err, { json: options.json === true });
       }
-      output(status, { json: options.json === true });
     });
 
   program
@@ -574,28 +598,32 @@ export function createProgram(): Command {
     .option('--inline-deps', 'Inline dependency contents')
     .addHelpText('after', '\nExample:\n  openadab instructions brief --change ch-001 --json')
     .action(async (artifact: string, options: Record<string, unknown>) => {
-      const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const changeId = String(options.change);
-      const changeDir = join(projectRoot, 'adab', 'changes', changeId);
-      const manifestManager = new ManifestManager();
-      const changeManifest = await manifestManager.readManifest(changeDir);
-      const configLoader = new ConfigLoader(projectRoot);
-      const projectConfig = await configLoader.load();
-      const schemaName = changeManifest.schema;
-      const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
-      const schemaLoader = new SchemaLoader(schemaDir);
-      const schema = await schemaLoader.load();
-      const wikiEngine = new WikiEngine(projectRoot);
-      const mentionIndexer = new MentionIndexer(projectRoot, wikiEngine);
-      const progressionTracker = new ProgressionTracker(projectRoot);
-      const contextPacker = new ContextPacker(projectRoot, wikiEngine, mentionIndexer, progressionTracker, configLoader);
-      const loader = new InstructionLoader(schema, projectConfig, contextPacker, changeId);
-      const payload = await loader.loadInstructions(artifact, options.inlineDeps === true);
-      if (options.json !== true) {
-        console.log(chalk.blue(`Instructions for artifact ${artifact}:`));
+      try {
+        const projectRoot = resolveProjectRoot();
+        await ensureProjectConfig(projectRoot);
+        const changeId = String(options.change);
+        const changeDir = join(projectRoot, 'adab', 'changes', changeId);
+        const manifestManager = new ManifestManager();
+        const changeManifest = await manifestManager.readManifest(changeDir);
+        const configLoader = new ConfigLoader(projectRoot);
+        const projectConfig = await configLoader.load();
+        const schemaName = changeManifest.schema;
+        const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
+        const schemaLoader = new SchemaLoader(schemaDir);
+        const schema = await schemaLoader.load();
+        const wikiEngine = new WikiEngine(projectRoot);
+        const mentionIndexer = new MentionIndexer(projectRoot, wikiEngine);
+        const progressionTracker = new ProgressionTracker(projectRoot);
+        const contextPacker = new ContextPacker(projectRoot, wikiEngine, mentionIndexer, progressionTracker, configLoader);
+        const loader = new InstructionLoader(schema, projectConfig, contextPacker, changeId);
+        const payload = await loader.loadInstructions(artifact, options.inlineDeps === true);
+        if (options.json !== true) {
+          console.log(chalk.blue(`Instructions for artifact ${artifact}:`));
+        }
+        output(payload, { json: options.json === true });
+      } catch (err) {
+        process.exitCode = handleError(err, { json: options.json === true });
       }
-      output(payload, { json: options.json === true });
     });
 
   const contextCmd = program.command('context').description('Context pack operations');
@@ -1015,23 +1043,27 @@ export function createProgram(): Command {
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab config get project.title')
     .action(async (path: string, options: Record<string, unknown>) => {
-      const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const loader = new ConfigLoader(projectRoot);
-      const config = await loader.load();
-      const keys = path.split('.');
-      let value: unknown = config;
-      for (const key of keys) {
-        if (value === null || typeof value !== 'object') {
-          process.exitCode = handleError(new UsageError(`Invalid config path: ${path}`), { json: options.json === true });
-          return;
+      try {
+        const projectRoot = resolveProjectRoot();
+        await ensureProjectConfig(projectRoot);
+        const loader = new ConfigLoader(projectRoot);
+        const config = await loader.load();
+        const keys = path.split('.');
+        let value: unknown = config;
+        for (const key of keys) {
+          if (value === null || typeof value !== 'object') {
+            process.exitCode = handleError(new UsageError(`Invalid config path: ${path}`), { json: options.json === true });
+            return;
+          }
+          value = (value as Record<string, unknown>)[key];
         }
-        value = (value as Record<string, unknown>)[key];
-      }
-      if (options.json !== true && typeof value === 'string') {
-        console.log(chalk.green(value));
-      } else {
-        output(value, { json: options.json === true });
+        if (options.json !== true && typeof value === 'string') {
+          console.log(chalk.green(value));
+        } else {
+          output(value, { json: options.json === true });
+        }
+      } catch (err) {
+        process.exitCode = handleError(err, { json: options.json === true });
       }
     });
 
@@ -1042,32 +1074,32 @@ export function createProgram(): Command {
     .addHelpText('after', '\nExample:\n  openadab config set project.title "My Novel"')
     .action(async (path: string, value: string, options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const writer = new ConfigWriter(projectRoot);
-      /**
-       * The stored value. In raw mode (default) this is the verbatim string
-       * the user typed. In `--json` mode this is the result of `JSON.parse`,
-       * which lets callers persist numbers, booleans, objects, and arrays
-       * without quoting. In raw mode, the string is stored as-is — including
-       * any literal quotes — so `config set project.title My Title` stores
-       * `My Title` (no surrounding quotes), while
-       * `config set project.title "My Title" --json` parses to `My Title`
-       * and `config set project.title My Title` stores `My Title`.
-       */
       let parsed: unknown = value;
-      if (options.json === true) {
-        try {
-          parsed = JSON.parse(value);
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          throw new AdabError(
-            `Invalid JSON for config value at "${path}": ${reason}`,
-            'CONFIG_INVALID_VALUE',
-            { cause: err },
-          );
-        }
-      }
       try {
+        await ensureProjectConfig(projectRoot);
+        const writer = new ConfigWriter(projectRoot);
+        /**
+         * The stored value. In raw mode (default) this is the verbatim string
+         * the user typed. In `--json` mode this is the result of `JSON.parse`,
+         * which lets callers persist numbers, booleans, objects, and arrays
+         * without quoting. In raw mode, the string is stored as-is — including
+         * any literal quotes — so `config set project.title My Title` stores
+         * `My Title` (no surrounding quotes), while
+         * `config set project.title "My Title" --json` parses to `My Title`
+         * and `config set project.title My Title` stores `My Title`.
+         */
+        if (options.json === true) {
+          try {
+            parsed = JSON.parse(value);
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            throw new AdabError(
+              `Invalid JSON for config value at "${path}": ${reason}`,
+              'CONFIG_INVALID_VALUE',
+              { cause: err },
+            );
+          }
+        }
         await writer.set(path, parsed);
         const logWriter = new LogWriter(projectRoot);
         // S2: redact sensitive values (secrets.*, *.token, *.apiKey, *.password, …)
@@ -1134,25 +1166,29 @@ export function createProgram(): Command {
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab log --limit 10 --change ch-001')
     .action(async (options: Record<string, unknown>) => {
-      const projectRoot = resolveProjectRoot();
-      await ensureProjectConfig(projectRoot);
-      const reader = new LogReader(projectRoot);
-      let entries = await reader.readAll();
-      if (options.change !== undefined && options.change !== '') {
-        entries = entries.filter((e) => e.change === options.change);
+      try {
+        const projectRoot = resolveProjectRoot();
+        await ensureProjectConfig(projectRoot);
+        const reader = new LogReader(projectRoot);
+        let entries = await reader.readAll();
+        if (options.change !== undefined && options.change !== '') {
+          entries = entries.filter((e) => e.change === options.change);
+        }
+        // The `--limit` parser rejects non-positive integers up front, so the
+        // `> 0` guard below is purely defensive and is not expected to fire in
+        // normal operation. Keeping it makes the slice call safe even if a
+        // future caller bypasses the parser (e.g. unit tests invoking the
+        // action handler directly with a hand-built options object).
+        if (options.limit !== undefined && typeof options.limit === 'number' && options.limit > 0) {
+          entries = entries.slice(-options.limit);
+        }
+        if (options.json !== true) {
+          console.log(chalk.blue(`Log entries (${String(entries.length)}):`));
+        }
+        output(entries, { json: options.json === true });
+      } catch (err) {
+        process.exitCode = handleError(err, { json: options.json === true });
       }
-      // The `--limit` parser rejects non-positive integers up front, so the
-      // `> 0` guard below is purely defensive and is not expected to fire in
-      // normal operation. Keeping it makes the slice call safe even if a
-      // future caller bypasses the parser (e.g. unit tests invoking the
-      // action handler directly with a hand-built options object).
-      if (options.limit !== undefined && typeof options.limit === 'number' && options.limit > 0) {
-        entries = entries.slice(-options.limit);
-      }
-      if (options.json !== true) {
-        console.log(chalk.blue(`Log entries (${String(entries.length)}):`));
-      }
-      output(entries, { json: options.json === true });
     });
 
   return program;

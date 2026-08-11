@@ -4,7 +4,7 @@
  * and appends a log entry.
  */
 import { copyFile, rename, mkdir, readdir, unlink, rmdir } from 'node:fs/promises';
-import { join, basename, dirname, isAbsolute, resolve, sep } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import YAML from 'yaml';
@@ -14,6 +14,7 @@ import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';
 import { AdabError, ConfigValidationError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, fileExists } from '../../utils/fs.js';
+import { assertChangeDirSafe } from '../../utils/path.js';
 import { LogWriter } from '../log/index.js';
 import type { SchemaLoader } from '../schema-engine/index.js';
 
@@ -78,7 +79,7 @@ export class ArchiveEngine {
    *                     escapes the project boundary, or IO fails.
    */
   async archive(changeDir: string, force = false): Promise<ArchiveReport> {
-    this.assertChangeDirSafe(changeDir);
+    assertChangeDirSafe(this.projectRoot, changeDir);
     const warnings: string[] = [];
 
     const changePath = join(this.projectRoot, 'adab', 'changes', changeDir);
@@ -271,35 +272,6 @@ export class ArchiveEngine {
     }
   }
 
-  /**
-   * Validate that a change directory name stays within the project boundary.
-   *
-   * Rejects absolute paths, parent-directory traversal (`..`), and any
-   * separator characters. The check is purely lexical — the resolved path
-   * is also compared to the expected `changes/` parent to defend against
-   * platforms where `..` does not collapse (e.g. Windows with mixed
-   * separators).
-   *
-   * @param changeDir Change directory name supplied by the caller.
-   * @throws {AdabError} with code `PATH_TRAVERSAL` if the name is unsafe.
-   */
-  private assertChangeDirSafe(changeDir: string): void {
-    if (changeDir.length === 0) {
-      throw new AdabError('Change directory name is empty', 'PATH_TRAVERSAL');
-    }
-    if (isAbsolute(changeDir)) {
-      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
-    }
-    if (changeDir.includes('..') || changeDir.includes('/') || changeDir.includes('\\') || changeDir.includes('\0')) {
-      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
-    }
-    const expected = join(this.projectRoot, 'adab', 'changes', changeDir);
-    const resolvedExpected = resolve(expected);
-    const changesRoot = resolve(join(this.projectRoot, 'adab', 'changes')) + sep;
-    if (!resolvedExpected.startsWith(changesRoot)) {
-      throw new AdabError(`Change directory escapes project boundary: ${changeDir}`, 'PATH_TRAVERSAL');
-    }
-  }
 
   /**
    * Infer the chapter identifier from the change directory name.

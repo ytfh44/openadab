@@ -10,6 +10,7 @@
  *    default. The new `--json` flag is the only way to opt into JSON
  *    parsing; invalid JSON under `--json` must surface as an AdabError.
  */
+import { mkdtempSync } from 'node:fs';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,10 +18,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import YAML from 'yaml';
 
+import { createMinimalProject } from '../../tests/integration/fixture.js';
 import { LogReader } from '../modules/log/index.js';
 import { ConfigLoader } from '../modules/project-config/index.js';
 
-import { createMinimalProject } from '../../tests/integration/fixture.js';
 
 import { createProgram } from './index.js';
 
@@ -46,7 +47,7 @@ async function runCliInDir(
   const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
     stderrLines.push(String(chunk));
     return true;
-  }) as never);
+  }));
 
   let capturedExitCode: number | null = null;
   const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number | string | null) => {
@@ -58,7 +59,7 @@ async function runCliInDir(
       capturedExitCode = 1;
     }
     throw new Error(`__test_exit:${String(capturedExitCode)}`);
-  }) as never);
+  }));
 
   const originalExitCode = process.exitCode;
   process.exitCode = undefined;
@@ -329,5 +330,34 @@ describe('config set redacts secrets in adab/log.md (S2)', () => {
     const raw = await readLogRaw();
     expect(raw).toContain('***');
     expect(raw).not.toContain('aws-secret-value');
+  });
+});
+
+// =============================================================================
+// E2: actions whose config-loading happens outside a try block (status, etc.)
+// must route errors through handleError: non-zero exit, structured error
+// envelope on stderr in --json mode, no raw stack trace.
+// =============================================================================
+describe('status without a project config (E2: uncaught action errors)', () => {
+  it('exits non-zero with a structured JSON error envelope in --json mode (no raw stack)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-no-config-'));
+    const { exitCode, stderrText } = await runCliInDir(root, ['status', '--change', 'ch-001', '--json']);
+
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText).toContain('"error": true');
+    expect(stderrText).toContain('CONFIG_MISSING');
+    // A raw stack trace would break the structured envelope convention.
+    expect(stderrText).not.toMatch(/^\s+at /m);
+  });
+
+  it('exits 1 with a formatted error in human mode (no raw stack)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openadab-no-config-'));
+    const { exitCode, stderrText } = await runCliInDir(root, ['status', '--change', 'ch-001']);
+
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText.toLowerCase()).toContain('config_missing');
+    expect(stderrText).not.toMatch(/^\s+at /m);
   });
 });
