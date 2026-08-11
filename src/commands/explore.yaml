@@ -4,13 +4,8 @@ category: utility
 parameters:
   - name: change
     type: string
-    required: false
-    description: Change identifier to focus exploration
-  - name: artifact
-    type: string
-    required: false
-    default: status
-    description: Artifact to inspect
+    required: true
+    description: Change identifier
   - name: chapter
     type: string
     required: false

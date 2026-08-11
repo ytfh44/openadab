@@ -13,7 +13,7 @@ import type { WikiPage } from '../../schemas/types.js';
 import type { WikiDiffOperation } from '../../schemas/wiki-diff.js';
 import { TargetNotFoundError, AdabError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
-import { extractWikiLinks } from '../../utils/markdown.js';
+import { extractWikiLinks, matterWithSafeYaml } from '../../utils/markdown.js';
 import { resolveWikiPage } from '../../utils/path.js';
 
 /**
@@ -214,7 +214,7 @@ export class WikiEngine {
     if (raw === null) {
       throw new TargetNotFoundError(`Wiki page not found: ${pagePath}`);
     }
-    const parsed = matter(raw);
+    const parsed = matterWithSafeYaml(raw);
     const frontmatter = parsed.data as Record<string, unknown>;
     const rawType = frontmatter.type;
     const hasMeaningfulType =
@@ -272,7 +272,7 @@ export class WikiEngine {
     let merged = { ...frontmatter };
     const raw = await safeReadFile(absPath);
     if (raw !== null) {
-      const existing = matter(raw);
+      const existing = matterWithSafeYaml(raw);
       merged = { ...existing.data, ...frontmatter };
     }
     const validated = this.validateFrontmatter(merged, pagePath);
@@ -396,7 +396,7 @@ export class WikiEngine {
       const hasFrontmatterMarker = /^\s*---\s*$/m.test(raw.split('\n').slice(0, 2).join('\n'));
       if (hasFrontmatterMarker) {
         try {
-          const parsed = matter(raw);
+          const parsed = matterWithSafeYaml(raw);
           const data = parsed.data as Record<string, unknown>;
           const rawType = data.type;
           const typeIsString = typeof rawType === 'string';

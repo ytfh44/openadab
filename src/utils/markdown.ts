@@ -1,7 +1,54 @@
 import matter from 'gray-matter';
+import YAML from 'yaml';
 
 import { WikiDiffParseError } from './errors.js';
 import { WIKI_LINK_RE } from './wiki-link-regex.js';
+
+/**
+ * YAML frontmatter parse engine backed by the `yaml` package instead of
+ * gray-matter's bundled js-yaml.
+ *
+ * js-yaml 3.x (gray-matter's pinned dependency) has a high-severity
+ * ReDoS advisory (quadratic CPU in `!!omap` resolution) with no fixed
+ * 3.x release, and gray-matter cannot move to js-yaml 4 (it binds
+ * `safeLoad` at module load, which 4.x removed). Passing a custom
+ * engine per call keeps gray-matter's fence handling while routing the
+ * actual YAML parsing through the `yaml` package (already a direct
+ * dependency, unaffected by the advisory).
+ *
+ * @param str Raw frontmatter body.
+ * @returns Parsed frontmatter object (never null/undefined).
+ */
+function yamlParseEngine(str: string): Record<string, unknown> {
+  const parsed: unknown = YAML.parse(str);
+  if (parsed === null || parsed === undefined || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    // Empty block or a bare-scalar frontmatter: every consumer here
+    // expects an object, so degrade to an empty object like an empty
+    // frontmatter block.
+    return {};
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Parse Markdown with YAML frontmatter using the safe `yaml` engine.
+ *
+ * Only the parse path is swapped: stringify keeps gray-matter's default
+ * js-yaml dump, which is unaffected by the advisory.
+ *
+ * @param content Raw Markdown content.
+ * @returns The gray-matter parse result (data + content + …).
+ */
+export function matterWithSafeYaml(content: string): ReturnType<typeof matter> {
+  return matter(content, {
+    engines: {
+      yaml: {
+        parse: yamlParseEngine,
+        stringify: (data: object): string => YAML.stringify(data),
+      },
+    },
+  });
+}
 
 export interface FrontmatterResult {
   /** Parsed frontmatter data. */
@@ -19,7 +66,7 @@ export interface FrontmatterResult {
  * Parse errors are caught and re-thrown as {@link WikiDiffParseError}
  * with the original error preserved on the `cause` chain, so callers
  * can branch on a structured code (`WIKI_DIFF_PARSE_ERROR`) instead of
- * the raw `gray-matter` / `js-yaml` exception.
+ * the raw frontmatter exception.
  *
  * @param content Raw Markdown content.
  * @returns Parsed frontmatter and body.
@@ -27,7 +74,7 @@ export interface FrontmatterResult {
 export function extractFrontmatter(content: string): FrontmatterResult {
   let parsed: ReturnType<typeof matter>;
   try {
-    parsed = matter(content);
+    parsed = matterWithSafeYaml(content);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new WikiDiffParseError(

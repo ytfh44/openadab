@@ -8,6 +8,6 @@ parameters:
     description: Change identifier
 steps:
   - action: cli
-    command: openadab wiki apply-diff adab/changes/{{change}}/wiki-diff.md --apply --change {{change}}
+    command: openadab wiki apply-diff --apply --change {{change}}
   - action: cli
     command: openadab wiki index

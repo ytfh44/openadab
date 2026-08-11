@@ -1,17 +1,21 @@
 name: continue
-description: Detect current change, next artifact, and run the appropriate workflow
+description: Detect current change, next artifact, and run the workflow
 category: workflow
 parameters:
   - name: change
     type: string
-    required: false
-    description: Change identifier (auto-detected if omitted)
+    required: true
+    description: Change identifier
+  - name: artifact
+    type: string
+    required: true
+    description: Next artifact to write (resolved from status nextStep)
 steps:
   - action: cli
     command: openadab status --change {{change}} --json
     capture: status_output
   - action: cli
-    command: openadab instructions {{status_output.nextStep.0.id}} --change {{change}} --json
+    command: openadab instructions {{artifact}} --change {{change}} --json
     capture: instructions_output
   - action: read
     paths: "{{instructions_output.requiredReads}}"
