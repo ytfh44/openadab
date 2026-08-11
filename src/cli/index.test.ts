@@ -668,3 +668,93 @@ describe('CLI wiki diff argument validation', () => {
     }
   });
 });
+
+/**
+ * Regression for S4: `validate --semantic` must not silently no-op when
+ * the change's schema names its artifacts differently from the hardcoded
+ * profile set (draft/revision/wiki-diff).  A schema with only `scene-plan`
+ * matches zero profile ids, so the command must surface a warning instead
+ * of printing "Validation passed" as if prompts had been generated.
+ */
+describe('CLI validate --semantic with no profile artifacts (S4)', () => {
+  let schemaLoadSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+  beforeEach(() => {
+    schemaLoadSpy = vi.spyOn(SchemaLoader.prototype, 'load');
+    schemaLoadSpy.mockResolvedValue({
+      name: 'custom-schema',
+      version: 1,
+      artifacts: [{ id: 'scene-plan', generates: 'scene-plan.md', requires: [] }],
+    });
+  });
+
+  afterEach(() => {
+    schemaLoadSpy?.mockRestore();
+    schemaLoadSpy = null;
+  });
+
+  async function setupProjectWithChange(): Promise<string> {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'openadab-validate-semantic-'));
+    await createMinimalProject(projectRoot);
+    const changeDir = join(projectRoot, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(
+      join(changeDir, '.openadab.yaml'),
+      `${[
+        'changeId: ch-001',
+        'schema: chapter-draft',
+        'version: 1',
+        'created: 2024-01-01T00:00:00Z',
+        'status: in_progress',
+        'currentArtifact: brief',
+        'artifacts:',
+        '  brief: ready',
+        '  scene-plan: blocked',
+        '  draft: blocked',
+        '  revision: blocked',
+        '  continuity-report: blocked',
+        '  wiki-diff: blocked',
+        'metadata: {}',
+      ].join('\n')  }\n`,
+      'utf-8',
+    );
+    return projectRoot;
+  }
+
+  it('warns in human mode and still exits 0 when no profile artifact ids match', async () => {
+    const projectRoot = await setupProjectWithChange();
+    const warnLines: string[] = [];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation((msg: unknown) => {
+      warnLines.push(String(msg));
+    });
+    try {
+      const { exitCode, stdoutText } = await runCliCapture(projectRoot, ['validate', '--change', 'ch-001', '--semantic']);
+      expect(exitCode === null || exitCode === 0).toBe(true);
+      const warning = warnLines.join('\n');
+      expect(warning.toLowerCase()).toMatch(/no semantic validation prompts/i);
+      expect(warning).toMatch(/draft, revision, wiki-diff/);
+      // The placeholder line must not claim prompts were generated.
+      expect(stdoutText).not.toContain('Prompt generated for manual review');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('includes a warning in the JSON results when no profile artifact ids match', async () => {
+    const projectRoot = await setupProjectWithChange();
+    const { exitCode, stdoutText } = await runCliCapture(projectRoot, [
+      'validate',
+      '--change',
+      'ch-001',
+      '--semantic',
+      '--json',
+    ]);
+    expect(exitCode === null || exitCode === 0).toBe(true);
+    const parsed = JSON.parse(stdoutText) as { artifactId: string; warnings: string[] }[];
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toBeDefined();
+    if (parsed[0] !== undefined) {
+      expect(parsed[0].warnings.join(' ').toLowerCase()).toMatch(/no semantic validation prompts/i);
+    }
+  });
+});

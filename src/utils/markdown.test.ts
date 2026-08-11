@@ -4,6 +4,7 @@ import {
   extractFrontmatter,
   extractWikiLinks,
   extractSectionsByHeading,
+  stripInlineCode,
 } from './markdown.js';
 
 describe('extractFrontmatter', () => {
@@ -105,6 +106,16 @@ describe('extractWikiLinks', () => {
     expect(extractWikiLinks(input)).toEqual([]);
   });
 
+  it('does not strip a 4-space-indented code block (links inside survive)', () => {
+    // CommonMark treats a 4-space-indented fence run as an indented
+    // code block, NOT a fence.  The opener's `{0,3}` leading-space
+    // constraint must be applied to the original line, or the indented
+    // block is wrongly stripped along with the wiki links it contains.
+    // (Tildes are used so stripInlineCode does not re-eat the block.)
+    const input = '    ~~~\n    [[Foo]]\n    ~~~\n[[Bar]]';
+    expect(extractWikiLinks(input)).toEqual(['Foo', 'Bar']);
+  });
+
   it('should not extract wiki links inside tilde-fenced code blocks (~~~)', () => {
     const input = '~~~\n[[Foo]]\n~~~\n[[Baz]]';
     expect(extractWikiLinks(input)).toEqual(['Baz']);
@@ -131,6 +142,20 @@ describe('extractWikiLinks', () => {
     // mapping is the cheapest portable way to trigger a parse error.
     const bad = `---\ntitle: [unterminated\n---\nbody`;
     expect(() => extractFrontmatter(bad)).toThrow(/frontmatter|yaml|parse/i);
+  });
+});
+
+describe('stripInlineCode', () => {
+  it('keeps excess closer backticks as literal content (`` `a`` `` → one literal backtick)', () => {
+    // CommonMark: a closer run longer than the opener leaves its excess
+    // backticks as literal text.  Opener 1, closer 2: the span content
+    // `a` is dropped, exactly one backtick remains, and `a` does not.
+    expect(stripInlineCode('`a``')).toBe('`');
+    expect(stripInlineCode('`a``')).not.toContain('a');
+  });
+
+  it('strips a balanced multi-backtick span fully (`` ``a`` `` 2/2)', () => {
+    expect(stripInlineCode('``a``')).toBe('');
   });
 });
 

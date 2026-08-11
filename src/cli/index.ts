@@ -705,8 +705,10 @@ export function createProgram(): Command {
         const schemaLoader = new SchemaLoader(schemaDir);
         const schema = await schemaLoader.load();
         const profileArtifactIds = new Set(['draft', 'revision', 'wiki-diff']);
+        let generatedPrompts = 0;
         for (const artDef of schema.artifacts) {
           if (!profileArtifactIds.has(artDef.id)) {continue;}
+          generatedPrompts += 1;
           const prompt = await linter.generateValidationPrompt(changeDir, artDef.id);
           results.push({
             artifactId: artDef.id,
@@ -716,7 +718,23 @@ export function createProgram(): Command {
             extras: { prompt },
           } satisfies ValidationResult);
         }
-        if (options.json !== true) {
+        if (generatedPrompts === 0) {
+          // A schema that names its artifacts differently (e.g.
+          // `scene-plan` only) would otherwise match none of the profile
+          // ids, produce zero prompts, and still print "Validation
+          // passed" — a silent no-op.  Surface it instead.
+          const warning = 'No semantic validation prompts generated: schema defines none of the profile artifact ids (draft, revision, wiki-diff).';
+          if (options.json === true) {
+            results.push({
+              artifactId: '_semantic',
+              passed: true,
+              errors: [],
+              warnings: [warning],
+            } satisfies ValidationResult);
+          } else {
+            console.warn(chalk.yellow(warning));
+          }
+        } else if (options.json !== true) {
           console.log(chalk.yellow('Semantic validation is a placeholder. Prompt generated for manual review.'));
         }
       }
@@ -1092,6 +1110,14 @@ export function createProgram(): Command {
             return;
           }
           value = (value as Record<string, unknown>)[key];
+        }
+        // A missing key leaves `value` undefined.  YAML cannot store
+        // undefined, so "key absent" and "key present with undefined"
+        // are indistinguishable — both are reported as an invalid path
+        // instead of printing `undefined` and exiting 0.
+        if (value === undefined) {
+          process.exitCode = handleError(new UsageError(`Invalid config path: ${path}`), { json: options.json === true });
+          return;
         }
         if (options.json !== true && typeof value === 'string') {
           console.log(chalk.green(value));

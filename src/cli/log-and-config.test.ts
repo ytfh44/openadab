@@ -267,6 +267,38 @@ describe('config get round-trip (L2 integration smoke)', () => {
   });
 });
 
+describe('config get missing key (regression: no silent `undefined` output)', () => {
+  let projectRoot: string;
+
+  beforeEach(async () => {
+    projectRoot = await createMinimalProject(await mkdtemp(join(tmpdir(), 'openadab-config-get-missing-')));
+  });
+
+  it('exits non-zero with a usage error in human mode when the key is missing', async () => {
+    const { exitCode, stderrText } = await runCliInDir(projectRoot, ['config', 'get', 'project.nonexistent']);
+
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText).toContain('Invalid config path: project.nonexistent');
+  });
+
+  it('exits non-zero with a structured error envelope in --json mode when the key is missing', async () => {
+    const { exitCode, stderrText } = await runCliInDir(projectRoot, ['config', 'get', 'project.nonexistent', '--json']);
+
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText).toContain('"error": true');
+    expect(stderrText).toContain('USAGE_ERROR');
+    expect(stderrText).toContain('Invalid config path: project.nonexistent');
+  });
+
+  it('still prints an existing value successfully (happy-path regression)', async () => {
+    const { exitCode } = await runCliInDir(projectRoot, ['config', 'get', 'project.title']);
+
+    expect(exitCode === null || exitCode === 0).toBe(true);
+  });
+});
+
 // =============================================================================
 // S2: `config set` must redact sensitive values before writing to adab/log.md
 // =============================================================================

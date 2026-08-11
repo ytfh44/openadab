@@ -68,7 +68,11 @@ function stripFencedCode(text: string): string {
   for (const line of lines) {
     const trimmed = line.replace(/^\s*/, '');
     if (!inFence) {
-      const openMatch = /^( {0,3})(`{3,}|~{3,})/.exec(trimmed);
+      // Match the opener against the ORIGINAL line so the `{0,3}`
+      // leading-space constraint is real: a 4+-space-indented fence is
+      // an indented code block (CommonMark), not a fence, and must be
+      // left untouched.
+      const openMatch = /^( {0,3})(`{3,}|~{3,})/.exec(line);
       if (openMatch) {
         inFence = true;
         fenceChar = openMatch[2][0];
@@ -99,14 +103,16 @@ function stripFencedCode(text: string): string {
  *
  * The implementation honours CommonMark's "balanced backticks" rule:
  * the opening fence is a run of N backticks and the matching closer
- * is a run of at least N backticks.  This correctly handles the case
+ * is a run of at least N backticks.  When the closer is longer than
+ * the opener, the excess backticks (closeLen - N) are kept as literal
+ * content, per CommonMark.  This correctly handles the case
  * `` ``code with a ` backtick inside`` `` that the old single-backtick
  * regex would misparse.
  *
  * @param text Markdown text.
  * @returns Text with inline code spans removed.
  */
-function stripInlineCode(text: string): string {
+export function stripInlineCode(text: string): string {
   let out = '';
   let i = 0;
   while (i < text.length) {
@@ -129,9 +135,10 @@ function stripInlineCode(text: string): string {
     // treating as the opener).
     let j = i + run;
     let found = -1;
+    let closeLen = 0;
     while (j < text.length) {
       if (text[j] === '`') {
-        let closeLen = 0;
+        closeLen = 0;
         while (j + closeLen < text.length && text[j + closeLen] === '`') {
           closeLen++;
         }
@@ -150,11 +157,11 @@ function stripInlineCode(text: string): string {
       i += run;
       continue;
     }
-    // Drop the entire code span (opener + content + closer).
-    i = found;
-    while (i < text.length && text[i] === '`') {
-      i++;
-    }
+    // Drop the code span (opener + content + closer).  A closer run
+    // longer than the opener leaves its excess backticks as literal
+    // content, e.g. `` `a`` `` (opener 1, closer 2) keeps one backtick.
+    out += '`'.repeat(closeLen - run);
+    i = found + closeLen;
   }
   return out;
 }
