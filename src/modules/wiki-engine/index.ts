@@ -102,9 +102,7 @@ export type WikilinkGraph = Record<string, WikilinkEntry>;
 /**
  * Log callback type for recording index/overview/wikilinks updates.
  */
-export interface LogCallback {
-  (entry: { op: string; change: string | null; result: string }): void;
-}
+export type LogCallback = (entry: { op: string; change: string | null; result: string }) => void;
 
 /**
  * A single issue reported by the wiki engine's linting surface.
@@ -402,7 +400,7 @@ export class WikiEngine {
           const data = parsed.data as Record<string, unknown>;
           const rawType = data.type;
           const typeIsString = typeof rawType === 'string';
-          const typeIsNonEmpty = typeIsString && (rawType as string).length > 0;
+          const typeIsNonEmpty = typeIsString && (rawType).length > 0;
           if (!typeIsNonEmpty) {
             issues.push({
               severity: 'error',
@@ -511,7 +509,7 @@ export class WikiEngine {
         const type = (page.frontmatter.type as string | undefined) ?? '';
         const name = (page.frontmatter.name as string | undefined) ?? '';
         if (type === 'character' && page.frontmatter.status === 'canon') {
-          characters.push({ name, status: (page.frontmatter.status as string | undefined) ?? '' });
+          characters.push({ name, status: (page.frontmatter.status) ?? '' });
         } else if (type === 'location') {
           locations.push({ name, location_type: (page.frontmatter.location_type as string | undefined) ?? '' });
         } else if (type === 'thread') {
@@ -606,9 +604,15 @@ export class WikiEngine {
   /**
    * Append contradiction entries from wiki-diff operations to `adab/wiki/contradictions.md`.
    *
-   * When a flag_contradiction has status 'explained' or 'retconned', the method
-   * first checks for an existing unresolved entry with the same description.
-   * If found, the existing entry is updated in-place; otherwise a new entry is appended.
+   * A contradiction's identity is its description: ops in one batch that
+   * share a description describe the same contradiction and are merged
+   * (the last op wins, so a resolved op supersedes an unresolved flag),
+   * which means a batch can never create duplicate `## <description>`
+   * sections. When a flag_contradiction has status 'explained' or
+   * 'retconned', the method first checks for ANY existing section with
+   * the same description — resolved or unresolved. If found, the
+   * existing section's Status is updated in place (and a Resolution line
+   * is added when missing); otherwise a new entry is appended.
    *
    * @param diff Array of wiki-diff operations.
    */
@@ -616,59 +620,52 @@ export class WikiEngine {
     const contradictionsPath = join(this.projectRoot, 'adab', 'wiki', 'contradictions.md');
     let existing = (await safeReadFile(contradictionsPath)) ?? '';
 
-    const unresolvedOps: Array<{ description: string; sources: Array<{ page: string; claim: string }>; status: string }> = [];
-    const resolvedOps: Array<{ description: string; sources: Array<{ page: string; claim: string }>; status: string }> = [];
-
+    // Merge ops by description (last op wins) so two ops describing the
+    // same contradiction cannot each create their own section. This is
+    // what lets a second resolved op with the same description update
+    // the section the first one resolved instead of appending a
+    // brand-new duplicate section.
+    const opsByDescription = new Map<string, { description: string; sources: { page: string; claim: string }[]; status: string }>();
     for (const op of diff) {
-      if (op.type === 'flag_contradiction') {
-        if (op.status === 'explained' || op.status === 'retconned') {
-          resolvedOps.push({ description: op.description, sources: op.sources, status: op.status });
-        } else {
-          unresolvedOps.push({ description: op.description, sources: op.sources, status: op.status });
-        }
-      }
+      if (op.type !== 'flag_contradiction') {continue;}
+      opsByDescription.set(op.description, { description: op.description, sources: op.sources, status: op.status });
     }
 
-    // Process resolved contradictions: update every existing unresolved entry
-    // that matches the description, not just the first.
-    for (const op of resolvedOps) {
+    // Process resolved contradictions: update every existing section that
+    // matches the description — resolved OR unresolved, not just the
+    // first — so a resolved op whose description already exists as a
+    // section updates that section's Status instead of appending a
+    // duplicate.
+    const appendOps: { description: string; sources: { page: string; claim: string }[]; status: string }[] = [];
+    for (const op of opsByDescription.values()) {
+      if (op.status !== 'explained' && op.status !== 'retconned') {
+        appendOps.push(op);
+        continue;
+      }
       const escapedDesc = op.description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       // Match the section heading and its content up to the next heading
       // or EOF.  `\r?\n` tolerates CRLF files: a literal `\n` never
       // matches the `## desc\r\n` heading of a CRLF file, so the probe
-      // below would find no unresolved section and a resolved op would
-      // be appended as a duplicate instead of updating in place.
+      // below would find no section and a resolved op would be appended
+      // as a duplicate instead of updating in place.
       const sectionRegex = new RegExp(
         `(## ${escapedDesc}\\r?\\n)((?:\\r?\\n|.)*?)(?=\\r?\\n## |$)`,
         'g',
       );
-      // First, determine whether there is at least one unresolved match;
-      // if not, treat the operation as a brand-new entry.
       sectionRegex.lastIndex = 0;
-      let probe: RegExpExecArray | null;
-      let anyUnresolved = false;
-      while ((probe = sectionRegex.exec(existing)) !== null) {
-        if (probe[2].includes('- Status: unresolved')) {
-          anyUnresolved = true;
-          break;
-        }
-      }
-      if (!anyUnresolved) {
-        unresolvedOps.push(op);
+      const anySection = sectionRegex.test(existing);
+      if (!anySection) {
+        appendOps.push(op);
         continue;
       }
-      // apply the update to every matching section in a single
-      // pass via `String.prototype.replace` with a callback. The previous
-      // implementation only called `exec` once, so only the first section
-      // was updated; subsequent sections with the same description were
-      // left as "unresolved".
+      // apply the update to every matching section in a single pass via
+      // `String.prototype.replace` with a callback.
       sectionRegex.lastIndex = 0;
-      existing = existing.replace(sectionRegex, (full, heading: string, body: string) => {
-        if (!body.includes('- Status: unresolved')) {
-          return full;
-        }
+      existing = existing.replace(sectionRegex, (_full, heading: string, body: string) => {
         let updated = body;
-        updated = updated.replace(/- Status: unresolved/, `- Status: ${op.status}`);
+        // Replace whatever Status the section currently carries
+        // (unresolved, explained, retconned, …) with the op's status.
+        updated = updated.replace(/^- Status: [^\r\n]*/m, `- Status: ${op.status}`);
         if (!updated.includes('- Resolution:')) {
           const source = op.sources[0]?.page ?? '';
           updated = `${updated.trim()}\n- Resolution: ${op.status} by ${source}`;
@@ -679,7 +676,7 @@ export class WikiEngine {
 
     // Build new entries for append
     const newEntries: string[] = [];
-    for (const op of unresolvedOps) {
+    for (const op of appendOps) {
       newEntries.push(`## ${op.description}\n`);
       for (const src of op.sources) {
         newEntries.push(`- **${src.page}**: ${src.claim}`);
@@ -695,7 +692,7 @@ export class WikiEngine {
       // Only updates were made (no new entries) — write the updated existing content
       // Only write if the file existed before (to avoid creating empty file)
       if (existing.length > 0) {
-        await atomicWriteFile(contradictionsPath, existing.trim() + '\n');
+        await atomicWriteFile(contradictionsPath, `${existing.trim()  }\n`);
       }
       return;
     }

@@ -222,7 +222,7 @@ describe('WikiEngine', () => {
 
     it('throws AdabError when type is null in frontmatter', async () => {
       await expect(
-        engine.writePage('characters/mara.md', { type: null, name: 'Mara', status: 'canon' } as unknown as Record<string, unknown>, '# Mara')
+        engine.writePage('characters/mara.md', { type: null, name: 'Mara', status: 'canon' }, '# Mara')
       ).rejects.toBeInstanceOf(AdabError);
     });
 
@@ -601,6 +601,72 @@ describe('WikiEngine', () => {
       expect(raw).toContain('- Resolution:');
       expect(raw).not.toContain('Status: unresolved');
     });
+
+    // Two resolved ops with the SAME description in one batch: after the
+    // first updates the section in place, the second must find the (now
+    // resolved) section and update it — not append a brand-new duplicate
+    // `## …` section because no *unresolved* entry remains.
+    it('two resolved ops with the same description produce exactly one section', async () => {
+      const path = join(tempDir, 'adab', 'wiki', 'contradictions.md');
+      const lf = `# Contradictions\n\n## Mara knows the secret\n- **characters/mara**: does not know\n- Status: unresolved\n`;
+      writeFileSync(path, lf, 'utf-8');
+
+      const diff = [
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: 'Mara knows the secret',
+          sources: [{ page: 'ch-002', claim: 'now knows' }],
+          status: 'explained' as const,
+        },
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: 'Mara knows the secret',
+          sources: [{ page: 'ch-003', claim: 'later retconned' }],
+          status: 'retconned' as const,
+        },
+      ];
+      await engine.updateContradictions(diff);
+
+      const raw = readFileSync(path, 'utf-8');
+      const sections = raw.match(/## Mara knows the secret/g) ?? [];
+      expect(sections).toHaveLength(1);
+      // The last resolved op wins the status.
+      expect(raw).toContain('Status: retconned');
+      expect(raw).not.toContain('Status: unresolved');
+    });
+
+    // A resolved op and an unresolved flag with the same description in
+    // one batch (no prior section) must still yield exactly one section.
+    it('one resolved and one unresolved op with the same description produce exactly one section', async () => {
+      const diff = [
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: 'Gate conflict',
+          sources: [{ page: 'ch-001', claim: 'gate open' }],
+          status: 'unresolved' as const,
+        },
+        {
+          type: 'flag_contradiction' as const,
+          target: 'characters/mara',
+          source: 'continuity-report',
+          description: 'Gate conflict',
+          sources: [{ page: 'ch-002', claim: 'gate closed' }],
+          status: 'explained' as const,
+        },
+      ];
+      await engine.updateContradictions(diff);
+
+      const raw = readFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), 'utf-8');
+      const sections = raw.match(/## Gate conflict/g) ?? [];
+      expect(sections).toHaveLength(1);
+      expect(raw).toContain('Status: explained');
+    });
   });
 
   describe('checkSystemPages', () => {
@@ -667,7 +733,7 @@ describe('WikiEngine', () => {
   describe('validateFrontmatter', () => {
     it('throws AdabError when writePage is called with unknown type', async () => {
       await expect(
-        engine.writePage('misc/mystery.md', { type: 'mystery', name: 'Mystery' } as unknown as Record<string, unknown>, '# Mystery')
+        engine.writePage('misc/mystery.md', { type: 'mystery', name: 'Mystery' }, '# Mystery')
       ).rejects.toBeInstanceOf(AdabError);
     });
 
@@ -696,7 +762,7 @@ describe('WikiEngine', () => {
 
     it('rejects type "unknown" (not a valid wiki page type)', async () => {
       await expect(
-        engine.writePage('misc/foo.md', { type: 'unknown', name: 'Foo' } as unknown as Record<string, unknown>, '# Foo')
+        engine.writePage('misc/foo.md', { type: 'unknown', name: 'Foo' }, '# Foo')
       ).rejects.toBeInstanceOf(AdabError);
     });
   });

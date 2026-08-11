@@ -179,6 +179,9 @@ export class MentionIndexer {
     this.aliasToEntities.clear();
     this.compiledPatterns = [];
     const pages = await this.wikiEngine.listPages();
+    // Track which page first registered each entity name so a duplicate
+    // name collision can name both pages in its warning.
+    const firstPageByEntity = new Map<string, string>();
     for (const pagePath of pages) {
       try {
         const page = await this.wikiEngine.readPage(pagePath);
@@ -190,6 +193,19 @@ export class MentionIndexer {
           ? aliasesRaw.map((a) => String(a))
           : [];
         if (name.length > 0) {
+          const firstPage = firstPageByEntity.get(name);
+          if (firstPage !== undefined) {
+            // Keep the FIRST registration: overwriting would silently
+            // drop the first page's aliases and appearances. The
+            // collision is deterministic (first page wins) and surfaced
+            // via a warning that names both pages.
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[MentionIndexer] Duplicate entity name "${name}" on pages "${firstPage}" and "${pagePath}" — keeping the first page's entry`
+            );
+            continue;
+          }
+          firstPageByEntity.set(name, pagePath);
           this.entityRegistry.set(name, {
             type,
             aliases: [name, ...aliases.filter((a) => a.trim().length > 0 && a !== name)],

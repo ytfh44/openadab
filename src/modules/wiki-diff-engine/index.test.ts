@@ -5,12 +5,12 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import { WikiDiffParseError } from '../../utils/errors.js';
 import { WikiEngine } from '../wiki-engine/index.js';
 
 import { WikiDiffParser, WikiDiffApplier } from './index.js';
-import { WikiDiffParseError } from '../../utils/errors.js';
 
 
 function setupProject() {
@@ -956,6 +956,38 @@ describe('WikiDiffApplier', () => {
       ],
     };
     const result = await applier.apply(doc, true);
+    expect(result.warnings.some((w) => w.includes('stale'))).toBe(true);
+  });
+
+  // An UNQUOTED ISO timestamp in frontmatter is parsed by
+  // gray-matter/js-yaml as a Date object, not a string. checkIdempotency
+  // must run the staleness comparison for Date values too — the
+  // previous `typeof lastUpdated !== 'string'` guard skipped the check
+  // entirely for Dates. The wiki engine is stubbed because its
+  // frontmatter schema rejects Date values (z.string()); the Date
+  // simulates what gray-matter hands to the engine before validation.
+  it('warns on idempotency when last_updated is a Date object (gray-matter unquoted ISO)', async () => {
+    writeWikiPage(root, 'characters/mara.md', `---\ntype: character\nname: Mara\nstatus: alive\n---\n\n# Mara\n`);
+    const dateEngine = {
+      readPage: vi.fn().mockResolvedValue({
+        path: 'characters/mara.md',
+        frontmatter: {
+          type: 'character',
+          name: 'Mara',
+          status: 'alive',
+          last_updated: new Date('2099-01-01T00:00:00.000Z'),
+        },
+        body: '# Mara\n',
+      }),
+    } as unknown as WikiEngine;
+    const dateApplier = new WikiDiffApplier(root, dateEngine);
+    const doc = {
+      changeId: 'draft-ch-012',
+      operations: [
+        { type: 'add_current_state' as const, target: 'characters/mara.md', source: '2020-01-01', content: 'Some state' },
+      ],
+    };
+    const result = await dateApplier.apply(doc, true);
     expect(result.warnings.some((w) => w.includes('stale'))).toBe(true);
   });
 

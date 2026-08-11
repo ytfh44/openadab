@@ -861,4 +861,60 @@ describe('MechanicalValidator', () => {
       expect(result.errors.some((e) => e.includes('not present in the change manifest'))).toBe(true);
     });
   });
+
+  // ===== MV-NOSCHEMA: no schemaEngine is a legitimate silent-degradation mode =====
+  describe('no schemaEngine configured — silent degradation preserved', () => {
+    it('validateChange returns [] when no schemaEngine is provided', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-noschema-'));
+      const validator = new MechanicalValidator(undefined, { project: { language: 'en-US' } }, undefined, root);
+      const results = await validator.validateChange(join(root, 'change'));
+      expect(results).toEqual([]);
+    });
+
+    it('validateDependencies passes when no schemaEngine is provided', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-noschema2-'));
+      const validator = new MechanicalValidator(undefined, { project: { language: 'en-US' } }, undefined, root);
+      const result = await validator.validateDependencies({});
+      expect(result.passed).toBe(true);
+      expect(result.errors).toEqual([]);
+    });
+  });
+
+  // ===== MV-SCHEMAERR: a configured schemaEngine that fails to load must NOT
+  // be silently swallowed — the error propagates so a broken schema never
+  // looks like "everything passed". =====
+  describe('configured schemaEngine that throws on load', () => {
+    it('validateChange rejects when schemaEngine.load throws', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-schemaerr-'));
+      const validator = new MechanicalValidator(
+        { load: vi.fn().mockRejectedValue(new Error('schema exploded')) },
+        { project: { language: 'en-US' } },
+        undefined,
+        root,
+      );
+      await expect(validator.validateChange(join(root, 'change'))).rejects.toThrow('schema exploded');
+    });
+
+    it('validateDependencies rejects when schemaEngine.load throws', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-schemaerr2-'));
+      const validator = new MechanicalValidator(
+        { load: vi.fn().mockRejectedValue(new Error('schema exploded')) },
+        { project: { language: 'en-US' } },
+        undefined,
+        root,
+      );
+      await expect(validator.validateDependencies({})).rejects.toThrow('schema exploded');
+    });
+
+    it('validateArtifact rejects when schemaEngine.load throws', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'openadab-mv-schemaerr3-'));
+      const validator = new MechanicalValidator(
+        { load: vi.fn().mockRejectedValue(new Error('schema exploded')) },
+        { project: { language: 'en-US' } },
+        undefined,
+        root,
+      );
+      await expect(validator.validateArtifact(join(root, 'change'), 'draft')).rejects.toThrow('schema exploded');
+    });
+  });
 });

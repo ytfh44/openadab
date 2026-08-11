@@ -12,8 +12,8 @@ import { unified } from 'unified';
 import type { WikiDiffDocument, WikiDiffOperation } from '../../schemas/wiki-diff.js';
 import { WikiDiffParseError, TargetNotFoundError, MissingSourceError, AdabError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, fileExists } from '../../utils/fs.js';
-import { resolveWithinBoundary } from '../../utils/path.js';
 import { extractSectionsByHeading } from '../../utils/markdown.js';
+import { resolveWithinBoundary } from '../../utils/path.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 /**
@@ -820,6 +820,13 @@ export class WikiDiffApplier {
    *    handled the chapter-number shape; date stamps were silently
    *    treated as "fresh" even when they were older than the source.
    *
+   * gray-matter/js-yaml parses an UNQUOTED ISO timestamp in frontmatter
+   * as a `Date` object rather than a string, so `last_updated` is
+   * accepted in both shapes: a `Date` is normalized to its ISO string
+   * before the comparison instead of silently skipping the staleness
+   * check.  Values of any other type still skip the check (no
+   * comparison is possible).
+   *
    * an optional read-cache may be supplied so that repeated
    * idempotency checks (and stat-accumulation reads) on the same
    * target share a single disk fetch.
@@ -838,10 +845,16 @@ export class WikiDiffApplier {
       const page = cached ?? await this.wikiEngine.readPage(op.target);
       pageCache?.set(op.target, page);
       const lastUpdated = page.frontmatter.last_updated;
-      if (typeof lastUpdated !== 'string' || op.source === '') {return null;}
+      if (op.source === '') {return null;}
+      // An unquoted ISO timestamp in YAML frontmatter is parsed by
+      // gray-matter/js-yaml as a Date object; normalize it to a string
+      // so the staleness comparison below runs for both shapes. Neither
+      // string nor Date → no comparison is possible, keep the skip.
+      const lastUpdatedValue = lastUpdated instanceof Date ? lastUpdated.toISOString() : lastUpdated;
+      if (typeof lastUpdatedValue !== 'string') {return null;}
 
       const sourceChapter = /ch-(\d+)/.exec(op.source);
-      const pageChapter = /ch-(\d+)/.exec(lastUpdated);
+      const pageChapter = /ch-(\d+)/.exec(lastUpdatedValue);
       if (sourceChapter && pageChapter) {
         const sourceNum = parseInt(sourceChapter[1] ?? '0', 10);
         const pageNum = parseInt(pageChapter[1] ?? '0', 10);
@@ -856,7 +869,7 @@ export class WikiDiffApplier {
       // `Date`; if either fails, we cannot prove staleness, so we do
       // not warn.
       const sourceDate = Date.parse(op.source);
-      const pageDate = Date.parse(lastUpdated);
+      const pageDate = Date.parse(lastUpdatedValue);
       if (Number.isFinite(sourceDate) && Number.isFinite(pageDate) && pageDate > sourceDate) {
         return `Target page ${op.target} was updated by a later chapter — diff may be stale`;
       }

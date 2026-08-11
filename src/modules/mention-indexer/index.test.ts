@@ -312,6 +312,34 @@ describe('MentionIndexer', () => {
     expect(reg.size).toBe(0);
   });
 
+  // Two wiki pages with the same frontmatter `name` must not silently
+  // overwrite each other (last-wins): the FIRST page's entry is kept
+  // (deterministic) and the collision is surfaced via a console warning
+  // that names both pages.
+  it('duplicate entity names keep the first page and warn', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { indexer, root } = setupIndexer([
+        { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character', aliases: ['Ali'] }, body: '' },
+        { path: 'characters/alice-2.md', frontmatter: { name: 'Alice', type: 'character', aliases: ['Alicia'] }, body: '' },
+      ]);
+      await indexer.indexAll();
+      const reg = (indexer as any).entityRegistry;
+      // Registry keeps the FIRST page's entry: its alias is registered,
+      // the second page's alias is not.
+      expect(reg.size).toBe(1);
+      expect(reg.get('Alice').aliases).toEqual(['Alice', 'Ali']);
+      const file = join(root, 'manuscript.md');
+      writeFileSync(file, 'Ali and Alicia both appear.');
+      const results = await indexer.scanFile(file);
+      expect(results.has('Alice')).toBe(true);
+      const warnings = warnSpy.mock.calls.map((c) => c.join(' '));
+      expect(warnings.some((w) => w.includes('Duplicate entity name') && w.includes('characters/alice.md') && w.includes('characters/alice-2.md'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   // ===== incrementalIndex logic decoupling =====
   it('new entity discovered in incrementalIndex gets full scan of all files', async () => {
     const { indexer, root } = setupIndexer([

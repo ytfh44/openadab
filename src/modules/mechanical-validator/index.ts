@@ -545,11 +545,16 @@ export class MechanicalValidator {
    * `validateChange` call and memoising the result for subsequent calls.
    *
    * Returns `undefined` when no `schemaEngine` was provided to the
-   * constructor, or when `load()` throws (e.g. the schema file is missing).
-   * On load failure the cache is reset to `null` so that the next call
-   * retries from disk instead of returning a stale undefined value.
+   * constructor — a missing schema engine is a legitimate
+   * silent-degradation mode. When a schemaEngine IS configured but
+   * `load()` throws (e.g. the schema file is missing or malformed), the
+   * failure is NOT swallowed: it is rethrown so `validateChange` /
+   * `validateDependencies` surface the error instead of reporting an
+   * empty pass that looks like "everything validated". On load failure
+   * the cache is reset to `null` so the next call retries from disk.
    *
-   * @returns The loaded `SchemaDef`, or `undefined` when unavailable.
+   * @returns The loaded `SchemaDef`, or `undefined` when no schemaEngine is configured.
+   * @throws The error from `schemaEngine.load()` when a configured engine fails.
    */
   private async getSchema(): Promise<SchemaDef | undefined> {
     if (!this.schemaEngine) {return undefined;}
@@ -557,9 +562,9 @@ export class MechanicalValidator {
     try {
       this.schemaCache = await this.schemaEngine.load();
       return this.schemaCache;
-    } catch {
+    } catch (err) {
       this.schemaCache = null;
-      return undefined;
+      throw err;
     }
   }
 

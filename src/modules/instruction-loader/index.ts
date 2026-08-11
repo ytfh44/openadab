@@ -7,7 +7,7 @@ import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 
 import type { SchemaDef, ArtifactDef } from '../../schemas/schema-def.js';
 import type { ContextPack, ProjectConfig } from '../../schemas/types.js';
-import { TargetNotFoundError, UnresolvedVariableError } from '../../utils/errors.js';
+import { TargetNotFoundError, UnresolvedVariableError, TemplateNotFoundError } from '../../utils/errors.js';
 import { safeReadFile } from '../../utils/fs.js';
 import { PathTraversalError } from '../../utils/path.js';
 import type { ContextPacker } from '../context-packer/index.js';
@@ -117,8 +117,13 @@ export class InstructionLoader {
     const changesRoot = join(resolvedRoot, 'adab', 'changes');
     const resolvedChange = resolve(changesRoot, changeDir);
     const rel = relative(changesRoot, resolvedChange);
-    if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) {
-      throw new PathTraversalError(String(changeDir), changesRoot);
+    // `rel` is the empty string when `changeDir` collapses back to the
+    // changes root itself (e.g. `foo/..`), and `'.'` when it is a bare
+    // `.` — both must be rejected just like an explicit `..`, otherwise
+    // `outputPath` would land directly in `adab/changes/` instead of a
+    // change subdirectory.
+    if (rel === '' || rel === '.' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new PathTraversalError(changeDir, changesRoot);
     }
     this.schemaDef = schemaDef;
     this.projectConfig = projectConfig;
@@ -165,6 +170,15 @@ export class InstructionLoader {
       const raw = await safeReadFile(instrPath);
       if (raw !== null) {
         instructionText = raw;
+      } else {
+        // The on-disk instructions file is missing: fall back to the
+        // inline `instruction` field when present (documented authoring
+        // fallback), but always flag the missing file so an empty
+        // result is not mistaken for a valid generated instruction.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[InstructionLoader] instructionFile '${artifact.instructionFile}' not found for artifact '${artifactId}' — using inline instruction`
+        );
       }
     }
 
@@ -254,7 +268,13 @@ export class InstructionLoader {
     const templatePath = join(schemaDir, artifact.template);
     const raw = await safeReadFile(templatePath);
     if (raw === null) {
-      return '';
+      // A schema-declared template that is missing from disk must not
+      // silently yield an empty instruction that looks valid. Unlike a
+      // missing dependency file (a forward-planning warning), a missing
+      // template is a configuration error and surfaces as such.
+      throw new TemplateNotFoundError(
+        `Template file not found: ${templatePath} (referenced by artifact '${artifactId}' in schema '${this.schemaDef.name}')`
+      );
     }
 
     const schemaContext = this.schemaDef.context ?? {};
