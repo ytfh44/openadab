@@ -13,7 +13,7 @@ import type { ProgressionTracker } from '../progression-tracker/index.js';
 import type { WikiDiffParser, WikiDiffApplier } from '../wiki-diff-engine/index.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
-import { SyncEngine } from './index.js';
+import { SyncEngine, classifyValidationError } from './index.js';
 
 describe('SyncEngine', () => {
   function setupSyncEngine(overrides?: { manifestStatus?: string; wikiDiffOps?: { type: string; target: string; source?: string }[]; validationFail?: boolean; schemaLoader?: { load: () => Promise<SchemaDef> } }) {
@@ -460,6 +460,15 @@ describe('SyncEngine', () => {
         { artifactId: 'wiki-diff', passed: false, errors: ['Custom error: artifact not registered'], warnings: [] },
       ]);
       await expect(engine.sync('draft-ch-001')).rejects.toMatchObject({ code: 'SYNC_VALIDATION_FAILED' });
+    });
+
+    it('classifies the real validateDependencies error format as DEPENDENCY_VIOLATION', () => {
+      // MechanicalValidator.validateDependencies emits single-quoted messages:
+      //   Artifact 'draft' requires 'brief' which is not present in the change manifest
+      // The old classifier regex required a double-quote before the apostrophe
+      // ("' which...) and never matched — the branch was dead code returning UNKNOWN.
+      const error = "Artifact 'draft' requires 'brief' which is not present in the change manifest";
+      expect(classifyValidationError(error)).toBe('DEPENDENCY_VIOLATION');
     });
   });
 

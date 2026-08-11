@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 
 import type { SchemaDef } from '../../schemas/schema-def.js';
 import { SchemaValidationError } from '../../utils/errors.js';
+
 import { ArtifactGraph } from './index.js';
 
 describe('ArtifactGraph', () => {
@@ -241,6 +242,28 @@ describe('ArtifactGraph', () => {
     const graph = new ArtifactGraph(schema, explodingValidator);
     const status = await graph.getStatus(dir);
     expect(status.a).toBe('ready');
+  });
+
+  // AG-6: toJson must compute the status map exactly once and share the
+  // result with getNextStep / getBlockingIssues — each _computeStatus call
+  // re-stats every artifact file on disk.
+  it('AG-6: toJson computes status exactly once (shared with getNextStep/getBlockingIssues)', async () => {
+    const schema = linearSchema();
+    const dir = makeChangeDir(schema, ['brief']);
+    const graph = new ArtifactGraph(schema);
+    const computeSpy = vi.spyOn(
+      ArtifactGraph.prototype,
+      '_computeStatus',
+    );
+    try {
+      const json = await graph.toJson(dir);
+      expect(computeSpy).toHaveBeenCalledTimes(1);
+      // Sanity: the shared result still drives the derived fields.
+      expect(json.nextStep).toEqual([{ id: 'scene-plan', action: 'write' }]);
+      expect(json.blockingIssues.length).toBeGreaterThan(0);
+    } finally {
+      computeSpy.mockRestore();
+    }
   });
 
   // AG-2 / AG-5: cycle detection still fires when inDegree.size differs

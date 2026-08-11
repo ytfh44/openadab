@@ -7,9 +7,9 @@ import { join } from 'node:path';
 
 import YAML from 'yaml';
 
-import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
-import type { SchemaDef } from '../../schemas/schema-def.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';
+import type { SchemaDef } from '../../schemas/schema-def.js';
+import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { AdabError, ConfigValidationError, WikiDiffParseError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, fileExists } from '../../utils/fs.js';
 import { assertChangeDirSafe } from '../../utils/path.js';
@@ -50,13 +50,13 @@ export type ValidationErrorCode =
  * @returns The corresponding {@link ValidationErrorCode}.
  */
 export function classifyValidationError(error: string): ValidationErrorCode {
-  if (/^File missing:/.test(error)) {return 'FILE_MISSING';}
-  if (/^File is empty:/.test(error)) {return 'FILE_EMPTY';}
-  if (/^Frontmatter missing/.test(error)) {return 'FRONTMATTER_MISSING';}
-  if (/^Required frontmatter field/.test(error)) {return 'REQUIRED_FIELD_MISSING';}
-  if (/^Word count /.test(error)) {return 'WORD_COUNT';}
-  if (/^Broken wiki link:/.test(error)) {return 'BROKEN_WIKI_LINK';}
-  if (/"' which is not present in the change manifest/.test(error)) {return 'DEPENDENCY_VIOLATION';}
+  if (error.startsWith("File missing:")) {return 'FILE_MISSING';}
+  if (error.startsWith("File is empty:")) {return 'FILE_EMPTY';}
+  if (error.startsWith("Frontmatter missing")) {return 'FRONTMATTER_MISSING';}
+  if (error.startsWith("Required frontmatter field")) {return 'REQUIRED_FIELD_MISSING';}
+  if (error.startsWith("Word count ")) {return 'WORD_COUNT';}
+  if (error.startsWith("Broken wiki link:")) {return 'BROKEN_WIKI_LINK';}
+  if (error.includes('\' which is not present in the change manifest')) {return 'DEPENDENCY_VIOLATION';}
   return 'UNKNOWN';
 }
 
@@ -157,11 +157,12 @@ export class SyncEngine {
    * - Any index step failure is collected; if at least one fails, the engine
    *   throws {@link AdabError} `SYNC_INDEX_FAILED` and the manifest status
    *   is preserved as `in_progress` (no rollback of wiki-diff).
-   * - When `--full` is set, all five index steps are forced to a full rebuild;
-   *   otherwise mentions use incremental indexing.
+   * - When `--full` is set, the mention index is fully rebuilt; otherwise it
+   *   uses incremental indexing. The other four index steps always rebuild.
    *
    * @param changeDir Change directory name (e.g. `draft-ch-012`).
-   * @param full      When `true`, force full rebuild for all indexes.
+   * @param full      When `true`, rebuild the mention index fully; otherwise
+   *                  it is updated incrementally.
    * @returns Structured sync report.
    * @throws {AdabError} If validation fails or a required step errors.
    * @throws {WikiDiffParseError} If `wiki-diff.md` is malformed.
@@ -234,12 +235,12 @@ export class SyncEngine {
     let lastIndexErrorMessage = '';
     const indexesRegenerated: string[] = [];
 
-    const indexSteps: Array<{ label: string; fn: () => Promise<void> }> = [
+    const indexSteps: { label: string; fn: () => Promise<void> }[] = [
       { label: 'adab/index/mentions.json', fn: full ? () => this.mentionIndexer.indexAll() : () => this.mentionIndexer.incrementalIndex() },
-      { label: 'adab/index/wikilinks.json', fn: full ? () => this.wikiEngine.generateWikilinks() : () => this.wikiEngine.generateWikilinks() },
-      { label: 'adab/index/progressions.json', fn: full ? () => this.progressionTracker.generateProgressionsJson() : () => this.progressionTracker.generateProgressionsJson() },
-      { label: 'adab/index/context-map.json', fn: full ? () => this.mentionIndexer.generateContextMap() : () => this.mentionIndexer.generateContextMap() },
-      { label: 'adab/wiki/index.md', fn: full ? () => this.wikiEngine.generateIndex() : () => this.wikiEngine.generateIndex() },
+      { label: 'adab/index/wikilinks.json', fn: () => this.wikiEngine.generateWikilinks() },
+      { label: 'adab/index/progressions.json', fn: () => this.progressionTracker.generateProgressionsJson() },
+      { label: 'adab/index/context-map.json', fn: () => this.mentionIndexer.generateContextMap() },
+      { label: 'adab/wiki/index.md', fn: () => this.wikiEngine.generateIndex() },
     ];
 
     const indexErrors: string[] = [];
@@ -334,7 +335,7 @@ export class SyncEngine {
         const schema = await this.schemaLoader.load();
         const ids = new Set<string>();
         for (const art of schema.artifacts) {
-          if (art.required === false) {
+          if (!art.required) {
             ids.add(art.id);
           }
         }
@@ -393,7 +394,7 @@ export class SyncEngine {
       errors.push(...depResult.errors);
     }
     for (const [artifactId, status] of Object.entries(manifest.artifacts)) {
-      if (optionalArtifactIds.has(artifactId)) continue;
+      if (optionalArtifactIds.has(artifactId)) {continue;}
       if (status === 'done') {
         // Delegate to the validator which correctly uses art.generates from the schema
         const nonEmptyResult = await this.validator.requireNonEmpty(changePath, artifactId);

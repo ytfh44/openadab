@@ -3,15 +3,15 @@
  * archive, copies the final revision to the manuscript, updates the manifest,
  * and appends a log entry.
  */
+import { randomUUID } from 'node:crypto';
 import { copyFile, rename, mkdir, readdir, unlink, rmdir } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
 
-import YAML from 'yaml';
 import glob from 'fast-glob';
+import YAML from 'yaml';
 
-import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { ChangeManifestSchema } from '../../schemas/change-manifest.js';
+import type { ChangeManifest, LogEntry } from '../../schemas/types.js';
 import { AdabError, ConfigValidationError } from '../../utils/errors.js';
 import { safeReadFile, atomicWriteFile, fileExists } from '../../utils/fs.js';
 import { assertChangeDirSafe } from '../../utils/path.js';
@@ -65,7 +65,9 @@ export class ArchiveEngine {
    * Steps:
    * 1. Verify the change directory name does not escape the project boundary.
    * 2. Verify the change manifest status is "synced" or "archived" (only synced is allowed).
-   * 3. Copy the revision artifact to `manuscript/chapters/ch-XXX.md`.
+   * 3. Resolve the chapter identifier (manifest `chapter` when set, else
+   *    inferred from the directory name) and copy the revision artifact to
+   *    `manuscript/chapters/<chapter>.md`.
    * 4. Move `adab/changes/<change>/` to `adab/changes/archive/<change>/`.
    * 5. Update the archived manifest status to "archived".
    * 6. Append an archive log entry; log write failures are non-fatal.
@@ -103,7 +105,12 @@ export class ArchiveEngine {
       );
     }
 
-    const chapterId = this.inferChapterId(changeDir);
+    // AE-12: prefer the manifest's explicit `chapter` field (set via
+    // ManifestManager.createManifest, which callers can override) over the
+    // directory-derived inference; the directory name may disagree with the
+    // manifest (e.g. a change dir of `draft-ch-012` targeting `ch-999`).
+    const manifestChapter = manifest.chapter?.trim() ?? '';
+    const chapterId = manifestChapter !== '' ? manifestChapter : this.inferChapterId(changeDir);
     if (chapterId === null) {
       throw new AdabError(
         `Could not infer chapter ID from change directory: ${changeDir}. Expected pattern: ch-NNN.`,

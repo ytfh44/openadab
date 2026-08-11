@@ -10,7 +10,7 @@ import { ArchiveEngine } from './index.js';
 
 
 describe('ArchiveEngine', () => {
-  function setupProject(overrides?: { manifestStatus?: string; backupOnOverwrite?: boolean; hasRevision?: boolean; existingManuscript?: boolean }) {
+  function setupProject(overrides?: { manifestStatus?: string; backupOnOverwrite?: boolean; hasRevision?: boolean; existingManuscript?: boolean; chapter?: string }) {
     const root = mkdtempSync(join(tmpdir(), 'openadab-archive-'));
     const changesDir = join(root, 'adab', 'changes', 'draft-ch-012');
     mkdirSync(changesDir, { recursive: true });
@@ -21,6 +21,7 @@ describe('ArchiveEngine', () => {
       version: 1,
       created: new Date().toISOString(),
       status: overrides?.manifestStatus ?? 'synced',
+      chapter: overrides?.chapter,
       artifacts: {},
     };
     writeFileSync(join(changesDir, '.openadab.yaml'), JSON.stringify(manifest));
@@ -104,6 +105,48 @@ describe('ArchiveEngine', () => {
     expect(report.manuscriptPath).toContain('ch-012.md');
   });
 
+  // AE-12: the manifest's explicit `chapter` field wins over the chapter
+  // inferred from the directory name.  Without this, a change dir named
+  // `draft-ch-012` whose manifest targets `ch-999` would write the wrong
+  // manuscript file.
+  it('AE-12: manifest chapter overrides the directory-derived chapter for the manuscript path', async () => {
+    const { root } = setupProject({ manifestStatus: 'synced', chapter: 'ch-999' });
+    const engine = new ArchiveEngine(root);
+    const report = await engine.archive('draft-ch-012');
+    expect(report.manuscriptPath).toBe(join(root, 'adab', 'manuscript', 'chapters', 'ch-999.md'));
+    expect(report.logEntry.details?.chapter).toBe('ch-999');
+  });
+
+  it('AE-12: conflict scan flags a change targeting the manifest chapter', async () => {
+    const { root } = setupProject({ manifestStatus: 'synced', chapter: 'ch-999' });
+    const engine = new ArchiveEngine(root);
+    // `draft-ch-999` infers ch-999 from its directory name, which matches
+    // the manifest chapter — the archive must be rejected.
+    const targetDir = join(root, 'adab', 'changes', 'draft-ch-999');
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(
+      join(targetDir, '.openadab.yaml'),
+      'changeId: draft-ch-999\nschema: chapter-draft\nversion: 1\ncreated: 2024-01-01T00:00:00Z\nstatus: in_progress\nartifacts: {}\n',
+    );
+    await expect(engine.archive('draft-ch-012', false)).rejects.toMatchObject({ code: 'ARCHIVE_CONFLICT' });
+  });
+
+  it('AE-12: conflict scan ignores changes that only collide via the directory-derived chapter', async () => {
+    const { root } = setupProject({ manifestStatus: 'synced', chapter: 'ch-999' });
+    const engine = new ArchiveEngine(root);
+    // `revise-ch-012` would collide via directory-derived inference (ch-012)
+    // but NOT via the manifest chapter (ch-999) — it must not be flagged.
+    const otherDir = join(root, 'adab', 'changes', 'revise-ch-012');
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(
+      join(otherDir, '.openadab.yaml'),
+      'changeId: revise-ch-012\nschema: chapter-draft\nversion: 1\ncreated: 2024-01-01T00:00:00Z\nstatus: in_progress\nartifacts: {}\n',
+    );
+    const report = await engine.archive('draft-ch-012');
+    expect(report.changeId).toBe('draft-ch-012');
+    expect(report.manuscriptPath).toContain('ch-999.md');
+  });
+
   // ==================== AE-1: force=true with archive target already exists ====================
   describe('AE-1: force+duplicate archive target', () => {
     it('force=true with existing archive target renames existing to .bak-{ts} and proceeds', async () => {
@@ -158,8 +201,8 @@ describe('ArchiveEngine', () => {
         expect(existsSync(report.archivePath)).toBe(true);
         expect(existsSync(report.manuscriptPath!)).toBe(true);
         expect(report.warnings).toBeDefined();
-        expect(report.warnings!.length).toBeGreaterThan(0);
-        expect(report.warnings!.join(' ')).toMatch(/log/i);
+        expect(report.warnings.length).toBeGreaterThan(0);
+        expect(report.warnings.join(' ')).toMatch(/log/i);
         expect(appendSpy).toHaveBeenCalledTimes(1);
       } finally {
         appendSpy.mockRestore();
@@ -182,7 +225,7 @@ describe('ArchiveEngine', () => {
       try {
         const report = await engine.archive('draft-ch-012');
         expect(report.archivePath).toBeDefined();
-        expect(report.warnings!.length).toBeGreaterThan(0);
+        expect(report.warnings.length).toBeGreaterThan(0);
       } finally {
         appendSpy.mockRestore();
       }

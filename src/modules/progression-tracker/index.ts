@@ -414,7 +414,6 @@ export class ProgressionTracker {
     // determine that from a single `(a, b)` pair when neither carries an
     // explicit `from`.
     const threadChains = this.buildThreadStatusChains(existingEvents, newEvents);
-    const newEventSet = new Set<ProgressionEvent>(newEvents);
     for (const newEv of newEvents) {
       if (newEv.type !== 'thread_status') {continue;}
       const chain = threadChains.get(newEv.entity);
@@ -437,7 +436,6 @@ export class ProgressionTracker {
       }
     }
     for (const newEv of newEvents) {
-      if (!newEventSet.has(newEv)) {continue;}
       for (const oldEv of existingEvents) {
         if (oldEv.entity === newEv.entity && oldEv.type === newEv.type && newEv.type !== 'thread_status') {
           if (this.isContradictory(oldEv, newEv)) {

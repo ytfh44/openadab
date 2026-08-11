@@ -274,11 +274,14 @@ export class ArtifactGraph {
    * If all artifacts (and apply.requires, when present) are done,
    * returns a single "apply" action.
    *
-   * @param changeDir Absolute path to the change directory.
+   * @param changeDir  Absolute path to the change directory.
+   * @param precomputed Optional result of {@link _computeStatus} when the
+   *                    caller already computed it (e.g. {@link toJson});
+   *                    avoids a redundant recompute (AG-6).
    * @returns Array of next steps.
    */
-  async getNextStep(changeDir: string): Promise<NextStep[]> {
-    const { status } = await this._computeStatus(changeDir);
+  async getNextStep(changeDir: string, precomputed?: ComputeStatusResult): Promise<NextStep[]> {
+    const { status } = precomputed ?? (await this._computeStatus(changeDir));
     const ready = Object.entries(status)
       .filter(([, s]) => s === 'ready')
       .map(([id]) => id);
@@ -292,7 +295,7 @@ export class ArtifactGraph {
       ? this.schemaDef.apply.requires.every((req) => status[req] === 'done')
       : false;
 
-    if (applyReady === true) {
+    if (applyReady) {
       let target = this.schemaDef.apply?.target ?? '';
       // Interpolate {{chapter}} and schema context variables in the apply target.
       const chapterMatch = /ch-(\d+)/i.exec(changeDir);
@@ -322,11 +325,14 @@ export class ArtifactGraph {
    * 2. Validation issues — artifacts whose file exists but failed
    *    mechanical validation (AG-8).
    *
-   * @param changeDir Absolute path to the change directory.
+   * @param changeDir  Absolute path to the change directory.
+   * @param precomputed Optional result of {@link _computeStatus} when the
+   *                    caller already computed it (e.g. {@link toJson});
+   *                    avoids a redundant recompute (AG-6).
    * @returns Combined list of issues, blocking first then validation.
    */
-  async getBlockingIssues(changeDir: string): Promise<BlockingIssue[]> {
-    const { status, validationIssues } = await this._computeStatus(changeDir);
+  async getBlockingIssues(changeDir: string, precomputed?: ComputeStatusResult): Promise<BlockingIssue[]> {
+    const { status, validationIssues } = precomputed ?? (await this._computeStatus(changeDir));
     const issues: BlockingIssue[] = [];
 
     for (const art of this.schemaDef.artifacts) {
@@ -353,9 +359,13 @@ export class ArtifactGraph {
    * @returns Structured status payload.
    */
   async toJson(changeDir: string): Promise<ArtifactGraphStatus> {
-    const { status, validationIssues } = await this._computeStatus(changeDir);
-    const nextStep = await this.getNextStep(changeDir);
-    const blockingIssues = await this.getBlockingIssues(changeDir);
+    // AG-6: compute the status map once and share it with the dependent
+    // helpers below; each call to _computeStatus re-stats every artifact
+    // file on disk.
+    const computed = await this._computeStatus(changeDir);
+    const { status, validationIssues } = computed;
+    const nextStep = await this.getNextStep(changeDir, computed);
+    const blockingIssues = await this.getBlockingIssues(changeDir, computed);
 
     // AG-7: pop() returns '' for a path with no segments (e.g. "/").
     // Fall back to a sensible name derived from the absolute path.
@@ -404,7 +414,7 @@ export class ArtifactGraph {
       // heuristic misfires.  Detect that case via the `_synthetic`
       // sentinel injected by gray-matter (or our own fallback) and treat
       // it as "no frontmatter".
-      const isSynthetic = (data as Record<string, unknown>)['_synthetic'] === true;
+      const isSynthetic = (data)._synthetic === true;
       if (isSynthetic || Object.keys(data).length === 0) {
         return false;
       }
