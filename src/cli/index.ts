@@ -5,8 +5,8 @@
  * context packing, validation, wiki operations, syncing, archiving,
  * configuration, and logging.
  */
-import { mkdir, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { mkdir, readdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import util from 'node:util';
 
@@ -39,7 +39,6 @@ import { MentionIndexer } from '../modules/mention-indexer/index.js';
 import { ProgressionTracker } from '../modules/progression-tracker/index.js';
 import { ConfigLoader, ConfigWriter } from '../modules/project-config/index.js';
 import { ProjectInitializer } from '../modules/project-init/index.js';
-import { resolveCommandsDir } from '../utils/resource-paths.js';
 import { SchemaLoader, SchemaValidator } from '../modules/schema-engine/index.js';
 import { SyncEngine } from '../modules/sync-engine/index.js';
 import { WikiDiffApplier, WikiDiffParser } from '../modules/wiki-diff-engine/index.js';
@@ -48,7 +47,9 @@ import { ProjectConfigSchema } from '../schemas/project-config.js';
 import type { ValidationResult } from '../schemas/types.js';
 import { AdabError, UsageError } from '../utils/errors.js';
 import { fileExists, safeReadFile } from '../utils/fs.js';
+import { assertChangeDirSafe } from '../utils/path.js';
 import { redactConfigValue } from '../utils/redact.js';
+import { resolveCommandsDir } from '../utils/resource-paths.js';
 import { extractWikiTargets } from '../utils/wiki-link-regex.js';
 
 /**
@@ -317,7 +318,7 @@ export function createProgram(): Command {
         const files: GeneratedFile[] = adapter.generate(defs);
         await writeGeneratedFiles(projectRoot, files);
 
-        let schemasRefreshed: string[] = [];
+        const schemasRefreshed: string[] = [];
         let schemasWarning: string | undefined;
 
         if (options.schemas === true) {
@@ -532,6 +533,10 @@ export function createProgram(): Command {
     .action(async (type: string, id: string, options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
       try {
+        // Reject traversal-style ids before they are joined onto
+        // `adab/changes/` (e.g. `openadab new chapter ../../x` would
+        // otherwise write `.openadab.yaml` outside the project).
+        assertChangeDirSafe(projectRoot, id);
         await ensureProjectConfig(projectRoot);
         const configLoader = new ConfigLoader(projectRoot);
         await configLoader.load();
@@ -570,6 +575,7 @@ export function createProgram(): Command {
     .action(async (options: Record<string, unknown>) => {
       try {
         const projectRoot = resolveProjectRoot();
+        assertChangeDirSafe(projectRoot, String(options.change));
         await ensureProjectConfig(projectRoot);
         const changeDir = join(projectRoot, 'adab', 'changes', String(options.change));
         const manifestManager = new ManifestManager();
@@ -600,6 +606,7 @@ export function createProgram(): Command {
     .action(async (artifact: string, options: Record<string, unknown>) => {
       try {
         const projectRoot = resolveProjectRoot();
+        assertChangeDirSafe(projectRoot, String(options.change));
         await ensureProjectConfig(projectRoot);
         const changeId = String(options.change);
         const changeDir = join(projectRoot, 'adab', 'changes', changeId);
@@ -861,6 +868,9 @@ export function createProgram(): Command {
     .option('--json', 'Output as JSON')
     .addHelpText('after', '\nExample:\n  openadab wiki diff --change ch-001')
     .action(async (options: Record<string, unknown>) => {
+      if (options.from !== undefined && options.change !== undefined) {
+        console.warn('Both --from and --change provided; --from takes precedence.');
+      }
       if (options.from !== undefined) {
         const projectRoot = resolveProjectRoot();
         await ensureProjectConfig(projectRoot);
@@ -897,6 +907,14 @@ export function createProgram(): Command {
       }
       if (options.change !== undefined) {
         const projectRoot = resolveProjectRoot();
+        try {
+          if (typeof options.change === 'string') {
+            assertChangeDirSafe(projectRoot, options.change);
+          }
+        } catch (err) {
+          process.exitCode = handleError(err, { json: options.json === true });
+          return;
+        }
         await ensureProjectConfig(projectRoot);
         const diffPath = join(projectRoot, 'adab', 'changes', typeof options.change === 'string' ? options.change : '', 'wiki-diff.md');
         const raw = await safeReadFile(diffPath);
@@ -916,6 +934,8 @@ export function createProgram(): Command {
         }
         output(doc, { json: options.json === true });
       }
+
+      process.exitCode = handleError(new UsageError('Either --from <path> or --change <id> is required'), { json: options.json === true });
     });
 
   wikiCmd
@@ -928,14 +948,23 @@ export function createProgram(): Command {
     .addHelpText('after', '\nExample:\n  openadab wiki apply-diff adab/changes/ch-001/wiki-diff.md --apply')
     .action(async (diffPath: string | undefined, options: Record<string, unknown>) => {
       const projectRoot = resolveProjectRoot();
+      // Guard the change id before it is joined onto `adab/changes/`.
+      if (options.change !== undefined && typeof options.change === 'string') {
+        try {
+          assertChangeDirSafe(projectRoot, options.change);
+        } catch (err) {
+          process.exitCode = handleError(err, { json: options.json === true });
+          return;
+        }
+      }
       await ensureProjectConfig(projectRoot);
 
       // Resolve path from --change flag if provided
-      if (options.change && typeof options.change === 'string') {
+      if (options.change !== undefined && typeof options.change === 'string') {
         diffPath = join(projectRoot, 'adab', 'changes', options.change, 'wiki-diff.md');
       }
 
-      if (!diffPath) {
+      if (diffPath === undefined || diffPath === '') {
         process.exitCode = handleError(new UsageError('Either <path> or --change <id> is required'), { json: options.json === true });
         return;
       }
@@ -977,14 +1006,21 @@ export function createProgram(): Command {
       try {
         const projectRoot = resolveProjectRoot();
         await ensureProjectConfig(projectRoot);
+        // Validate/pack against the schema the change was created under
+        // (from its manifest), not the currently ACTIVE schema — a change
+        // created under an older schema would otherwise be validated
+        // against the wrong rules once the active schema changes.
+        const changeDir = join(projectRoot, 'adab', 'changes', String(options.change));
+        const manifestManager = new ManifestManager();
+        const changeManifest = await manifestManager.readManifest(changeDir);
+        const schemaName = changeManifest.schema;
+        const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
+        const schemaLoader = new SchemaLoader(schemaDir);
         const wikiEngine = new WikiEngine(projectRoot);
         const mentionIndexer = new MentionIndexer(projectRoot, wikiEngine);
         const progressionTracker = new ProgressionTracker(projectRoot);
         const configLoader = new ConfigLoader(projectRoot);
         const projectConfig = await configLoader.load();
-        const schemaName = configLoader.getActiveSchema();
-        const schemaDir = join(projectRoot, 'adab', 'schemas', schemaName);
-        const schemaLoader = new SchemaLoader(schemaDir);
         const contextPacker = new ContextPacker(projectRoot, wikiEngine, mentionIndexer, progressionTracker, configLoader);
         const wikiDiffParser = new WikiDiffParser();
         const wikiDiffApplier = new WikiDiffApplier(projectRoot, wikiEngine);

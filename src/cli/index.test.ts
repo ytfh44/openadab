@@ -1,20 +1,87 @@
 /**
  * Unit tests for CLI command parsing and JSON output structure.
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
-import type { ProjectConfig, ContextPack } from '../schemas/types.js';
-import type { SchemaDef } from '../schemas/schema-def.js';
+import { createMinimalProject } from '../../tests/integration/fixture.js';
 import type { ContextPacker } from '../modules/context-packer/index.js';
 import { InstructionLoader } from '../modules/instruction-loader/index.js';
 import { SchemaLoader } from '../modules/schema-engine/index.js';
-import { createMinimalProject } from '../../tests/integration/fixture.js';
+import type { SchemaDef } from '../schemas/schema-def.js';
+import type { ProjectConfig, ContextPack } from '../schemas/types.js';
 
 import { createProgram } from './index.js';
+
+/**
+ * Read the current `process.exitCode`.
+ *
+ * Wrapped in a function because TS control-flow analysis pins the
+ * property to `undefined` after an assignment of `undefined` — a direct
+ * comparison at the call site would be narrowed to "always false" and
+ * trip `no-unnecessary-condition`. A function call resets narrowing.
+ */
+function readExitCode(): typeof process.exitCode {
+  return process.exitCode;
+}
+
+/**
+ * Run a CLI command with cwd set to `projectRoot`, capturing stdout,
+ * stderr, and the final exit code. Restores cwd, exit code, and all
+ * console spies afterwards.
+ *
+ * @param projectRoot Directory to run the command in (must contain a project).
+ * @param args        Arguments after `openadab`.
+ * @returns Captured stdout/stderr text and the final exit code
+ *          (`null` when the command left it unset, i.e. success).
+ */
+async function runCliCapture(
+  projectRoot: string,
+  args: string[],
+): Promise<{ exitCode: number | null; stdoutText: string; stderrText: string }> {
+  const originalCwd = process.cwd();
+  process.chdir(projectRoot);
+
+  const stdoutLines: string[] = [];
+  const stderrLines: string[] = [];
+  const logSpy = vi.spyOn(console, 'log').mockImplementation((msg: unknown) => {
+    stdoutLines.push(String(msg));
+  });
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation((msg: unknown) => {
+    stderrLines.push(String(msg));
+  });
+  const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+    stderrLines.push(String(chunk));
+    return true;
+  }));
+
+  const originalExitCode = process.exitCode;
+  // Earlier tests in this file run real action handlers that set
+  // process.exitCode without restoring it, so the pre-run value cannot
+  // be trusted as a "success" baseline. Clear it and treat ANY
+  // non-undefined value after parsing as set by the command itself.
+  process.exitCode = undefined;
+
+  let capturedExitCode: number | null = null;
+  try {
+    const program = createProgram();
+    await program.parseAsync(['node', 'openadab', ...args]);
+  } finally {
+    const exitAfterParse = readExitCode();
+    if (exitAfterParse !== undefined) {
+      capturedExitCode = Number(exitAfterParse);
+    }
+    process.chdir(originalCwd);
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    stderrWriteSpy.mockRestore();
+    process.exitCode = originalExitCode;
+  }
+  return { exitCode: capturedExitCode, stdoutText: stdoutLines.join('\n'), stderrText: stderrLines.join('\n') };
+}
 
 describe('CLI createProgram', () => {
   it('returns a Commander program named openadab', () => {
@@ -264,10 +331,10 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
     const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
       stderrLines.push(String(chunk));
       return true;
-    }) as never);
+    }));
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       return undefined as unknown as never;
-    }) as never);
+    }));
 
     const originalCwd = process.cwd();
     const originalExitCode = process.exitCode;
@@ -373,7 +440,7 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
       const origExit = process.exit;
       (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
         throw new Error('commander:exit');
-      }) as never;
+      });
       try {
         await expect(
           program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--apply'])
@@ -391,7 +458,7 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
       const origExit = process.exit;
       (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
         throw new Error('commander:exit');
-      }) as never;
+      });
       try {
         await expect(
           program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--dry-run'])
@@ -409,7 +476,7 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
       const origExit = process.exit;
       (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
         throw new Error('commander:exit');
-      }) as never;
+      });
       try {
         await expect(
           program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md'])
@@ -430,13 +497,13 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
       const stderrWriteSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
         stderrLines.push(String(chunk));
         return true;
-      }) as never);
+      }));
       const origExit = process.exit;
       // Commander calls process.exit on parse error; replace it so the
       // test does not abort the process.
       (process as unknown as { exit: (code?: number) => never }).exit = ((_code?: number) => {
         throw new Error('commander:exit');
-      }) as never;
+      });
       try {
         await expect(
           program.parseAsync(['node', 'openadab', 'wiki', 'apply-diff', 'foo/bar.md', '--apply', '--dry-run'])
@@ -449,5 +516,155 @@ describe('CLI update --schemas surfaces empty/error cases', () => {
       const combined = stderrLines.join('\n');
       expect(combined.toLowerCase()).toMatch(/cannot be used with|--apply|--dry-run/);
     });
+  });
+});
+
+/**
+ * Regression for S1: `sync` must validate/pack against the schema the
+ * change was created under (from its manifest), not the currently
+ * ACTIVE schema. A change created under schema A must not be validated
+ * against schema B just because the project's active schema changed.
+ */
+describe('CLI sync uses the change manifest schema (S1)', () => {
+  it('builds the SchemaLoader from changeManifest.schema, not the active schema', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'openadab-sync-schema-'));
+    await createMinimalProject(projectRoot);
+
+    // The change is created under "legacy-schema" while the project's
+    // ACTIVE schema stays "chapter-draft" (the minimal-project default).
+    const changeDir = join(projectRoot, 'adab', 'changes', 'ch-001');
+    mkdirSync(changeDir, { recursive: true });
+    writeFileSync(
+      join(changeDir, '.openadab.yaml'),
+      `${[
+        'changeId: ch-001',
+        'schema: legacy-schema',
+        'version: 1',
+        'created: 2024-01-01T00:00:00Z',
+        'status: in_progress',
+        'currentArtifact: brief',
+        'artifacts:',
+        '  brief: ready',
+        '  scene-plan: blocked',
+        '  draft: blocked',
+        '  revision: blocked',
+        '  continuity-report: blocked',
+        '  wiki-diff: blocked',
+        'metadata: {}',
+      ].join('\n')  }\n`,
+      'utf-8',
+    );
+
+    let capturedSchemaDir = '';
+    const schemaLoadSpy = vi.spyOn(SchemaLoader.prototype, 'load');
+    schemaLoadSpy.mockImplementation(function mockLoad(this: SchemaLoader) {
+      capturedSchemaDir = (this as unknown as { schemaDir: string }).schemaDir;
+      return Promise.resolve({
+        name: 'legacy-schema',
+        version: 1,
+        // "xyz" is deliberately NOT in the sync engine's legacy optional
+        // list (wiki-diff/brief/scene-plan), so the missing artifact file
+        // is a hard validation failure and sync aborts after capturing
+        // the schema dir.
+        artifacts: [{ id: 'xyz', generates: 'xyz.md', requires: [], required: true }],
+      });
+    });
+
+    try {
+      const { exitCode, stderrText } = await runCliCapture(projectRoot, ['sync', '--change', 'ch-001']);
+      // The real validation pipeline runs against the change's own schema
+      // (the mocked load returns a schema with one REQUIRED artifact whose
+      // file is missing, so sync fails after the schema dir was captured).
+      expect(exitCode).not.toBeNull();
+      expect(exitCode).not.toBe(0);
+      expect(stderrText.toLowerCase()).toMatch(/pre-sync validation failed|error/);
+    } finally {
+      schemaLoadSpy.mockRestore();
+    }
+
+    expect(capturedSchemaDir).toBe(join(projectRoot, 'adab', 'schemas', 'legacy-schema'));
+    expect(capturedSchemaDir).not.toBe(join(projectRoot, 'adab', 'schemas', 'chapter-draft'));
+  });
+});
+
+/**
+ * Regression for S2: change-id arguments must be validated before they
+ * are joined onto `adab/changes/`, so ids like `../../x` cannot write
+ * or read outside the project boundary.
+ */
+describe('CLI change-id traversal guards (path safety)', () => {
+  let projectRoot: string;
+  let projectParent: string;
+
+  beforeEach(async () => {
+    projectRoot = mkdtempSync(join(tmpdir(), 'openadab-traversal-'));
+    await createMinimalProject(projectRoot);
+    projectParent = dirname(projectRoot);
+  });
+
+  it('rejects `new` with a traversal id and writes nothing outside the project', async () => {
+    const { exitCode, stderrText } = await runCliCapture(projectRoot, ['new', 'chapter', '../../x']);
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText.toLowerCase()).toMatch(/path_traversal|boundary/);
+    expect(existsSync(join(projectParent, 'x'))).toBe(false);
+  });
+
+  it('rejects `status --change` with a parent-traversal id', async () => {
+    const { exitCode, stderrText } = await runCliCapture(projectRoot, ['status', '--change', '../x']);
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText.toLowerCase()).toMatch(/path_traversal|boundary/);
+  });
+
+  it('rejects `wiki diff --change` with a parent-traversal id', async () => {
+    const { exitCode, stderrText } = await runCliCapture(projectRoot, ['wiki', 'diff', '--change', '../x']);
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText.toLowerCase()).toMatch(/path_traversal|boundary/);
+  });
+});
+
+/**
+ * Regression for S3: `wiki diff` with neither `--from` nor `--change`
+ * must fail with a usage error instead of silently exiting 0; when both
+ * are passed, `--from` wins but the precedence must be announced.
+ */
+describe('CLI wiki diff argument validation', () => {
+  let projectRoot: string;
+
+  beforeEach(async () => {
+    projectRoot = mkdtempSync(join(tmpdir(), 'openadab-wiki-diff-'));
+    await createMinimalProject(projectRoot);
+  });
+
+  it('exits non-zero with a usage error when neither --from nor --change is given', async () => {
+    const { exitCode, stderrText } = await runCliCapture(projectRoot, ['wiki', 'diff']);
+    expect(exitCode).not.toBeNull();
+    expect(exitCode).not.toBe(0);
+    expect(stderrText).toContain('Either --from <path> or --change <id> is required');
+  });
+
+  it('--from wins when both --from and --change are passed (warning emitted)', async () => {
+    writeFileSync(join(projectRoot, 'manuscript.md'), 'See [[characters/mara]].', 'utf-8');
+    const warnLines: string[] = [];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation((msg: unknown) => {
+      warnLines.push(String(msg));
+    });
+    try {
+      const { exitCode, stdoutText } = await runCliCapture(projectRoot, [
+        'wiki',
+        'diff',
+        '--from',
+        'manuscript.md',
+        '--change',
+        'ch-001',
+      ]);
+      expect(exitCode === null || exitCode === 0).toBe(true);
+      expect(stdoutText).toContain('characters/mara');
+      expect(warnLines.join('\n')).toContain('--from takes precedence');
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

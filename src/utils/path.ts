@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { AdabError } from './errors.js';
@@ -58,23 +58,48 @@ export class PathTraversalError extends AdabError {
 
 /**
  * Resolve `realpath` for a path, falling back to the input path when
- * the file does not exist (realpath throws ENOENT in that case).
+ * the path genuinely does not exist (realpath throws ENOENT and lstat
+ * confirms there is no entry at all).
+ *
+ * A DANGLING symlink — an entry lstat sees as a symlink whose target
+ * is missing — is NOT treated as "does not exist": the realpath ENOENT
+ * is rethrown so the caller fails closed instead of later writing
+ * through the link.
  *
  * Any other error (permission denied, loop, etc.) is rethrown so the
  * caller can decide whether to fail closed or open.
  *
  * @param p Path to resolve.
- * @returns Real path on success, original path on ENOENT.
+ * @returns Real path on success, original path on genuine ENOENT.
+ * @throws {NodeJS.ErrnoException} The original ENOENT when `p` is a
+ *         dangling symlink.
  */
 async function safeRealPath(p: string): Promise<string> {
   try {
     return await realpath(p);
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
-    if (e.code === 'ENOENT') {
-      return p;
+    if (e.code !== 'ENOENT') {
+      throw err;
     }
-    throw err;
+    // realpath ENOENT means either "no entry at all" or "dangling
+    // symlink" (the symlink entry exists but its target does not).
+    // lstat distinguishes the two: a symlink entry is visible even
+    // when its target is missing.
+    let isSymlink = false;
+    try {
+      isSymlink = (await lstat(p)).isSymbolicLink();
+    } catch (lstatErr) {
+      const le = lstatErr as NodeJS.ErrnoException;
+      if (le.code !== 'ENOENT') {
+        throw lstatErr;
+      }
+      return p; // genuinely missing — fall back
+    }
+    if (isSymlink) {
+      throw err; // dangling symlink — do NOT fall back
+    }
+    return p;
   }
 }
 
@@ -104,10 +129,22 @@ async function safeRealPath(p: string): Promise<string> {
 export async function resolveWithinBoundary(pwd: string, ...segments: string[]): Promise<string> {
   const resolved = resolve(pwd, ...segments);
   const normPwd = resolve(pwd);
-  const realResolved = await safeRealPath(resolved);
+  let realResolved: string;
+  try {
+    realResolved = await safeRealPath(resolved);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === 'ENOENT') {
+      // safeRealPath rethrows ENOENT only for a dangling symlink: the
+      // lexical path lies inside the boundary, but a write through it
+      // would follow the link to a (missing) target outside.
+      throw new PathTraversalError(segments.join('/'), pwd);
+    }
+    throw err;
+  }
   const realPwd = await safeRealPath(normPwd);
   const rel = relative(realPwd, realResolved);
-  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) {
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new PathTraversalError(segments.join('/'), pwd);
   }
   return resolved;

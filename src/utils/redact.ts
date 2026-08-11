@@ -23,10 +23,12 @@ const REDACTED_PLACEHOLDER = '***';
 /**
  * Lower-cased leaf-key suffixes that mark a config path as sensitive.
  *
- * A config path like `api.token`, `api.password`, or
- * `service.authToken` is considered sensitive; `api.tokenType` would
- * NOT be redacted by leaf-key alone (the leaf is `tokenType`, not in
- * the set). Use the `secrets` segment to redact whole subtrees.
+ * The leaf (last path segment) is matched by SUFFIX against this set:
+ * `service.authToken` is sensitive because `authtoken` ends with
+ * `token`; `openai.apiKey` is sensitive because `apikey` ends with
+ * `apikey`. `api.tokenType` is NOT sensitive by leaf-key alone
+ * (`tokentype` ends with neither `token` nor any other suffix). Use
+ * the `secrets` segment to redact whole subtrees.
  */
 const SENSITIVE_LEAF_KEYS: ReadonlySet<string> = new Set([
   'token',
@@ -43,7 +45,8 @@ const SENSITIVE_LEAF_KEYS: ReadonlySet<string> = new Set([
  *
  * Performs two independent checks (case-insensitive):
  *   1. Path contains a `secrets` or `secret` segment anywhere.
- *   2. The leaf (last) segment matches a known sensitive suffix.
+ *   2. The leaf (last) segment ends with a known sensitive suffix
+ *      (e.g. `token`, `apikey`, `password`).
  *
  * @param path Dot-separated config path (e.g. `secrets.apiKey`).
  * @returns `true` when the value at `path` must be redacted.
@@ -54,8 +57,10 @@ export function isSensitiveConfigPath(path: string): boolean {
     return true;
   }
   const leaf = segments[segments.length - 1];
-  if (leaf !== undefined && SENSITIVE_LEAF_KEYS.has(leaf)) {
-    return true;
+  for (const key of SENSITIVE_LEAF_KEYS) {
+    if (leaf.endsWith(key)) {
+      return true;
+    }
   }
   return false;
 }

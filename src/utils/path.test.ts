@@ -1,4 +1,5 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { lstat, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 
@@ -14,9 +15,18 @@ vi.mock('node:fs/promises', async () => {
   return {
     ...actual,
     realpath: vi.fn(async (p: unknown) => String(p)),
+    // Default: the path has no entry at all (matches realpath ENOENT on
+    // a genuinely missing file). The dangling-symlink test overrides this
+    // to report a symlink entry.
+    lstat: vi.fn(() => {
+      const err: NodeJS.ErrnoException = new Error('ENOENT');
+      err.code = 'ENOENT';
+      return Promise.reject(err);
+    }),
   };
 });
 
+import { AdabError } from './errors.js';
 import {
   resolveFromProjectRoot,
   resolveSchemaTemplate,
@@ -26,10 +36,9 @@ import {
   resolveWithinBoundary,
   PathTraversalError,
 } from './path.js';
-import { AdabError } from './errors.js';
-import { realpath } from 'node:fs/promises';
 
 const mockedRealpath = vi.mocked(realpath);
+const mockedLstat = vi.mocked(lstat);
 
 describe('resolveFromProjectRoot', () => {
   it('should resolve single segment', () => {
@@ -144,6 +153,14 @@ describe('resolveWithinBoundary symlink awareness (mocked realpath)', () => {
     boundary = join(root, 'inside');
     mkdirSync(boundary, { recursive: true });
     mockedRealpath.mockReset();
+    // Re-assert the "no entry" default so a previous test's lstat
+    // implementation never leaks into this test.
+    mockedLstat.mockReset();
+    mockedLstat.mockImplementation(() => {
+      const err: NodeJS.ErrnoException = new Error('ENOENT');
+      err.code = 'ENOENT';
+      return Promise.reject(err);
+    });
   });
 
   afterEach(() => {
@@ -163,13 +180,13 @@ describe('resolveWithinBoundary symlink awareness (mocked realpath)', () => {
       const err: NodeJS.ErrnoException = new Error('ENOENT');
       err.code = 'ENOENT';
       throw err;
-    }) as never);
+    }));
     await expect(resolveWithinBoundary(boundary, 'escape.md'))
       .rejects.toBeInstanceOf(PathTraversalError);
   });
 
   it('accepts a symlink whose realpath points inside the boundary', async () => {
-    mockedRealpath.mockImplementation((async (p: unknown) => String(p)) as never);
+    mockedRealpath.mockImplementation((async (p: unknown) => String(p)));
     await expect(resolveWithinBoundary(boundary, 'link.txt'))
       .resolves.toBe(join(boundary, 'link.txt'));
   });
@@ -179,7 +196,7 @@ describe('resolveWithinBoundary symlink awareness (mocked realpath)', () => {
       const err: NodeJS.ErrnoException = new Error('ENOENT');
       err.code = 'ENOENT';
       throw err;
-    }) as never);
+    }));
     await expect(resolveWithinBoundary(boundary, 'ghost.md'))
       .resolves.toBe(join(boundary, 'ghost.md'));
   });
@@ -187,8 +204,41 @@ describe('resolveWithinBoundary symlink awareness (mocked realpath)', () => {
   it('rejects lexical traversal even when realpath would resolve it back inside', async () => {
     // A boundary outside of realpath: e.g. boundary points at a child of the
     // real boundary, so a `..` segment is needed to escape.
-    mockedRealpath.mockImplementation((async (p: unknown) => String(p)) as never);
+    mockedRealpath.mockImplementation((async (p: unknown) => String(p)));
     await expect(resolveWithinBoundary(boundary, '..', 'foo.md'))
+      .rejects.toBeInstanceOf(PathTraversalError);
+  });
+
+  it('accepts a real file inside the boundary', async () => {
+    writeFileSync(join(boundary, 'real.txt'), 'real content', 'utf-8');
+    mockedRealpath.mockImplementation((p: unknown) => Promise.resolve(String(p)));
+    await expect(resolveWithinBoundary(boundary, 'real.txt'))
+      .resolves.toBe(join(boundary, 'real.txt'));
+  });
+
+  it('rejects a DANGLING symlink (entry is a link whose target is missing)', async () => {
+    // realpath fails with ENOENT for the dangling link, but lstat sees
+    // the symlink entry — the fallback must NOT apply, or a later write
+    // would follow the link outside the boundary.
+    mockedRealpath.mockImplementation((p: unknown) => {
+      const pathStr = String(p);
+      if (pathStr === boundary) {
+        return Promise.resolve(boundary);
+      }
+      const err: NodeJS.ErrnoException = new Error('ENOENT');
+      err.code = 'ENOENT';
+      return Promise.reject(err);
+    });
+    mockedLstat.mockImplementation((p: unknown) => {
+      const pathStr = String(p);
+      if (pathStr.endsWith('dangling.md')) {
+        return Promise.resolve({ isSymbolicLink: () => true } as never);
+      }
+      const err: NodeJS.ErrnoException = new Error('ENOENT');
+      err.code = 'ENOENT';
+      return Promise.reject(err);
+    });
+    await expect(resolveWithinBoundary(boundary, 'dangling.md'))
       .rejects.toBeInstanceOf(PathTraversalError);
   });
 });

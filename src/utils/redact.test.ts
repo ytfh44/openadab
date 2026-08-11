@@ -36,6 +36,14 @@ describe('isSensitiveConfigPath', () => {
     expect(isSensitiveConfigPath('openai.apiKey')).toBe(true);
   });
 
+  it('marks leaf key "authToken" as sensitive (suffix match)', () => {
+    expect(isSensitiveConfigPath('service.authToken')).toBe(true);
+  });
+
+  it('marks leaf key "apiKey" as sensitive via suffix match', () => {
+    expect(isSensitiveConfigPath('secrets.apiKey')).toBe(true);
+  });
+
   it('marks leaf key "password" as sensitive', () => {
     expect(isSensitiveConfigPath('database.password')).toBe(true);
   });
@@ -55,6 +63,8 @@ describe('isSensitiveConfigPath', () => {
   it('does NOT mark a path whose leaf merely contains the substring "token"', () => {
     // leaf is "tokenType" — must not be redacted by leaf-key alone
     expect(isSensitiveConfigPath('api.tokenType')).toBe(false);
+    // "maxTokens" ends with "Tokens", not "token" — stays visible
+    expect(isSensitiveConfigPath('context.maxTokens')).toBe(false);
   });
 });
 
@@ -65,6 +75,10 @@ describe('redactConfigValue', () => {
 
   it('redacts api.token to the placeholder', () => {
     expect(redactConfigValue('api.token', 'bearer-abc')).toBe(REDACTED_VALUE);
+  });
+
+  it('redacts service.authToken to the placeholder (suffix match)', () => {
+    expect(redactConfigValue('service.authToken', 'bearer-def')).toBe(REDACTED_VALUE);
   });
 
   it('redacts nested database.secrets.password', () => {
