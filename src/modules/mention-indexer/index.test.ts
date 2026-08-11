@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -163,7 +163,7 @@ describe('MentionIndexer', () => {
     // Active change should appear in mentions.json
     const mentionsPath = join(root, 'adab', 'index', 'mentions.json');
     const mentions = JSON.parse(readFileSync(mentionsPath, 'utf-8'));
-    const aliceEntry = mentions['Alice'];
+    const aliceEntry = mentions.Alice;
     expect(aliceEntry).toBeDefined();
     const activeMatch = aliceEntry.appearances.find((a: any) => a.file === activeFile);
     expect(activeMatch).toBeDefined();
@@ -332,13 +332,16 @@ describe('MentionIndexer', () => {
       { path: 'characters/bob.md', frontmatter: { name: 'Bob', type: 'character' }, body: '' },
     ]);
     // Copy the manuscript files into the new indexer's root
-    const manDir2 = join(indexer2['projectRoot'], 'adab', 'manuscript');
+    // (`as { projectRoot: string }` keeps the private access explicit
+    // while satisfying the dot-notation lint rule).
+    const indexer2Root = (indexer2 as unknown as { projectRoot: string }).projectRoot;
+    const manDir2 = join(indexer2Root, 'adab', 'manuscript');
     mkdirSync(manDir2, { recursive: true });
     writeFileSync(join(manDir2, 'ch-001.md'), 'Alice was here. Bob smiled.');
     writeFileSync(join(manDir2, 'ch-002.md'), 'Alice was there too.');
 
     // Seed mentions.json with only Alice (no Bob yet)
-    const idxDir = join(indexer2['projectRoot'], 'adab', 'index');
+    const idxDir = join(indexer2Root, 'adab', 'index');
     mkdirSync(idxDir, { recursive: true });
     writeFileSync(join(idxDir, '.last-mention-indexed'), String(Date.now() - 10000));
     writeFileSync(join(idxDir, 'mentions.json'), JSON.stringify({
@@ -353,6 +356,35 @@ describe('MentionIndexer', () => {
     // Bob should be found in ch-001 (not modified, so via full-scan path)
     const bobInCh001 = bob.appearances.find((a: any) => a.file === join(manDir2, 'ch-001.md'));
     expect(bobInCh001).toBeDefined();
+  });
+
+  it('incrementalIndex drops appearances of deleted files', async () => {
+    const { indexer, root } = setupIndexer([
+      { path: 'characters/alice.md', frontmatter: { name: 'Alice', type: 'character' }, body: '' },
+    ]);
+    const manDir = join(root, 'adab', 'manuscript');
+    mkdirSync(manDir, { recursive: true });
+    const file = join(manDir, 'ch-001.md');
+    writeFileSync(file, 'Alice walked.');
+
+    await indexer.indexAll();
+    const mentionsPath = join(root, 'adab', 'index', 'mentions.json');
+    const before = JSON.parse(readFileSync(mentionsPath, 'utf-8'));
+    expect(before.Alice.appearances.some((a: { file: string }) => a.file === file)).toBe(true);
+
+    // Delete the source file: a deleted file never lands in the modified
+    // set of a later incremental run, so without the deletion pass its
+    // appearances would survive in mentions.json forever.
+    rmSync(file);
+    await indexer.incrementalIndex();
+
+    const after = JSON.parse(readFileSync(mentionsPath, 'utf-8'));
+    expect(after.Alice.appearances.some((a: { file: string }) => a.file === file)).toBe(false);
+    const contextPath = join(root, 'adab', 'index', 'context-map.json');
+    if (existsSync(contextPath)) {
+      const cm = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      expect(JSON.stringify(cm)).not.toContain(file);
+    }
   });
 
   it('incrementalIndex with no new entities and no modified files returns early', async () => {
@@ -803,7 +835,7 @@ describe('MentionIndexer', () => {
     ]);
     await indexer.indexAll();
     const file = join(root, 'm.md');
-    const para1 = 'Para1 ' + 'a'.repeat(80) + '.';
+    const para1 = `Para1 ${  'a'.repeat(80)  }.`;
     const tail = 'third line ignore';
     writeFileSync(file, `${para1}\n\nMara walked through the cold door.\n${tail}\n`);
     const results = await indexer.scanFile(file);
@@ -830,7 +862,7 @@ describe('MentionIndexer', () => {
     // - paragraph separator index = 30 (length of "Para1 " + 24 'a's + ".")
     // - line break does not exist on the before side at all in this case;
     //   so we just want to confirm the paragraph separator stops the leak.
-    const para1 = 'Para1 ' + 'a'.repeat(24) + '.'; // length 30
+    const para1 = `Para1 ${  'a'.repeat(24)  }.`; // length 30
     writeFileSync(file, `${para1}\n\nMara walked through the cold door.\ntail\n`);
     const results = await indexer.scanFile(file);
     const ctx = results.get('Mara')?.[0]?.context ?? '';
@@ -861,7 +893,7 @@ describe('MentionIndexer', () => {
     ]);
     await indexer.indexAll();
     const file = join(root, 'm.md');
-    const lf = 'Para1 ' + 'a'.repeat(200) + '.\n\nMara smiled.\n\nPara3 ' + 'b'.repeat(200) + '.';
+    const lf = `Para1 ${  'a'.repeat(200)  }.\n\nMara smiled.\n\nPara3 ${  'b'.repeat(200)  }.`;
     writeFileSync(file, toCRLF(lf));
     const results = await indexer.scanFile(file);
     const ctx = results.get('Mara')?.[0]?.context ?? '';

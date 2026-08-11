@@ -313,6 +313,24 @@ describe('ConfigWriter.set — nested path edge cases', () => {
     expect(loaded.context.alwaysInclude).toEqual(['a', 'b']);
   });
 
+  it('rejects malformed array index segments in set paths', async () => {
+    const writer = new ConfigWriter(tempDir);
+    // Unclosed bracket, empty brackets, negative and fractional indices
+    // must be rejected as malformed paths instead of being silently
+    // treated as literal object keys (or padding array holes).
+    await expect(writer.set('context.alwaysInclude[0', 'a')).rejects.toBeInstanceOf(ConfigValidationError);
+    await expect(writer.set('context.alwaysInclude[]', 'a')).rejects.toBeInstanceOf(ConfigValidationError);
+    await expect(writer.set('context.alwaysInclude[-1]', 'a')).rejects.toBeInstanceOf(ConfigValidationError);
+    await expect(writer.set('context.alwaysInclude[1.5]', 'a')).rejects.toBeInstanceOf(ConfigValidationError);
+  });
+
+  it('suggests valid enum values when set produces an invalid enum', async () => {
+    const writer = new ConfigWriter(tempDir);
+    await expect(writer.set('project.pov', 'bogus')).rejects.toThrow(
+      /Valid values: first-person, limited-third, omniscient-third/,
+    );
+  });
+
   it('throws ConfigValidationError when set produces invalid config', async () => {
     const writer = new ConfigWriter(tempDir);
     await expect(writer.set('project.tense', 'invalid-tense')).rejects.toBeInstanceOf(ConfigValidationError);

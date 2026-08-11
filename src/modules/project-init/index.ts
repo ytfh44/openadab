@@ -9,12 +9,12 @@ import YAML from 'yaml';
 import { AdabError } from '../../utils/errors.js';
 import { atomicWriteFile, ensureDir, fileExists, safeReadFile } from '../../utils/fs.js';
 import { resolveBuiltInSchemasDir, resolveCommandsDir } from '../../utils/resource-paths.js';
+import { AdapterFactory } from '../host-adapters/adapter-factory.js';
 import {
   detectHost,
   CommandDefLoader,
   writeGeneratedFiles,
 } from '../host-adapters/index.js';
-import { AdapterFactory } from '../host-adapters/adapter-factory.js';
 
 /**
  * Options passed to {@link ProjectInitializer.init}.
@@ -427,13 +427,17 @@ created: ${now}
 
   private async updateGitignore(): Promise<void> {
     const gitignorePath = join(this.targetDir, '.gitignore');
-    // PI-4: use the spec's single `.last-indexed` filename; the legacy
-    // `.last-mention-indexed` / `.last-progression-indexed` split is
-    // what the codebase had drifted to, but the spec wording is the
-    // source of truth.
+    // The index marker files are dotfiles, so `adab/index/*.json` does not
+    // cover them; without explicit ignores they get committed to git and
+    // trigger spurious "index is stale" warnings on clones.  Ignore the two
+    // real marker filenames written by the mention-indexer and the
+    // progression-tracker.  (`.last-indexed` is a legacy spec name that no
+    // module writes anymore — the context-packer explicitly treats it as an
+    // old-format file to ignore.)
     const lines = [
       'adab/index/*.json',
-      'adab/index/.last-indexed',
+      'adab/index/.last-mention-indexed',
+      'adab/index/.last-progression-indexed',
       'adab/log.md',
       'adab/wiki/index.md',
       'adab/wiki/overview.md',

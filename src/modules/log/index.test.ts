@@ -52,6 +52,20 @@ describe('LogWriter', () => {
     expect(initIndex).toBeLessThan(newIndex);
   });
 
+  it('keeps both entries when appends run concurrently (O_APPEND)', async () => {
+    // The old read-modify-write append could lose one entry when two
+    // appends raced (both read the same base, the later writer clobbered
+    // the earlier entry).  The append path now uses O_APPEND so each
+    // entry lands independently.
+    await Promise.all([
+      writer.append({ ts: '2026-06-06T10:00:00Z', op: 'sync', change: 'ch-001', result: 'success' }),
+      writer.append({ ts: '2026-06-06T10:00:01Z', op: 'archive', change: 'ch-001', result: 'success' }),
+    ]);
+    const reader = new LogReader(tempDir);
+    const entries = await reader.readAll();
+    expect(entries).toHaveLength(2);
+  });
+
   it('includes details when provided', async () => {
     const entry: LogEntry = {
       ts: '2026-06-06T10:02:00Z',

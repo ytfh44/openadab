@@ -58,9 +58,9 @@ function toDisplayPath(absolutePath: string): string {
   }
   const home = homedir();
   if (home && absolutePath.startsWith(home + sep)) {
-    return '~' + sep + relative(home, absolutePath);
+    return `~${  sep  }${relative(home, absolutePath)}`;
   }
-  return 'adab' + sep + 'config.yaml';
+  return `adab${  sep  }config.yaml`;
 }
 
 /**
@@ -123,34 +123,40 @@ export class ConfigLoader {
    * @returns Array of valid values, or `null` if the path does not land on
    *          an enum schema.
    */
-  private collectEnumValues(path: string): string[] | null {
+  /**
+   * Walk the config schema to find the allowed values of an enum field at
+   * `path` (e.g. `project.pov`), unwrapping `ZodDefault`/`ZodOptional`/
+   * `ZodNullable`/`ZodEffects` wrappers along the way.
+   *
+   * @param path Dot-separated config path to the enum field.
+   * @returns The enum's allowed values, or `null` when the path does not
+   *          resolve to an enum.
+   */
+  collectEnumValues(path: string): string[] | null {
     const segments = path.split('.');
     let schema: z.ZodType<unknown> = ProjectConfigSchema;
     for (const segment of segments) {
-      if (schema instanceof z.ZodObject) {
-        const shape = schema.shape as Record<string, z.ZodType<unknown>>;
-        const next = shape[segment];
-        if (next === undefined) {
-          return null;
-        }
-        schema = next;
-      } else if (schema instanceof z.ZodOptional) {
-        schema = schema._def.innerType as z.ZodType<unknown>;
-        const shape = (schema as z.ZodObject<z.ZodRawShape>).shape as Record<string, z.ZodType<unknown>>;
-        const next = shape[segment];
-        if (next === undefined) {
-          return null;
-        }
-        schema = next;
-      } else {
+      // The config schema wraps every nested object and enum field in
+      // `.default(...)` (ZodDefault) and uses `.passthrough()` objects, so
+      // the walker must look through the wrappers before it can see the
+      // next object shape or the final enum.
+      schema = this.unwrapSchema(schema);
+      if (!(schema instanceof z.ZodObject)) {
         return null;
       }
+      const shape = schema.shape as Record<string, z.ZodType<unknown>>;
+      // `shape` is typed as a full record, but passthrough objects can
+      // lack the segment at runtime — check presence explicitly so the
+      // walker returns null instead of indexing a missing key.
+      if (!Object.prototype.hasOwnProperty.call(shape, segment)) {
+        return null;
+      }
+      const next = shape[segment];
+      schema = next;
     }
+    schema = this.unwrapSchema(schema);
     if (schema instanceof z.ZodEnum) {
-      return [...schema._def.values];
-    }
-    if (schema instanceof z.ZodOptional && schema._def.innerType instanceof z.ZodEnum) {
-      return [...(schema._def.innerType as z.ZodEnum<[string, ...string[]]>)._def.values];
+      return Array.from(schema._def.values as readonly string[]);
     }
     return null;
   }
@@ -158,13 +164,13 @@ export class ConfigLoader {
   /**
    * Recursively unwrap a zod schema, peeling off wrapper types that have
    * no impact on the user-visible field shape (`ZodDefault`,
-   * `ZodOptional`).
+   * `ZodOptional`, `ZodNullable`, `ZodEffects`).
    *
    * Field-level wrappers are used liberally in the project config schema
    * (e.g. `project: z.object({...}).default({...})`), so the unknown-field
-   * detector must look through them to find the underlying `ZodObject`,
-   * `ZodRecord`, or `ZodArray` before deciding whether the current value
-   * is structured.
+   * detector and the enum-value walker must look through them to find the
+   * underlying `ZodObject`, `ZodRecord`, or `ZodArray` (or the final
+   * `ZodEnum`) before deciding whether the current value is structured.
    *
    * @param schema A zod schema that may be wrapped.
    * @returns The innermost non-wrapper schema. If the input is already a
@@ -173,8 +179,16 @@ export class ConfigLoader {
   private unwrapSchema(schema: z.ZodType<unknown>): z.ZodType<unknown> {
     let current: z.ZodType<unknown> = schema;
     while (true) {
-      if (current instanceof z.ZodDefault || current instanceof z.ZodOptional) {
-        current = (current as z.ZodDefault<z.ZodType<unknown>>)._def.innerType as z.ZodType<unknown>;
+      if (
+        current instanceof z.ZodDefault ||
+        current instanceof z.ZodOptional ||
+        current instanceof z.ZodNullable
+      ) {
+        current = (current as z.ZodDefault<z.ZodType<unknown>>)._def.innerType;
+        continue;
+      }
+      if (current instanceof z.ZodEffects) {
+        current = current._def.schema as z.ZodType<unknown>;
         continue;
       }
       break;
@@ -385,12 +399,12 @@ export class ConfigWriter {
  * @param issues Zod issues from the failed parse.
  * @returns Suffix string (including a leading space) or empty.
  */
-function suggestValidValues(issues: ReadonlyArray<z.ZodIssue>): string {
+function suggestValidValues(issues: readonly z.ZodIssue[]): string {
   for (const issue of issues) {
     const path = issue.path.map(String).join('.');
     if (!path) {continue;}
     const loader = new ConfigLoader(process.cwd());
-    const values = loader['collectEnumValues'](path);
+    const values = loader.collectEnumValues(path);
     if (values !== null && values.length > 0) {
       return ` (Valid values: ${values.join(', ')})`;
     }
@@ -411,17 +425,17 @@ function suggestValidValues(issues: ReadonlyArray<z.ZodIssue>): string {
  * @returns Suffix string (including a leading space) or empty.
  */
 function suggestValidValuesForPath(
-  issues: ReadonlyArray<z.ZodIssue>,
+  issues: readonly z.ZodIssue[],
   userPath: string
 ): string {
-  const directValues = new ConfigLoader(process.cwd())['collectEnumValues'](userPath);
+  const directValues = new ConfigLoader(process.cwd()).collectEnumValues(userPath);
   if (directValues !== null && directValues.length > 0) {
     return ` (Valid values: ${directValues.join(', ')})`;
   }
   for (const issue of issues) {
     const path = issue.path.map(String).join('.');
     if (!path) {continue;}
-    const values = new ConfigLoader(process.cwd())['collectEnumValues'](path);
+    const values = new ConfigLoader(process.cwd()).collectEnumValues(path);
     if (values !== null && values.length > 0) {
       return ` (Valid values: ${values.join(', ')})`;
     }
@@ -448,18 +462,27 @@ function suggestValidValuesForPath(
  * @returns A flat list of segments; string for object keys, number for
  *          array indices.
  */
-function parseConfigPath(path: string): Array<string | number> {
+function parseConfigPath(path: string): (string | number)[] {
   return path.split(/\.|(?=\[)/).flatMap((segment) => {
     const match = /^\[(\d+)\]$/.exec(segment);
     if (match) {
       return [parseInt(match[1], 10)];
     }
-    const bracketMatch = /^(.+?)\[(\d+)\]$/.exec(segment);
+    const bracketMatch = /^([^[\]]+)\[(\d+)\]$/.exec(segment);
     if (bracketMatch) {
       return [bracketMatch[1], parseInt(bracketMatch[2], 10)];
     }
     if (/^\d+$/.test(segment)) {
       return [parseInt(segment, 10)];
+    }
+    // Any leftover bracket means a malformed index segment (`a[0`, `a[]`,
+    // `a[-1]`, `a[1.5]`).  Without this check such paths are silently
+    // accepted as literal object keys (e.g. `a['[0']`) instead of failing
+    // loudly as usage errors.
+    if (/[[\]]/.test(segment)) {
+      throw new ConfigValidationError(
+        `Invalid config path "${path}": segment "${segment}" has a malformed [N] array index`
+      );
     }
     return [segment];
   });
@@ -515,6 +538,9 @@ function isArray(value: unknown): value is unknown[] {
  * (the user meant to set an adjacent slot). The schema also rejects empty
  * strings, but relying on schema validation alone hides the problem from
  * the user. We throw a {@link ConfigValidationError} up front instead.
+ * This applies both to the FINAL key and to every intermediate numeric
+ * segment — `foo[5].bar` on an empty array would otherwise create five
+ * array holes before the traversal even reaches `bar`.
  *
  * @param root  The object (or array) to mutate in place.
  * @param keys  The flat list of segments produced by {@link parseConfigPath}.
@@ -522,7 +548,7 @@ function isArray(value: unknown): value is unknown[] {
  * @throws {ConfigValidationError} When the numeric index is beyond
  *         `parent.length` (would create empty string padding slots).
  */
-function setIn(root: Record<string, unknown> | unknown[], keys: Array<string | number>, value: unknown): void {
+function setIn(root: Record<string, unknown> | unknown[], keys: (string | number)[], value: unknown): void {
   if (keys.length === 0) {
     return;
   }
@@ -536,7 +562,13 @@ function setIn(root: Record<string, unknown> | unknown[], keys: Array<string | n
           `Cannot traverse into numeric key [${key}]: parent is not an array`
         );
       }
-      if (parent.length <= key || !isPlainObject(parent[key]) && !isArray(parent[key])) {
+      if (parent.length < key) {
+        throw new ConfigValidationError(
+          `Array index [${String(key)}] is out of range (length is ${String(parent.length)}); ` +
+          `set indices sequentially to avoid silent "" padding`
+        );
+      }
+      if (!isPlainObject(parent[key]) && !isArray(parent[key])) {
         parent[key] = emptyContainerFor(nextKey);
       }
       parent = parent[key] as Record<string, unknown> | unknown[];

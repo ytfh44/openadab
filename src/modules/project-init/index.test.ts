@@ -414,22 +414,26 @@ describe('ProjectInitializer', () => {
     const overviewMd = readFileSync(join(tempDir, 'adab', 'wiki', 'overview.md'), 'utf-8');
     const contradictionsMd = readFileSync(join(tempDir, 'adab', 'wiki', 'contradictions.md'), 'utf-8');
     const tsRe = /^created:\s*(.+)$/m;
-    const a = indexMd.match(tsRe)?.[1];
-    const b = overviewMd.match(tsRe)?.[1];
-    const c = contradictionsMd.match(tsRe)?.[1];
+    const a = (tsRe.exec(indexMd))?.[1];
+    const b = (tsRe.exec(overviewMd))?.[1];
+    const c = (tsRe.exec(contradictionsMd))?.[1];
     expect(a).toBeDefined();
     expect(b).toBe(a);
     expect(c).toBe(a);
   });
 
-  it('gitignore uses `.last-indexed` per the spec wording (PI-4)', async () => {
+  it('gitignore ignores the real index marker filenames (PI-4)', async () => {
     const initializer = new ProjectInitializer(tempDir);
     await initializer.init();
     const gitignore = readFileSync(join(tempDir, '.gitignore'), 'utf-8');
-    expect(gitignore).toContain('adab/index/.last-indexed');
-    // The legacy split filenames must NOT appear in the generated block.
-    expect(gitignore).not.toContain('.last-mention-indexed');
-    expect(gitignore).not.toContain('.last-progression-indexed');
+    // The marker files actually written by the indexers are
+    // .last-mention-indexed (mention-indexer) and
+    // .last-progression-indexed (progression-tracker); the legacy spec
+    // name `.last-indexed` is written by no module and must not be the
+    // only ignored entry.
+    expect(gitignore).toContain('adab/index/.last-mention-indexed');
+    expect(gitignore).toContain('adab/index/.last-progression-indexed');
+    expect(gitignore).not.toContain('adab/index/.last-indexed');
   });
 
   it('rejects unknown --schema values with SCHEMA_NOT_FOUND (PI-6)', async () => {
@@ -456,7 +460,7 @@ describe('ProjectInitializer', () => {
   it('reports duplicate gitignore lines instead of silently skipping (PI-7)', async () => {
     // Pre-seed a .gitignore that already contains one of the canonical lines.
     writeFileSync(join(tempDir, '.gitignore'), 'adab/log.md\n', 'utf-8');
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const initializer = new ProjectInitializer(tempDir);
     await initializer.init();
     const gitignore = readFileSync(join(tempDir, '.gitignore'), 'utf-8');

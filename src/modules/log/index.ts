@@ -4,10 +4,11 @@
  * Uses Markdown + HTML-comment JSON hybrid format so humans can read the
  * Markdown while machines parse the JSON comments.
  */
+import { appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { LogEntry } from '../../schemas/types.js';
-import { safeReadFile, atomicWriteFile, ensureDir } from '../../utils/fs.js';
+import { safeReadFile, ensureDir } from '../../utils/fs.js';
 
 export class LogWriter {
   private readonly logPath: string;
@@ -27,17 +28,29 @@ export class LogWriter {
    */
   async append(entry: LogEntry): Promise<void> {
     const line = this.formatEntry(entry);
-    const existing = (await safeReadFile(this.logPath)) ?? '';
-    const output = existing ? `${existing.trimEnd()}\n\n${line}` : line;
+    // The file is read only to decide whether a blank-line separator is
+    // needed — the entry itself is appended with O_APPEND, so two
+    // concurrent appends can no longer LOSE an entry the way the old
+    // read-modify-write could (both readers saw the same base, the later
+    // writer clobbered the earlier entry).  Worst case under a race is a
+    // slightly odd blank line.
+    const existing = await safeReadFile(this.logPath);
+    const separator = existing !== null && existing.length > 0 && !existing.endsWith('\n\n') ? '\n\n' : '';
     await ensureDir(join(this.logPath, '..'));
-    await atomicWriteFile(this.logPath, `${output}\n`);
+    await appendFile(this.logPath, `${separator}${line}\n`, 'utf-8');
     // Defensive re-read: detect if another process modified the log concurrently.
     // Since this is a single-user CLI, concurrent writes are unlikely but not impossible.
     // Compare only the machine-readable `<!-- log-entry ... -->` fragment rather than the
     // full formatted line, so cosmetic tweaks to the Markdown portion do not trigger
     // false positives.
     const verify = await safeReadFile(this.logPath);
-    const lastComment = line.match(/<!--.*?-->/)?.[0] ?? line;
+    // `.match()` keeps the regex literal inside a call expression: a
+    // leading `(/<!--…-->/.exec(…))` form trips oxc's HTML-comment
+    // detection and fails to parse.
+    // Built via `new RegExp` (not a `/<!--…/` literal): oxc's parser treats
+    // a leading `(/<!--` as an HTML comment and fails to transform the
+    // module, and the lint autofixer converts `.match()` to `.exec()`.
+    const lastComment = new RegExp('<!--.*?-->').exec(line)?.[0] ?? line;
     if (verify !== null && !verify.includes(lastComment)) {
       console.warn('[LogWriter] Possible concurrent modification detected — log entry may have been lost.');
     }

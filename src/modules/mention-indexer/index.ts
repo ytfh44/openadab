@@ -8,8 +8,8 @@ import { join, normalize } from 'node:path';
 import glob from 'fast-glob';
 import { z } from 'zod';
 
-import { safeReadFile, atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
 import { TargetNotFoundError } from '../../utils/errors.js';
+import { safeReadFile, atomicWriteFile, ensureDir, fileExists } from '../../utils/fs.js';
 import type { WikiEngine } from '../wiki-engine/index.js';
 
 /**
@@ -500,7 +500,10 @@ export class MentionIndexer {
    * Perform an incremental re-index of only modified files.
    *
    * Compares file mtimes against the last index timestamp.  Removes stale
-   * appearances from modified files, re-scans them, and updates both indexes.
+   * appearances from modified files AND from files that no longer exist
+   * (a deleted manuscript/wiki file never appears in the modified set, so
+   * without the deletion pass its mentions would survive forever),
+   * re-scans the survivors, and updates both indexes.
    */
   async incrementalIndex(): Promise<void> {
     const lastIndexed = await this.readLastIndexed();
@@ -524,7 +527,7 @@ export class MentionIndexer {
         const parsed = JSON.parse(existingMentionsRaw);
         const validated = MentionsIndexSchema.safeParse(parsed);
         if (validated.success) {
-          existingMentions = validated.data as MentionsIndex;
+          existingMentions = validated.data;
           for (const [name, existingEntry] of Object.entries(existingMentions)) {
             const registryEntry = this.entityRegistry.get(name);
             if (registryEntry) {
@@ -551,6 +554,23 @@ export class MentionIndexer {
     }
 
     const files = await this.collectSourceFiles();
+    const existingFiles = new Set(files);
+
+    // Drop appearances whose source file no longer exists.  Deleted files
+    // are absent from the glob, so they never land in modifiedFiles and
+    // their stale appearances — plus the context-map entries pointing at a
+    // nonexistent file — would otherwise survive in the indexes forever.
+    // Both index writers derive from the registry, so pruning the registry
+    // here propagates to mentions.json and context-map.json below.
+    let removedStaleAppearances = false;
+    for (const [, entry] of this.entityRegistry) {
+      const kept = entry.appearances.filter((a) => existingFiles.has(a.file));
+      if (kept.length !== entry.appearances.length) {
+        removedStaleAppearances = true;
+        entry.appearances = kept;
+      }
+    }
+
     const modifiedFiles: string[] = [];
     for (const file of files) {
       try {
@@ -563,12 +583,12 @@ export class MentionIndexer {
       }
     }
 
-    if (modifiedFiles.length === 0 && newEntityNames.length === 0) {
+    if (modifiedFiles.length === 0 && newEntityNames.length === 0 && !removedStaleAppearances) {
       return;
     }
 
     if (newEntityNames.length > 0) {
-      this.applyScanResults(files, new Set(newEntityNames));
+      await this.applyScanResults(files, new Set(newEntityNames));
     }
 
     if (modifiedFiles.length > 0) {
@@ -578,7 +598,7 @@ export class MentionIndexer {
           entry.appearances = entry.appearances.filter((a) => !modifiedFiles.includes(a.file));
         }
       }
-      this.applyScanResults(modifiedFiles, null);
+      await this.applyScanResults(modifiedFiles, null);
     }
 
     await this.generateMentionsJson();
