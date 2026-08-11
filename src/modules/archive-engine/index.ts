@@ -144,10 +144,12 @@ export class ArchiveEngine {
       warnings.push(`Revision artifact not found: ${revisionPath}`);
     }
 
-    // Write the archived manifest BEFORE moving the directory, so that
-    // if rename fails after manifest write, the archive directory is in a
-    // consistent state (manifest reflects archived status, directory still
-    // in changes/ — will be picked up on retry).
+    // Mark the manifest archived BEFORE moving the directory. Every
+    // failure-prone step after this point (backup drain and rename) lives
+    // inside the same try/catch below so any failure reverts the status
+    // back to `synced`: a change left in `changes/` with status `archived`
+    // would be permanently stuck (every retry throws
+    // ARCHIVE_ALREADY_ARCHIVED).
     manifest.status = 'archived';
     await this.writeManifest(manifestPath, manifest);
 
@@ -155,25 +157,32 @@ export class ArchiveEngine {
     await mkdir(archiveDir, { recursive: true });
     const archivePath = join(archiveDir, changeDir);
 
-    // AE-1: If an existing archive target is present, move it aside to a
-    // timestamped backup location so the rename can proceed cleanly.  When
-    // force is false the existence check still throws below.
-    if (await fileExists(archivePath)) {
-      if (!force) {
-        throw new AdabError(
-          `Archive target already exists: ${archivePath}. Remove it manually or use a different change ID.`,
-          'ARCHIVE_DUPLICATE',
-        );
-      }
-      const backupArchivePath = `${archivePath}.bak-${String(Date.now())}-${randomUUID()}`;
-      await this.moveDirContents(archivePath, backupArchivePath);
-    }
     try {
+      // AE-1: If an existing archive target is present, move it aside to a
+      // timestamped backup location so the rename can proceed cleanly.  When
+      // force is false the existence check still throws below.
+      if (await fileExists(archivePath)) {
+        if (!force) {
+          throw new AdabError(
+            `Archive target already exists: ${archivePath}. Remove it manually or use a different change ID.`,
+            'ARCHIVE_DUPLICATE',
+          );
+        }
+        const backupArchivePath = `${archivePath}.bak-${String(Date.now())}-${randomUUID()}`;
+        await this.moveDirContents(archivePath, backupArchivePath);
+      }
       await rename(changePath, archivePath);
     } catch (err) {
-      // Revert manifest status since rename failed — directory stays in changes/
+      // Revert manifest status since the drain or rename failed — the
+      // directory stays in changes/ and must remain retryable.
       manifest.status = 'synced';
       await this.writeManifest(manifestPath, manifest);
+      // Errors the engine already classified (ARCHIVE_DUPLICATE from the
+      // force=false existence check, ARCHIVE_RENAME_FAILED from the drain)
+      // are re-thrown as-is after the revert.
+      if (err instanceof AdabError) {
+        throw err;
+      }
       // TOCTOU guard: if the archive directory appeared between our
       // fileExists check and rename, it's a duplicate.
       if (err instanceof Error && 'code' in err) {

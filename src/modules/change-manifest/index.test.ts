@@ -558,6 +558,32 @@ describe('ManifestManager', () => {
       // File contents should be byte-identical when the status is unchanged.
       expect(mtimeAfter).toBe(mtimeBefore);
     });
+
+    /**
+     * Contract: even when the requested status equals the current status,
+     * the documented `currentArtifact` re-targeting ("Also updates
+     * currentArtifact to the given artifact ID") must still happen and
+     * persist. The no-op shortcut only applies when nothing at all changed.
+     */
+    it('updates currentArtifact when the status is unchanged but focus is elsewhere', async () => {
+      const changeDir = join(tempDir, 'noop-current');
+      mkdirSync(changeDir, { recursive: true });
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+      ]);
+      const manifest = manager.createManifest('noop-current', schema);
+      // Stage: B is already ready, but focus still points at A.
+      manifest.artifacts.B = 'ready';
+      manifest.currentArtifact = 'A';
+      await manager.writeManifest(changeDir, manifest);
+
+      await manager.updateArtifactStatus(changeDir, 'B', 'ready', schema);
+
+      const read = await manager.readManifest(changeDir);
+      expect(read.artifacts.B).toBe('ready');
+      expect(read.currentArtifact).toBe('B');
+    });
   });
 
   describe('handleArtifactDeletion — schema-driven status reversion', () => {
@@ -607,6 +633,38 @@ describe('ManifestManager', () => {
       const read = await manager.readManifest(changeDir);
       // B's dep A is not done → B must revert to blocked.
       expect(read.artifacts.B).toBe('blocked');
+    });
+
+    /**
+     * Contract: deleting an artifact must cascade to its dependents. A
+     * downstream artifact that was `ready` only because the deleted
+     * artifact was `done` must be re-blocked — the same derivation
+     * `applyCascade` performs after a status mutation.
+     */
+    it('re-blocks dependent artifacts when a dependency is deleted (A → B → C)', async () => {
+      const changeDir = join(tempDir, 'del-cascade');
+      mkdirSync(changeDir, { recursive: true });
+      const schema = makeSchema([
+        { id: 'A', generates: 'A.md', requires: [] },
+        { id: 'B', generates: 'B.md', requires: ['A'] },
+        { id: 'C', generates: 'C.md', requires: ['B'] },
+      ]);
+      // Stage: A=done, B=done, C=ready (C was unblocked when B was done).
+      const manifest = manager.createManifest('del-cascade', schema);
+      manifest.artifacts.A = 'done';
+      manifest.artifacts.B = 'done';
+      manifest.artifacts.C = 'ready';
+      await manager.writeManifest(changeDir, manifest);
+
+      await manager.handleArtifactDeletion(changeDir, 'B', schema);
+
+      const read = await manager.readManifest(changeDir);
+      // B's dep A is still done → B reverts to ready.
+      expect(read.artifacts.B).toBe('ready');
+      // C requires B=done; B is no longer done → C must be re-blocked.
+      expect(read.artifacts.C).toBe('blocked');
+      // A stays done (done is never auto-reverted by the cascade).
+      expect(read.artifacts.A).toBe('done');
     });
   });
 

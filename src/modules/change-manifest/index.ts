@@ -131,11 +131,18 @@ export class ManifestManager {
       throw new TargetNotFoundError(`Artifact '${artifactId}' not found in schema '${schema.name}'. Valid artifacts: ${schema.artifacts.map((a) => a.id).join(', ')}`);
     }
 
-    // No-op short circuit: when the requested status equals the current
-    // status there is nothing to validate, cascade, or persist, so return
-    // early to avoid unnecessary disk writes and mtime churn.
     const prevStatus = manifest.artifacts[artifactId];
     if (status === prevStatus) {
+      // No-op short circuit: when the requested status equals the current
+      // status there is nothing to validate or cascade. Re-targeting
+      // `currentArtifact` at this artifact is still a legitimate state
+      // change worth persisting; only when nothing at all changed do we
+      // return early to avoid unnecessary disk writes and mtime churn.
+      if (manifest.currentArtifact === artifactId) {
+        return;
+      }
+      manifest.currentArtifact = artifactId;
+      await this.writeManifest(changeDir, manifest);
       return;
     }
 
@@ -322,6 +329,11 @@ export class ManifestManager {
     }
 
     manifest.artifacts[artifactId] = targetStatus;
+    // Re-derive every dependent artifact from the new dependency state:
+    // a downstream artifact that was `ready` only because this artifact was
+    // `done` must be re-blocked now that the dependency is gone. `done`
+    // artifacts are never auto-reverted by the cascade.
+    this.applyCascade(manifest, schema);
     await this.writeManifest(changeDir, manifest);
   }
 

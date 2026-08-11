@@ -453,4 +453,41 @@ describe('ArchiveEngine', () => {
       expect(archivedErr?.code).not.toBe(notSyncedErr?.code);
     });
   });
+
+  // ==================== AE-11: backup drain failure reverts manifest status ====================
+  describe('AE-11: moveDirContents failure leaves change retryable', () => {
+    it('reverts manifest status to synced and keeps the change in changes/ when the drain fails', async () => {
+      const { root, changesDir } = setupProject({ manifestStatus: 'synced' });
+      const archiveDir = join(root, 'adab', 'changes', 'archive', 'draft-ch-012');
+      mkdirSync(archiveDir, { recursive: true });
+      writeFileSync(join(archiveDir, 'old-marker.txt'), 'previously archived');
+      const engine = new ArchiveEngine(root);
+
+      // Simulate a failure inside the backup drain (e.g. a leftover file the
+      // engine cannot move) by stubbing the drain method, mirroring the
+      // LogWriter.prototype.append stub convention used in AE-2.
+      const drainSpy = vi
+        .spyOn(
+          ArchiveEngine.prototype as unknown as { moveDirContents: (srcDir: string, destDir: string) => Promise<void> },
+          'moveDirContents',
+        )
+        .mockRejectedValue(new Error('simulated drain failure'));
+
+      try {
+        await expect(engine.archive('draft-ch-012', true)).rejects.toThrow(/simulated drain failure/);
+
+        // Manifest status must be reverted so the change stays retryable:
+        // an `archived` manifest still sitting in changes/ would make every
+        // retry throw ARCHIVE_ALREADY_ARCHIVED.
+        const manifestRaw = readFileSync(join(changesDir, '.openadab.yaml'), 'utf-8');
+        expect(manifestRaw).toContain('synced');
+        expect(manifestRaw).not.toContain('archived');
+
+        // The change directory was not renamed away.
+        expect(existsSync(changesDir)).toBe(true);
+      } finally {
+        drainSpy.mockRestore();
+      }
+    });
+  });
 });
